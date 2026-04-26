@@ -4753,6 +4753,67 @@ async def admin_extra_import(request: Request, data: dict = Body(...)):
     return extra
 
 
+# 单字段流式导入：浏览器把巨大 JSON 文件直接作为 request body 流式上传，
+# 避免把 79MB+ 字符串塞进 React state / textarea 导致页面崩溃。
+@app.post("/admin/extra-import-stream")
+async def admin_extra_import_stream(request: Request, field: str):
+    """单字段流式导入，body 是该字段的 JSON 数组（或 {keys_with_meta:[...]} 兼容格式）。"""
+    if request.headers.get("X-Admin-Key", "") != ADMIN_KEY:
+        return JSONResponse(status_code=403, content={"error": "forbidden"})
+    valid_fields = {
+        "accounts", "keys",
+        "prizes", "saint_points", "saint_donations",
+        "user_items", "pokeballs", "user_passwords",
+        "donated_jb_accounts", "cf_proxies",
+    }
+    if field not in valid_fields:
+        return JSONResponse(
+            status_code=400,
+            content={"error": f"未知字段 {field!r}，允许：{sorted(valid_fields)}"},
+        )
+    raw = await request.body()
+    if not raw:
+        return JSONResponse(status_code=400, content={"error": "body 为空"})
+    try:
+        parsed = json.loads(raw)
+    except Exception as e:
+        return JSONResponse(
+            status_code=400,
+            content={"error": f"JSON 解析失败: {type(e).__name__}: {e}"},
+        )
+    # 兼容 /admin/keys 直接返回的对象格式
+    if field == "keys" and isinstance(parsed, dict):
+        parsed = parsed.get("keys_with_meta") or parsed.get("keys") or []
+    if not isinstance(parsed, list):
+        return JSONResponse(
+            status_code=400,
+            content={"error": f"{field} 必须是 JSON 数组（实际是 {type(parsed).__name__}）"},
+        )
+    try:
+        if field == "accounts":
+            r = await _do_bulk_import(parsed, [])
+            return {"success": True, "imported_accounts": r.get("imported_accounts", 0)}
+        if field == "keys":
+            r = await _do_bulk_import([], parsed)
+            return {"success": True, "imported_keys": r.get("imported_keys", 0)}
+        # 其他都走 _do_extra_import 的对应字段
+        kwargs = {
+            "prizes": [], "saint_points": [], "saint_donations": [],
+            "user_items": [], "pokeballs": [], "user_passwords": [],
+            "donated_jb_accounts": [], "cf_proxies": [],
+        }
+        kwargs[field] = parsed
+        r = await _do_extra_import(**kwargs)
+        # 只回包含本字段的导入数
+        out_key = f"imported_{field}"
+        return {"success": True, out_key: r.get(out_key, 0)}
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"导入 {field} 失败: {type(e).__name__}: {e}"},
+        )
+
+
 @app.get("/admin/accounts/export-all")
 async def admin_export_all(request: Request):
     """导出全部账号、密钥及奖品/抽奖/背包数据（供跨环境迁移使用）"""

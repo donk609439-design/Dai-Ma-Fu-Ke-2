@@ -39,12 +39,24 @@ interface MigrateResult {
 
 interface ExtraImportResult {
   success: boolean;
-  imported_prizes: number;
-  imported_saint_points: number;
-  imported_saint_donations: number;
-  imported_user_items: number;
-  imported_pokeballs: number;
+  imported_prizes?: number;
+  imported_saint_points?: number;
+  imported_saint_donations?: number;
+  imported_user_items?: number;
+  imported_pokeballs?: number;
+  imported_user_passwords?: number;
+  imported_donated_jb_accounts?: number;
+  imported_cf_proxies?: number;
+  imported_accounts?: number;
+  imported_keys?: number;
   error?: string;
+}
+
+function formatBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`;
+  return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`;
 }
 
 const SQL_INSTRUCTIONS = [
@@ -111,7 +123,9 @@ export default function Dashboard() {
   const [migrateResult, setMigrateResult] = useState<MigrateResult | null>(null);
 
   const [jsonFields, setJsonFields] = useState<Record<string, string>>({});
+  const [jsonFiles, setJsonFiles] = useState<Record<string, File>>({});
   const [jsonImporting, setJsonImporting] = useState(false);
+  const [jsonProgress, setJsonProgress] = useState<string>("");
   const [jsonResult, setJsonResult] = useState<ExtraImportResult | null>(null);
   const [showSql, setShowSql] = useState(false);
 
@@ -165,31 +179,63 @@ export default function Dashboard() {
   const handleJsonImport = async () => {
     setJsonImporting(true);
     setJsonResult(null);
+    setJsonProgress("");
+    const totals: ExtraImportResult = { success: true };
+    const errors: string[] = [];
     try {
-      const payload: Record<string, unknown> = {};
+      // 收集所有需要上传的字段：文件优先于粘贴文本
+      const tasks: Array<{ field: string; label: string; body: BodyInit; sizeHint: string }> = [];
       for (const item of SQL_INSTRUCTIONS) {
-        const raw = (jsonFields[item.field] || "").trim();
-        if (raw) {
-          try {
-            payload[item.field] = JSON.parse(raw);
-          } catch {
-            setJsonResult({ success: false, imported_prizes: 0, imported_saint_points: 0, imported_saint_donations: 0, imported_user_items: 0, imported_pokeballs: 0, error: `${item.label} JSON 格式错误` });
-            setJsonImporting(false);
-            return;
-          }
+        const file = jsonFiles[item.field];
+        const text = (jsonFields[item.field] || "").trim();
+        if (file) {
+          tasks.push({ field: item.field, label: item.label, body: file, sizeHint: formatBytes(file.size) });
+        } else if (text) {
+          tasks.push({ field: item.field, label: item.label, body: text, sizeHint: `${text.length.toLocaleString()} 字符` });
         }
       }
-      const res = await adminFetch("/admin/extra-import", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-      const data = await res.json();
-      setJsonResult(res.ok ? { ...data, success: true } : { success: false, imported_prizes: 0, imported_saint_points: 0, imported_saint_donations: 0, imported_user_items: 0, imported_pokeballs: 0, error: data.error || `HTTP ${res.status}` });
-    } catch (e: unknown) {
-      setJsonResult({ success: false, imported_prizes: 0, imported_saint_points: 0, imported_saint_donations: 0, imported_user_items: 0, imported_pokeballs: 0, error: String(e) });
+      if (tasks.length === 0) {
+        setJsonResult({ success: false, error: "请至少粘贴一个字段或上传一个文件" });
+        return;
+      }
+      // 逐字段串行 POST。文件直接作为 fetch body —— 浏览器底层流式上传，
+      // 不会把 79MB+ 内容 materialize 到 JS 字符串里。
+      let i = 0;
+      for (const t of tasks) {
+        i++;
+        setJsonProgress(`(${i}/${tasks.length}) 正在上传 ${t.label}（${t.sizeHint}）…`);
+        try {
+          const res = await adminFetch(
+            `/admin/extra-import-stream?field=${encodeURIComponent(t.field)}`,
+            { method: "POST", headers: { "Content-Type": "application/json" }, body: t.body },
+          );
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) {
+            errors.push(`${t.label}: ${data.error || `HTTP ${res.status}`}`);
+          } else {
+            const totalsAny = totals as unknown as Record<string, unknown>;
+            for (const k of Object.keys(data)) {
+              if (k.startsWith("imported_") && typeof data[k] === "number") {
+                const cur = totalsAny[k];
+                totalsAny[k] = (typeof cur === "number" ? cur : 0) + data[k];
+              }
+            }
+          }
+        } catch (e: unknown) {
+          errors.push(`${t.label}: ${(e as Error).message || String(e)}`);
+        }
+      }
+      totals.success = errors.length === 0;
+      if (errors.length) totals.error = errors.join("； ");
+      setJsonResult(totals);
+      if (errors.length === 0) {
+        // 成功后清空所有 slot，避免重复提交
+        setJsonFiles({});
+        setJsonFields({});
+      }
     } finally {
       setJsonImporting(false);
+      setJsonProgress("");
     }
   };
 
@@ -521,65 +567,47 @@ export default function Dashboard() {
             </div>
           )}
 
-          {/* 粘贴区 */}
+          {/* 粘贴/上传区 */}
           <div className="space-y-3">
             {SQL_INSTRUCTIONS.map(item => {
               const val = jsonFields[item.field] || "";
-              const charCount = val.length;
+              const file = jsonFiles[item.field];
+              const hasFile = !!file;
+              const hasText = val.length > 0;
               return (
                 <div key={item.field} className="space-y-1.5">
                   <div className="flex items-center justify-between gap-2 flex-wrap">
                     <Label className="text-xs text-muted-foreground">{item.label} JSON（留空跳过）</Label>
                     <div className="flex items-center gap-2">
-                      {charCount > 0 && (
-                        <span className="text-[10px] text-muted-foreground font-mono">{charCount.toLocaleString()} 字符</span>
+                      {hasFile && (
+                        <span className="text-[10px] text-emerald-400 font-mono">
+                          已绑定 {file.name}（{formatBytes(file.size)}）
+                        </span>
+                      )}
+                      {!hasFile && hasText && (
+                        <span className="text-[10px] text-muted-foreground font-mono">
+                          {val.length.toLocaleString()} 字符
+                        </span>
                       )}
                       <input
                         type="file"
                         accept=".json,application/json,.txt,text/plain"
                         id={`upload-${item.field}`}
                         className="hidden"
-                        onChange={async (e) => {
-                          const file = e.target.files?.[0];
-                          if (!file) return;
-                          try {
-                            const text = await file.text();
-                            const trimmed = text.trim();
-                            // 简单校验：必须以 [ 开头（数组）
-                            if (!trimmed.startsWith("[")) {
-                              toast({
-                                variant: "destructive",
-                                title: "文件格式错误",
-                                description: `${file.name} 不是 JSON 数组（应以 [ 开头）`,
-                              });
-                              return;
-                            }
-                            // 校验 JSON 合法性
-                            try {
-                              JSON.parse(trimmed);
-                            } catch (parseErr) {
-                              toast({
-                                variant: "destructive",
-                                title: "JSON 解析失败",
-                                description: `${file.name}: ${(parseErr as Error).message}`,
-                              });
-                              return;
-                            }
-                            setJsonFields(prev => ({ ...prev, [item.field]: trimmed }));
-                            toast({
-                              title: "已加载文件",
-                              description: `${file.name}（${(file.size / 1024).toFixed(1)} KB）`,
-                            });
-                          } catch (err) {
-                            toast({
-                              variant: "destructive",
-                              title: "读取文件失败",
-                              description: (err as Error).message,
-                            });
-                          } finally {
-                            // 清空 input 让同一文件可以再次上传
-                            e.target.value = "";
-                          }
+                        onChange={(e) => {
+                          const f = e.target.files?.[0];
+                          if (!f) return;
+                          // 关键：不读取文件内容，只保存 File 引用，
+                          // 提交时由 fetch 直接流式上传（哪怕几百 MB 也不卡浏览器）
+                          setJsonFiles(prev => ({ ...prev, [item.field]: f }));
+                          // 清空对应文本框，避免歧义
+                          setJsonFields(prev => ({ ...prev, [item.field]: "" }));
+                          toast({
+                            title: "已绑定文件（未读取内容）",
+                            description: `${f.name} - ${formatBytes(f.size)}，点击「上传导入」时才会发送`,
+                          });
+                          // 清空 input 让同一文件可以再次选
+                          e.target.value = "";
                         }}
                       />
                       <Button
@@ -590,27 +618,43 @@ export default function Dashboard() {
                         onClick={() => document.getElementById(`upload-${item.field}`)?.click()}
                       >
                         <Upload className="w-3 h-3 mr-1" />
-                        上传 JSON 文件
+                        {hasFile ? "更换文件" : "上传 JSON 文件"}
                       </Button>
-                      {charCount > 0 && (
+                      {(hasFile || hasText) && (
                         <Button
                           type="button"
                           size="sm"
                           variant="ghost"
                           className="h-6 px-2 text-[11px] text-muted-foreground hover:text-destructive"
-                          onClick={() => setJsonFields(prev => ({ ...prev, [item.field]: "" }))}
+                          onClick={() => {
+                            setJsonFiles(prev => {
+                              const next = { ...prev };
+                              delete next[item.field];
+                              return next;
+                            });
+                            setJsonFields(prev => ({ ...prev, [item.field]: "" }));
+                          }}
                         >
                           清空
                         </Button>
                       )}
                     </div>
                   </div>
-                  <Textarea
-                    placeholder={`粘贴 ${item.label} 的 JSON 数组，或点击右上角"上传 JSON 文件"…`}
-                    value={val}
-                    onChange={e => setJsonFields(prev => ({ ...prev, [item.field]: e.target.value }))}
-                    className="font-mono text-xs h-20 resize-y"
-                  />
+                  {hasFile ? (
+                    <div className="font-mono text-xs h-20 rounded-md border border-emerald-500/40 bg-emerald-500/5 px-3 py-2 flex items-center gap-2 text-emerald-400">
+                      <Upload className="w-4 h-4 shrink-0" />
+                      <span className="truncate">
+                        {file.name} · {formatBytes(file.size)} · 提交时直接流式上传，不会读入浏览器内存
+                      </span>
+                    </div>
+                  ) : (
+                    <Textarea
+                      placeholder={`粘贴 ${item.label} 的 JSON 数组，或点击右上角"上传 JSON 文件"（推荐用于大文件）…`}
+                      value={val}
+                      onChange={e => setJsonFields(prev => ({ ...prev, [item.field]: e.target.value }))}
+                      className="font-mono text-xs h-20 resize-y"
+                    />
+                  )}
                 </div>
               );
             })}
@@ -618,12 +662,12 @@ export default function Dashboard() {
 
           <Button
             onClick={handleJsonImport}
-            disabled={jsonImporting || Object.values(jsonFields).every(v => !v.trim())}
+            disabled={jsonImporting || (Object.values(jsonFields).every(v => !v.trim()) && Object.keys(jsonFiles).length === 0)}
             className="w-full"
             variant="secondary"
           >
             <ClipboardPaste className={`w-4 h-4 mr-2 ${jsonImporting ? "animate-pulse" : ""}`} />
-            {jsonImporting ? "导入中…" : "粘贴导入"}
+            {jsonImporting ? (jsonProgress || "导入中…") : "上传 / 粘贴导入"}
           </Button>
 
           {jsonResult && (
