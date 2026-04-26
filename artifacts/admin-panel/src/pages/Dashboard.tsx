@@ -1,6 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import { useState } from "react";
-import { RefreshCw, Server, Users, Key, Cpu, CheckCircle, XCircle, AlertCircle, Activity, Database, ArrowDownToLine, ClipboardPaste, ChevronDown, ChevronUp } from "lucide-react";
+import { RefreshCw, Server, Users, Key, Cpu, CheckCircle, XCircle, AlertCircle, Activity, Database, ArrowDownToLine, ClipboardPaste, ChevronDown, ChevronUp, Stethoscope } from "lucide-react";
 import { adminFetch, getAdminKey } from "@/lib/admin-auth";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -74,6 +74,31 @@ export default function Dashboard() {
   const [jsonImporting, setJsonImporting] = useState(false);
   const [jsonResult, setJsonResult] = useState<ExtraImportResult | null>(null);
   const [showSql, setShowSql] = useState(false);
+
+  const [probing, setProbing] = useState(false);
+  const [probeResult, setProbeResult] = useState<Record<string, unknown> | null>(null);
+
+  const handleProbe = async () => {
+    if (!sourceUrl.trim()) return;
+    setProbing(true);
+    setProbeResult(null);
+    try {
+      const res = await adminFetch("/admin/migration-probe", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          source_url: sourceUrl.trim().replace(/\/$/, ""),
+          source_admin_key: sourceKey.trim() || getAdminKey(),
+        }),
+      });
+      const data = await res.json();
+      setProbeResult(data);
+    } catch (e: unknown) {
+      setProbeResult({ ok: false, error: String(e) });
+    } finally {
+      setProbing(false);
+    }
+  };
 
   const handleMigrate = async () => {
     if (!sourceUrl.trim()) return;
@@ -295,14 +320,77 @@ export default function Dashboard() {
               />
             </div>
           </div>
-          <Button
-            onClick={handleMigrate}
-            disabled={migrating || !sourceUrl.trim()}
-            className="w-full"
-          >
-            <ArrowDownToLine className={`w-4 h-4 mr-2 ${migrating ? "animate-bounce" : ""}`} />
-            {migrating ? "迁移中，请稍候…" : "开始迁移"}
-          </Button>
+          <div className="flex gap-2">
+            <Button
+              onClick={handleMigrate}
+              disabled={migrating || !sourceUrl.trim()}
+              className="flex-1"
+            >
+              <ArrowDownToLine className={`w-4 h-4 mr-2 ${migrating ? "animate-bounce" : ""}`} />
+              {migrating ? "迁移中，请稍候…" : "开始迁移"}
+            </Button>
+            <Button
+              onClick={handleProbe}
+              disabled={probing || !sourceUrl.trim()}
+              variant="outline"
+              className="border-amber-500/40 text-amber-500 hover:text-amber-400 hover:bg-amber-500/10"
+              title="只调用源端 export-all 不导入数据，用于查看源端真实响应"
+            >
+              <Stethoscope className={`w-4 h-4 mr-2 ${probing ? "animate-pulse" : ""}`} />
+              {probing ? "诊断中…" : "诊断源端"}
+            </Button>
+          </div>
+
+          {probeResult && (() => {
+            const ok = probeResult.ok === true;
+            const status = probeResult.status_code as number | undefined;
+            const body = (probeResult.body_truncated_8kb as string) ?? "";
+            const summary = probeResult.json_top_level_summary as Record<string, string> | null;
+            const stage = probeResult.stage as string | undefined;
+            const errorMsg = probeResult.error as string | undefined;
+            return (
+              <div className={`rounded-lg p-4 text-xs space-y-3 border ${ok ? "bg-emerald-500/5 border-emerald-500/30" : "bg-amber-500/5 border-amber-500/30"}`}>
+                <div className="flex items-center gap-2 text-sm font-medium">
+                  <Stethoscope className={`w-4 h-4 ${ok ? "text-emerald-400" : "text-amber-400"}`} />
+                  <span className={ok ? "text-emerald-400" : "text-amber-400"}>
+                    诊断结果：{stage === "network" ? "网络层失败" : ok ? `源端正常（HTTP ${status}）` : `源端异常（HTTP ${status ?? "?"}）`}
+                  </span>
+                </div>
+                {errorMsg && (
+                  <div className="text-destructive font-mono break-all">{errorMsg}</div>
+                )}
+                {probeResult.url ? (
+                  <div className="text-muted-foreground">
+                    URL：<code className="font-mono break-all text-foreground/80">{String(probeResult.url)}</code>
+                  </div>
+                ) : null}
+                {probeResult.content_type ? (
+                  <div className="text-muted-foreground">
+                    Content-Type：<code className="font-mono">{String(probeResult.content_type)}</code>
+                    {" · "}长度：<code className="font-mono">{String(probeResult.content_length_bytes ?? 0)}</code> 字节
+                    {probeResult.server_header ? <> · Server：<code className="font-mono">{String(probeResult.server_header)}</code></> : null}
+                  </div>
+                ) : null}
+                {summary && (
+                  <div>
+                    <div className="text-muted-foreground mb-1">JSON 顶层字段：</div>
+                    <pre className="bg-muted/40 border border-border rounded p-2 font-mono text-[11px] overflow-x-auto">
+{Object.entries(summary).map(([k, v]) => `${k}: ${v}`).join("\n")}
+                    </pre>
+                  </div>
+                )}
+                {body && (
+                  <div>
+                    <div className="text-muted-foreground mb-1">响应正文（截前 8KB）：</div>
+                    <pre className="bg-muted/40 border border-border rounded p-2 font-mono text-[11px] max-h-80 overflow-auto whitespace-pre-wrap break-all">
+{body}
+                    </pre>
+                  </div>
+                )}
+              </div>
+            );
+          })()}
+
           {migrateResult && (
             <div className={`rounded-lg p-4 text-sm space-y-1 ${migrateResult.success ? "bg-emerald-500/10 border border-emerald-500/30" : "bg-destructive/10 border border-destructive/30"}`}>
               {migrateResult.success ? (

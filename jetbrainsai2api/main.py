@@ -4873,6 +4873,63 @@ async def admin_export_all(request: Request):
     }
 
 
+@app.post("/admin/migration-probe")
+async def admin_migration_probe(request: Request, data: dict = Body(...)):
+    """诊断模式：直接调用源端 /admin/accounts/export-all 并把完整响应（status/header/body 截短）返回，用于排查迁移失败的真实原因"""
+    admin_key_header = request.headers.get("X-Admin-Key", "")
+    if admin_key_header != ADMIN_KEY:
+        return JSONResponse(status_code=403, content={"error": "forbidden"})
+
+    source_url = (data.get("source_url") or "").rstrip("/")
+    source_admin_key = data.get("source_admin_key") or ADMIN_KEY
+    if not source_url:
+        return JSONResponse(status_code=400, content={"error": "source_url required"})
+
+    target = f"{source_url}/admin/accounts/export-all"
+    hdrs = {"X-Admin-Key": source_admin_key}
+
+    try:
+        async with httpx.AsyncClient(verify=False, timeout=60, follow_redirects=True) as client:
+            resp = await client.get(target, headers=hdrs)
+    except Exception as e:
+        return {
+            "ok": False,
+            "stage": "network",
+            "url": target,
+            "error": f"{type(e).__name__}: {e}",
+        }
+
+    body_text = resp.text or ""
+    body_truncated = body_text[:8000]
+
+    # 尝试解析 JSON 顶层 schema
+    keys_summary = None
+    try:
+        body_json = resp.json()
+        if isinstance(body_json, dict):
+            keys_summary = {}
+            for k, v in body_json.items():
+                if isinstance(v, list):
+                    keys_summary[k] = f"<list len={len(v)}>"
+                elif isinstance(v, dict):
+                    keys_summary[k] = f"<dict keys={len(v)}>"
+                else:
+                    keys_summary[k] = type(v).__name__
+    except Exception:
+        keys_summary = None
+
+    return {
+        "ok": resp.status_code == 200,
+        "url": target,
+        "status_code": resp.status_code,
+        "content_type": resp.headers.get("content-type", ""),
+        "content_length_bytes": len(body_text),
+        "body_truncated_8kb": body_truncated,
+        "json_top_level_summary": keys_summary,
+        "server_header": resp.headers.get("server", ""),
+    }
+
+
 @app.post("/admin/accounts/import-from-source")
 async def admin_import_from_source(request: Request, data: dict = Body(...)):
     """从另一个部署实例拉取全部数据（含奖品/抽奖/背包）并导入本库"""
