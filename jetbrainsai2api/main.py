@@ -717,6 +717,41 @@ async def _ensure_db_tables():
         await conn.execute("ALTER TABLE jb_accounts ADD COLUMN IF NOT EXISTS pending_nc_pass TEXT DEFAULT NULL")
         await conn.execute("ALTER TABLE jb_accounts ADD COLUMN IF NOT EXISTS pending_nc_key TEXT DEFAULT NULL")
         await conn.execute("ALTER TABLE jb_accounts ADD COLUMN IF NOT EXISTS pending_nc_bound_ids TEXT DEFAULT NULL")
+        # 该邮箱（行）是否已为 LOW 用户的 key 贡献过 +16 额度
+        # —— 同一邮箱凑够 4 个信任凭证只会触发一次 +16，不会重复计入
+        await conn.execute("ALTER TABLE jb_accounts ADD COLUMN IF NOT EXISTS pending_nc_quota_granted BOOLEAN DEFAULT FALSE")
+        # 一次性回填：旧机制下"全部信任后一次性升 16/25"会导致 LOW key.usage_limit > 0；
+        # 切到新机制后，必须把"已经领过那次 +16 的最早一行"标记为 granted=TRUE，
+        # 否则重启后会被当作"未贡献"再次触发 +16，每个剩余 pending 行都会再加一次。
+        # 用 jb_settings 加幂等标记，确保只跑一次。
+        backfill_done = await conn.fetchval(
+            "SELECT v FROM jb_settings WHERE k = 'low_nc_quota_granted_backfill_v1'"
+        )
+        if not backfill_done:
+            backfilled = await conn.fetchval(
+                """
+                WITH first_row_per_low_key AS (
+                    SELECT DISTINCT ON (a.pending_nc_key) a.id
+                    FROM jb_accounts a
+                    JOIN jb_client_keys k ON a.pending_nc_key = k.key
+                    WHERE a.pending_nc_low_admin = TRUE
+                      AND k.is_low_admin_key = TRUE
+                      AND COALESCE(k.usage_limit, 0) > 0
+                      AND a.pending_nc_quota_granted = FALSE
+                      AND a.pending_nc_key IS NOT NULL
+                      AND a.pending_nc_key <> ''
+                    ORDER BY a.pending_nc_key, a.id
+                )
+                UPDATE jb_accounts SET pending_nc_quota_granted = TRUE
+                WHERE id IN (SELECT id FROM first_row_per_low_key)
+                RETURNING id
+                """
+            )
+            await conn.execute(
+                "INSERT INTO jb_settings (k, v) VALUES ('low_nc_quota_granted_backfill_v1', '1') "
+                "ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v"
+            )
+            logger.info(f"✅ LOW NC 配额历史回填完成：已为已升级 LOW key 的最早一行标记 granted=TRUE")
         # 抽奖奖品表
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS lottery_prizes (
@@ -2782,7 +2817,8 @@ async def _retry_pending_nc_lids():
                 rows = await conn.fetch(
                     "SELECT id, pending_nc_lids, pending_nc_email, pending_nc_pass, "
                     "pending_nc_key, pending_nc_bound_ids, pending_nc_low_admin, "
-                    "pending_nc_discord_id, auth_token, license_id FROM jb_accounts "
+                    "pending_nc_discord_id, pending_nc_quota_granted, "
+                    "auth_token, license_id FROM jb_accounts "
                     "WHERE pending_nc_lids IS NOT NULL AND pending_nc_lids != '[]'"
                 )
 
@@ -2886,6 +2922,11 @@ async def _retry_pending_nc_lids():
                     "pending_lids": pending_lids,
                     "is_low": is_low,
                     "discord_id": row_dc_id,
+                    # 该邮箱是否已为 LOW 用户的 key 贡献过 +16 额度（防重复计入）
+                    "nc_quota_granted": (
+                        bool(row["pending_nc_quota_granted"])
+                        if "pending_nc_quota_granted" in row.keys() else False
+                    ),
                 }
                 for lid in pending_lids:
                     probe_tasks.append((row["id"], lid, _probe_lid(lid, id_token, sem_for_row, pool_for_row)))
@@ -2977,33 +3018,86 @@ async def _retry_pending_nc_lids():
                 NC_QUOTA_THRESHOLD = 4
                 already_bound = [x for x in pending_nc_bound_ids_str.split(",") if x.strip()]
                 all_ids = list(dict.fromkeys(already_bound + newly_trusted_ids))  # 去重保序
+                # 同一邮箱（行）只能贡献一次额度
+                row_already_granted = bool(meta.get("nc_quota_granted", False))
 
-                # 条件：已绑定总数 ≥ 4 且 key 尚未升级（usage_limit 仍为 0）
-                key_already_upgraded = (
-                    VALID_CLIENT_KEYS.get(pending_nc_key, {}).get("usage_limit", 0) > 0
-                    if pending_nc_key else False
-                )
-                if pending_nc_key and len(all_ids) >= NC_QUOTA_THRESHOLD and not key_already_upgraded:
-                    _upg_db = await _get_db_pool()
-                    if _upg_db:
-                        await _activate_key_quota(pending_nc_key, all_ids, _upg_db)
-                        _new_quota = _LOW_USER_KEY_QUOTA if VALID_CLIENT_KEYS.get(pending_nc_key, {}).get("is_low_admin_key") else _NORMAL_KEY_QUOTA
-                        _log(f"🎉 {short_email} 已达 {NC_QUOTA_THRESHOLD} 个信任凭证，密钥升级为额度 {_new_quota}（共 {len(all_ids)} 个）", "success", is_low=row_is_low)
-                    # 更新 DB 中 bound_ids，保留 still_pending 等待继续入池
-                    async with db.acquire() as _ub:
-                        await _ub.execute(
-                            "UPDATE jb_accounts SET pending_nc_bound_ids=$1 WHERE id=$2",
-                            ",".join(all_ids), row_id
+                # ── LOW 用户：每邮箱独立判定，凑够 4 个信任凭证就给该 LOW 用户的 key 追加 +16；
+                #            已贡献过的邮箱不会重复计入。
+                if row_is_low:
+                    if (
+                        pending_nc_key
+                        and len(all_ids) >= NC_QUOTA_THRESHOLD
+                        and not row_already_granted
+                    ):
+                        _upg_db = await _get_db_pool()
+                        if _upg_db:
+                            new_quota = await _add_low_quota(pending_nc_key, all_ids, _upg_db)
+                            _log(
+                                f"🎉 {short_email} 已达 {NC_QUOTA_THRESHOLD} 个信任凭证，"
+                                f"LOW 用户密钥额度 +{_LOW_USER_KEY_QUOTA}（当前总额度 {new_quota}，"
+                                f"本邮箱贡献 {len(all_ids)} 个账号）",
+                                "success", is_low=True,
+                            )
+                            # 同时持久化：bound_ids 累积、本行 granted 置 TRUE
+                            async with db.acquire() as _ub:
+                                await _ub.execute(
+                                    "UPDATE jb_accounts "
+                                    "SET pending_nc_bound_ids=$1, pending_nc_quota_granted=TRUE "
+                                    "WHERE id=$2",
+                                    ",".join(all_ids), row_id,
+                                )
+                    elif row_already_granted and newly_trusted_ids:
+                        # 已贡献过额度的邮箱：仅累积 bound_ids（用于审计/账号去重），不再加额度
+                        async with db.acquire() as _ub:
+                            await _ub.execute(
+                                "UPDATE jb_accounts SET pending_nc_bound_ids=$1 WHERE id=$2",
+                                ",".join(all_ids), row_id,
+                            )
+                        _log(
+                            f"ℹ {short_email} 本轮新增 {len(newly_trusted_ids)} 个信任凭证，"
+                            f"但本邮箱已贡献过 +{_LOW_USER_KEY_QUOTA} 额度，不重复计入",
+                            "info", is_low=True,
                         )
-                elif len(still_pending) == 0 and pending_nc_key and not key_already_upgraded:
-                    # 全部 pending 已消化但总数未达阈值（极少见），仍升级
-                    if all_ids:
+                    elif newly_trusted_ids:
+                        # 未达阈值：仅累积 bound_ids，等待下轮
+                        async with db.acquire() as _ub:
+                            await _ub.execute(
+                                "UPDATE jb_accounts SET pending_nc_bound_ids=$1 WHERE id=$2",
+                                ",".join(all_ids), row_id,
+                            )
+                        _log(
+                            f"📊 {short_email} 当前 {len(all_ids)}/{NC_QUOTA_THRESHOLD} 个信任凭证，"
+                            f"未达阈值",
+                            "info", is_low=True,
+                        )
+                else:
+                    # ── 普通用户（非 LOW）：保持原"全部信任后一次性升至 25"逻辑 ──
+                    key_already_upgraded = (
+                        VALID_CLIENT_KEYS.get(pending_nc_key, {}).get("usage_limit", 0) > 0
+                        if pending_nc_key else False
+                    )
+                    if pending_nc_key and len(all_ids) >= NC_QUOTA_THRESHOLD and not key_already_upgraded:
                         _upg_db = await _get_db_pool()
                         if _upg_db:
                             await _activate_key_quota(pending_nc_key, all_ids, _upg_db)
-                            _log(f"🎉 {short_email} 全部 trusted（共 {len(all_ids)} 个），密钥已升级", "success", is_low=row_is_low)
-                    else:
-                        _log(f"⚠ {short_email} 无有效账号可绑定，密钥保持 0 额度", "warn", is_low=row_is_low)
+                            _log(
+                                f"🎉 {short_email} 已达 {NC_QUOTA_THRESHOLD} 个信任凭证，"
+                                f"密钥升级为额度 {_NORMAL_KEY_QUOTA}（共 {len(all_ids)} 个）",
+                                "success", is_low=False,
+                            )
+                        async with db.acquire() as _ub:
+                            await _ub.execute(
+                                "UPDATE jb_accounts SET pending_nc_bound_ids=$1 WHERE id=$2",
+                                ",".join(all_ids), row_id,
+                            )
+                    elif len(still_pending) == 0 and pending_nc_key and not key_already_upgraded:
+                        if all_ids:
+                            _upg_db = await _get_db_pool()
+                            if _upg_db:
+                                await _activate_key_quota(pending_nc_key, all_ids, _upg_db)
+                                _log(f"🎉 {short_email} 全部 trusted（共 {len(all_ids)} 个），密钥已升级", "success", is_low=False)
+                        else:
+                            _log(f"⚠ {short_email} 无有效账号可绑定，密钥保持 0 额度", "warn", is_low=False)
 
         except Exception as e:
             _log(f"❌ 扫描循环异常: {e}", "error")
