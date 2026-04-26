@@ -3276,6 +3276,110 @@ async def _sse_with_keepalive(
             break
 
 
+def _convert_openai_messages_to_jetbrains(
+    messages: "List[ChatMessage]",
+    tool_id_to_func_name_map: Dict[str, str],
+) -> List[Dict[str, Any]]:
+    """OpenAI 历史消息 → JetBrains 内部 messages 格式。
+
+    要点：
+    - assistant 一次返回多个 tool_calls 时，全部都要保留：第一个 tool_call 跟随原
+      assistant 文本作为一条 assistant_message 发出；后续每个 tool_call 单独追加一条
+      content="" 的 assistant_message，避免上游历史丢失并行调用上下文。
+    - 同时把所有 tool_call.id → function.name 写入映射表，供后续 role='tool' 消息
+      转 function_message 时回查 functionName。
+    """
+    jetbrains_messages: List[Dict[str, Any]] = []
+    for msg in messages:
+        text_content = extract_text_content(msg.content)
+        if msg.role in ("user", "system"):
+            jetbrains_messages.append(
+                {"type": f"{msg.role}_message", "content": text_content}
+            )
+        elif msg.role == "assistant":
+            if msg.tool_calls:
+                for idx, tc in enumerate(msg.tool_calls):
+                    fn = tc.get("function", {}) or {}
+                    fn_name = fn.get("name") or ""
+                    fn_args = fn.get("arguments") or ""
+                    if tc.get("id") and fn_name:
+                        tool_id_to_func_name_map[tc["id"]] = fn_name
+                    jetbrains_messages.append({
+                        "type": "assistant_message",
+                        # 只把原 assistant 文本带在第一条上，避免重复
+                        "content": text_content if idx == 0 else "",
+                        "functionCall": {
+                            "functionName": fn_name,
+                            "content": fn_args,
+                        },
+                    })
+            else:
+                jetbrains_messages.append(
+                    {"type": "assistant_message", "content": text_content}
+                )
+        elif msg.role == "tool":
+            function_name = tool_id_to_func_name_map.get(msg.tool_call_id)
+            if function_name:
+                jetbrains_messages.append({
+                    "type": "function_message",
+                    "content": text_content,
+                    "functionName": function_name,
+                })
+            else:
+                print(
+                    f"警告: 无法为 tool_call_id {msg.tool_call_id} 找到对应的函数调用"
+                )
+        else:
+            jetbrains_messages.append(
+                {"type": "user_message", "content": text_content}
+            )
+    return jetbrains_messages
+
+
+def _filter_tools_by_choice(
+    tools: List[Dict[str, Any]],
+    tool_choice: Any,
+) -> List[Dict[str, Any]]:
+    """按 OpenAI tool_choice 语义在代理层裁剪 tools 列表。
+
+    JetBrains 后端没有公开的"强制调用"开关，因此我们在代理层做语义近似：
+      - None / "auto" / "required" → 原样返回（required 退化为 auto，把候选集发过去）
+      - "none"                     → 返回 []，调用方据此完全不发送 tools 字段
+      - {"type":"function", "function":{"name":"X"}} → 仅保留名为 X 的那一个 function
+        若指定的 function 不在 tools 中则原样返回（避免误把列表清空，更接近"宽松匹配"）
+    其它未识别值（如旧版 "function_call":{...} 字符串等）→ 视为 auto，不裁剪。
+    """
+    if not tools:
+        return []
+    if tool_choice is None:
+        return tools
+    if isinstance(tool_choice, str):
+        if tool_choice == "none":
+            return []
+        # "auto" / "required" / 任何未知字符串 → 不裁剪
+        return tools
+    if isinstance(tool_choice, dict):
+        if tool_choice.get("type") == "function":
+            target_name = (tool_choice.get("function") or {}).get("name")
+            if target_name:
+                picked = [
+                    t for t in tools
+                    if (t.get("function") or {}).get("name") == target_name
+                ]
+                if picked:
+                    return picked
+        # 其它形态（如 anthropic 风格 {"type":"tool","name":"X"} 等）尽量宽松解析
+        target_name = tool_choice.get("name")
+        if target_name:
+            picked = [
+                t for t in tools
+                if (t.get("function") or {}).get("name") == target_name
+            ]
+            if picked:
+                return picked
+    return tools
+
+
 async def openai_stream_adapter(
     api_stream_generator: AsyncGenerator[str, None],
     model_name: str,
@@ -3289,7 +3393,14 @@ async def openai_stream_adapter(
     """
     stream_id = f"chatcmpl-{uuid.uuid4().hex}"
     first_chunk_sent = False
-    tool_id = 0
+    # JetBrains 把同一个 tool_call 的 arguments 拆成多个 FunctionCall 事件流送：
+    #   第一条带 name（=新的 tool_call 起点）；后续每个 token 增量再发一条 name=null
+    # OpenAI 客户端按 (index, id) 拼接 arguments，所以：
+    #   - 见到带 name 的事件 → 视为新的 tool_call，分配新 index 与新 id
+    #   - 见到 name=null 的事件 → 视为当前 tool_call 的 arguments 增量，复用 index、不再下发 id
+    # 这样既正确处理单 tool_call 的多片增量，也能在真正出现并行 tool_calls
+    # （多个带 name 的事件）时按顺序分配独立 index，避免它们撞到同一个 index=0。
+    current_tool_call_index = -1
     completion_chars = 0
     api_prompt_tokens: int = 0
     api_completion_tokens: int = 0
@@ -3338,20 +3449,43 @@ async def openai_stream_adapter(
                     elif event_type == "FunctionCall":
                         func_name = data.get("name", None)
                         func_argu = data.get("content", None)
-                        if func_name and tools:
-                            for tool_id, tool in enumerate(tools):
-                                if tool["name"] == func_name:
-                                    break
+                        if func_name:
+                            # 新的 tool_call 起点：分配新 index 与新 id，函数名只在首块下发
+                            current_tool_call_index += 1
+                            tc_delta = {
+                                "index": current_tool_call_index,
+                                "id": f"call_{uuid.uuid4().hex}",
+                                "type": "function",
+                                "function": {
+                                    "name": func_name,
+                                    "arguments": func_argu or "",
+                                },
+                            }
+                        else:
+                            # 当前 tool_call 的 arguments 增量；index 沿用，不重发 id/name/type
+                            if current_tool_call_index < 0:
+                                # 罕见：上游先发了无 name 的增量。兜底建立一个匿名 tool_call
+                                current_tool_call_index = 0
+                                tc_delta = {
+                                    "index": 0,
+                                    "id": f"call_{uuid.uuid4().hex}",
+                                    "type": "function",
+                                    "function": {"name": "", "arguments": func_argu or ""},
+                                }
+                            else:
+                                tc_delta = {
+                                    "index": current_tool_call_index,
+                                    "function": {"arguments": func_argu or ""},
+                                }
                         chunk = {
                             "id": stream_id, "object": "chat.completion.chunk",
                             "created": int(time.time()), "model": model_name,
                             "system_fingerprint": "fp_jetbrains",
-                            "choices": [{"delta": {"tool_calls": [{
-                                "index": tool_id,
-                                "id": f"call_{uuid.uuid4().hex}",
-                                "function": {"arguments": func_argu, "name": func_name},
-                                "type": "function" if func_name else None,
-                            }]}, "index": 0, "finish_reason": None}],
+                            "choices": [{
+                                "delta": {"tool_calls": [tc_delta]},
+                                "index": 0,
+                                "finish_reason": None,
+                            }],
                         }
                         yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 
@@ -3623,40 +3757,23 @@ async def chat_completions(
                     tool_id_to_func_name_map[tc["id"]] = tc["function"]["name"]
 
     # 将 OpenAI 格式的消息转换为 JetBrains 格式
-    jetbrains_messages = []
-    for msg in request.messages:
-        text_content = extract_text_content(msg.content)
-        if msg.role in ["user", "system"]:
-            jetbrains_messages.append({"type": f"{msg.role}_message", "content": text_content})
-        elif msg.role == "assistant":
-            if msg.tool_calls:
-                first_tool_call = msg.tool_calls[0]
-                tool_id_to_func_name_map[first_tool_call["id"]] = first_tool_call["function"]["name"]
-                jetbrains_messages.append({
-                    "type": "assistant_message",
-                    "content": text_content,
-                    "functionCall": {
-                        "functionName": first_tool_call["function"]["name"],
-                        "content": first_tool_call["function"]["arguments"],
-                    },
-                })
-            else:
-                jetbrains_messages.append({"type": "assistant_message", "content": text_content})
-        elif msg.role == "tool":
-            function_name = tool_id_to_func_name_map.get(msg.tool_call_id)
-            if function_name:
-                jetbrains_messages.append({"type": "function_message", "content": text_content, "functionName": function_name})
-            else:
-                print(f"警告: 无法为 tool_call_id {msg.tool_call_id} 找到对应的函数调用")
-        else:
-            jetbrains_messages.append({"type": "user_message", "content": text_content})
+    jetbrains_messages = _convert_openai_messages_to_jetbrains(
+        request.messages, tool_id_to_func_name_map
+    )
 
+    # 解释 tool_choice：
+    #   None / "auto" / "required" → 全部 tools 发给 JetBrains（required 退化为 auto，
+    #     JetBrains 后端无强制 hook，能做到的最接近语义就是仍把候选工具集发过去）
+    #   "none" → 完全不发送 tools，模型按纯文本生成
+    #   {"type":"function","function":{"name":"X"}} → 只发送指定的那一个 function
     data = []
     tools = None
     if request.tools:
-        data.append({"type": "json", "fqdn": "llm.parameters.functions"})
-        tools = [t["function"] for t in request.tools]
-        data.append({"type": "json", "value": json.dumps(tools)})
+        tools_filtered = _filter_tools_by_choice(request.tools, request.tool_choice)
+        if tools_filtered:
+            data.append({"type": "json", "fqdn": "llm.parameters.functions"})
+            tools = [t["function"] for t in tools_filtered]
+            data.append({"type": "json", "value": json.dumps(tools)})
 
     payload = {
         "prompt": "ij.chat.request.new-chat-on-start",
@@ -4039,16 +4156,21 @@ async def messages_completions(
             jetbrains_messages.append({"type": f"{msg.role}_message", "content": text_content})
         elif msg.role == "assistant":
             if msg.tool_calls:
-                first_tool_call = msg.tool_calls[0]
-                tool_id_to_func_name_map[first_tool_call["id"]] = first_tool_call["function"]["name"]
-                jetbrains_messages.append({
-                    "type": "assistant_message",
-                    "content": text_content,
-                    "functionCall": {
-                        "functionName": first_tool_call["function"]["name"],
-                        "content": first_tool_call["function"]["arguments"],
-                    },
-                })
+                # 多个 tool_calls：第一条带原 content，其余拆成 content="" 的独立 assistant_message
+                for idx, tc in enumerate(msg.tool_calls):
+                    fn = tc.get("function", {}) or {}
+                    fn_name = fn.get("name") or ""
+                    fn_args = fn.get("arguments") or ""
+                    if tc.get("id") and fn_name:
+                        tool_id_to_func_name_map[tc["id"]] = fn_name
+                    jetbrains_messages.append({
+                        "type": "assistant_message",
+                        "content": text_content if idx == 0 else "",
+                        "functionCall": {
+                            "functionName": fn_name,
+                            "content": fn_args,
+                        },
+                    })
             else:
                 jetbrains_messages.append({"type": "assistant_message", "content": text_content})
         elif msg.role == "tool":
@@ -4056,12 +4178,15 @@ async def messages_completions(
             if function_name:
                 jetbrains_messages.append({"type": "function_message", "content": text_content, "functionName": function_name})
 
+    # tool_choice：与 OpenAI 端口一致的语义近似（none → 不发；指定 function → 仅发那一个）
     data = []
     tools = None
     if openai_request.tools:
-        data.append({"type": "json", "fqdn": "llm.parameters.functions"})
-        tools = [t["function"] for t in openai_request.tools]
-        data.append({"type": "json", "value": json.dumps(tools)})
+        tools_filtered = _filter_tools_by_choice(openai_request.tools, openai_request.tool_choice)
+        if tools_filtered:
+            data.append({"type": "json", "fqdn": "llm.parameters.functions"})
+            tools = [t["function"] for t in tools_filtered]
+            data.append({"type": "json", "value": json.dumps(tools)})
 
     payload = {
         "prompt": "ij.chat.request.new-chat-on-start",
