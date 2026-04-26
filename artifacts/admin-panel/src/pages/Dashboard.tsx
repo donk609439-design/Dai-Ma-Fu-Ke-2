@@ -181,44 +181,87 @@ export default function Dashboard() {
     setJsonResult(null);
     setJsonProgress("");
     const totals: ExtraImportResult = { success: true };
+    const totalsAny = totals as unknown as Record<string, unknown>;
     const errors: string[] = [];
+
+    // Replit 部署边缘代理对单个请求体限制 32MB；
+    // 粘贴文本/小文件直接发；超阈值时浏览器端 JSON.parse 后按记录数分批 POST。
+    // 之所以分批安全：所有插入都用 ON CONFLICT DO UPDATE，重复调用是幂等的。
+    const REPLIT_MAX_BYTES = 20 * 1024 * 1024; // 20MB 安全阈值（留 buffer）
+    const CHUNK_ITEMS = 2000;
+
+    const postOne = async (field: string, body: BodyInit): Promise<Record<string, unknown>> => {
+      const res = await adminFetch(
+        `/admin/extra-import-stream?field=${encodeURIComponent(field)}`,
+        { method: "POST", headers: { "Content-Type": "application/json" }, body },
+      );
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error((data as { error?: string }).error || `HTTP ${res.status}`);
+      }
+      return data as Record<string, unknown>;
+    };
+    const accumulate = (data: Record<string, unknown>) => {
+      for (const k of Object.keys(data)) {
+        if (k.startsWith("imported_") && typeof data[k] === "number") {
+          const cur = totalsAny[k];
+          totalsAny[k] = (typeof cur === "number" ? cur : 0) + (data[k] as number);
+        }
+      }
+    };
+
     try {
       // 收集所有需要上传的字段：文件优先于粘贴文本
-      const tasks: Array<{ field: string; label: string; body: BodyInit; sizeHint: string }> = [];
+      const tasks: Array<{ field: string; label: string; source: File | string; sizeHint: string; size: number }> = [];
       for (const item of SQL_INSTRUCTIONS) {
         const file = jsonFiles[item.field];
         const text = (jsonFields[item.field] || "").trim();
         if (file) {
-          tasks.push({ field: item.field, label: item.label, body: file, sizeHint: formatBytes(file.size) });
+          tasks.push({ field: item.field, label: item.label, source: file, sizeHint: formatBytes(file.size), size: file.size });
         } else if (text) {
-          tasks.push({ field: item.field, label: item.label, body: text, sizeHint: `${text.length.toLocaleString()} 字符` });
+          tasks.push({ field: item.field, label: item.label, source: text, sizeHint: `${text.length.toLocaleString()} 字符`, size: text.length });
         }
       }
       if (tasks.length === 0) {
         setJsonResult({ success: false, error: "请至少粘贴一个字段或上传一个文件" });
         return;
       }
-      // 逐字段串行 POST。文件直接作为 fetch body —— 浏览器底层流式上传，
-      // 不会把 79MB+ 内容 materialize 到 JS 字符串里。
+
       let i = 0;
       for (const t of tasks) {
         i++;
-        setJsonProgress(`(${i}/${tasks.length}) 正在上传 ${t.label}（${t.sizeHint}）…`);
         try {
-          const res = await adminFetch(
-            `/admin/extra-import-stream?field=${encodeURIComponent(t.field)}`,
-            { method: "POST", headers: { "Content-Type": "application/json" }, body: t.body },
-          );
-          const data = await res.json().catch(() => ({}));
-          if (!res.ok) {
-            errors.push(`${t.label}: ${data.error || `HTTP ${res.status}`}`);
+          if (t.size <= REPLIT_MAX_BYTES) {
+            // 小数据直接 POST（File 时浏览器 chunked 流式上传，string 时一次发送）
+            setJsonProgress(`(${i}/${tasks.length}) 上传 ${t.label}（${t.sizeHint}）…`);
+            accumulate(await postOne(t.field, t.source));
           } else {
-            const totalsAny = totals as unknown as Record<string, unknown>;
-            for (const k of Object.keys(data)) {
-              if (k.startsWith("imported_") && typeof data[k] === "number") {
-                const cur = totalsAny[k];
-                totalsAny[k] = (typeof cur === "number" ? cur : 0) + data[k];
-              }
+            // 大数据：读到 string → JSON.parse → 切片 → 多次 POST
+            setJsonProgress(`(${i}/${tasks.length}) 读取 ${t.label}（${t.sizeHint}）…`);
+            const rawText = t.source instanceof File ? await t.source.text() : t.source;
+            let arr: unknown;
+            try {
+              arr = JSON.parse(rawText);
+            } catch (e) {
+              throw new Error(`JSON 解析失败: ${(e as Error).message}`);
+            }
+            // keys 字段兼容 {keys_with_meta:[...]} / {keys:[...]} 结构
+            if (!Array.isArray(arr) && t.field === "keys" && arr && typeof arr === "object") {
+              const o = arr as Record<string, unknown>;
+              arr = (o.keys_with_meta as unknown[]) || (o.keys as unknown[]) || [];
+            }
+            if (!Array.isArray(arr)) {
+              throw new Error(`${t.label} 不是 JSON 数组`);
+            }
+            const list = arr as unknown[];
+            const total = list.length;
+            const batches = Math.ceil(total / CHUNK_ITEMS) || 1;
+            for (let b = 0; b < batches; b++) {
+              const slice = list.slice(b * CHUNK_ITEMS, (b + 1) * CHUNK_ITEMS);
+              setJsonProgress(
+                `(${i}/${tasks.length}) ${t.label} 分批 ${b + 1}/${batches}（本批 ${slice.length} 条 / 共 ${total.toLocaleString()} 条）…`,
+              );
+              accumulate(await postOne(t.field, JSON.stringify(slice)));
             }
           }
         } catch (e: unknown) {
@@ -229,7 +272,7 @@ export default function Dashboard() {
       if (errors.length) totals.error = errors.join("； ");
       setJsonResult(totals);
       if (errors.length === 0) {
-        // 成功后清空所有 slot，避免重复提交
+        // 全部成功后清空所有 slot，避免重复提交
         setJsonFiles({});
         setJsonFields({});
       }
