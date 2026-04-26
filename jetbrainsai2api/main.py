@@ -4899,10 +4899,38 @@ async def admin_import_from_source(request: Request, data: dict = Body(...)):
 
     async with httpx.AsyncClient(verify=False, timeout=120) as client:
         # 1. 先拉综合导出
-        resp = await client.get(f"{source_url}/admin/accounts/export-all", headers=hdrs)
+        try:
+            resp = await client.get(f"{source_url}/admin/accounts/export-all", headers=hdrs)
+        except Exception as e:
+            return JSONResponse(
+                status_code=502,
+                content={"error": f"无法连接源服务器 {source_url}: {type(e).__name__}: {e}"},
+            )
         if resp.status_code != 200:
-            return JSONResponse(status_code=502, content={"error": f"source returned {resp.status_code}"})
-        payload = resp.json()
+            # 透传远端响应体，方便诊断（截短到 800 字，去掉 HTML 标签噪音）
+            try:
+                body_obj = resp.json()
+                detail = body_obj.get("error") or body_obj.get("detail") or json.dumps(body_obj, ensure_ascii=False)[:800]
+            except Exception:
+                detail = (resp.text or "")[:800]
+            hint = ""
+            if resp.status_code == 401 or resp.status_code == 403:
+                hint = "（请检查 source_admin_key 是否正确）"
+            elif resp.status_code == 404:
+                hint = "（源服务器没有 /admin/accounts/export-all 接口，可能版本过旧）"
+            elif resp.status_code >= 500:
+                hint = "（源服务器内部错误，常见原因：数据库 schema 不一致或缺表，请到源服务器查看后端日志）"
+            return JSONResponse(
+                status_code=502,
+                content={"error": f"source returned {resp.status_code}{hint}: {detail}"},
+            )
+        try:
+            payload = resp.json()
+        except Exception as e:
+            return JSONResponse(
+                status_code=502,
+                content={"error": f"源服务器返回的不是合法 JSON: {type(e).__name__}: {e}"},
+            )
 
         # 2. 奖品：若综合导出未包含，回退到 /admin/prizes
         prizes = payload.get("prizes")
