@@ -5186,6 +5186,31 @@ async def admin_set_key_usage(key: str, request: Request):
     return {"success": True, "key": key[:8] + "***", "usage_count": new_count}
 
 
+@app.patch("/admin/keys/{key}/set-limit")
+async def admin_set_key_limit(key: str, request: Request):
+    """修改密钥的额度上限（usage_limit）。传 null 或省略 → 不限次数。"""
+    body = await request.json()
+    if key not in VALID_CLIENT_KEYS:
+        raise HTTPException(status_code=404, detail="密钥不存在")
+    raw_limit = body.get("usage_limit", None)
+    new_limit: Optional[int]
+    if raw_limit is None:
+        new_limit = None
+    else:
+        if not isinstance(raw_limit, (int, float)) or int(raw_limit) < 0:
+            raise HTTPException(status_code=400, detail="usage_limit 必须为非负整数或 null")
+        new_limit = int(raw_limit)
+    VALID_CLIENT_KEYS[key]["usage_limit"] = new_limit
+    if DB_POOL:
+        async with DB_POOL.acquire() as conn:
+            await conn.execute(
+                "UPDATE jb_client_keys SET usage_limit = $1 WHERE key = $2",
+                new_limit, key,
+            )
+    _admin_cache_invalidate("keys")
+    return {"success": True, "key": key[:8] + "***", "usage_limit": new_limit}
+
+
 @app.delete("/admin/keys/{key}")
 async def admin_delete_key(key: str):
     """删除客户端 API 密钥"""

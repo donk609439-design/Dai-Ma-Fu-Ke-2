@@ -1,6 +1,6 @@
 import { useState, useMemo } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { Plus, Trash2, RefreshCw, Key, Copy, Eye, EyeOff, Infinity, User, Users, Search, X, Eraser, ShieldOff, ShieldCheck, ChevronDown, ChevronRight, Ban, ShieldAlert, SlidersHorizontal, Clock, UserCog } from "lucide-react";
+import { Plus, Trash2, RefreshCw, Key, Copy, Eye, EyeOff, Infinity, User, Users, Search, X, Eraser, ShieldOff, ShieldCheck, ChevronDown, ChevronRight, Ban, ShieldAlert, SlidersHorizontal, Clock, UserCog, Pencil } from "lucide-react";
 import { adminFetch } from "@/lib/admin-auth";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -57,6 +57,11 @@ export default function ApiKeys() {
   const [toMin, setToMin] = useState("0");
   const [toMax, setToMax] = useState("50");
   const [previewValues, setPreviewValues] = useState<Record<string, number>>({});
+  // 单 key 修改额度上限
+  const [editLimitKey, setEditLimitKey] = useState<string | null>(null);
+  const [editLimitValue, setEditLimitValue] = useState<string>("");
+  const [editLimitUnlimited, setEditLimitUnlimited] = useState<boolean>(false);
+  const [editUsageValue, setEditUsageValue] = useState<string>("");
 
   const { data, isLoading, refetch } = useQuery<KeysData>({
     queryKey: ["admin-keys"],
@@ -215,6 +220,81 @@ export default function ApiKeys() {
     },
     onError: (e: Error) => toast({ title: "部分修改失败", description: e.message, variant: "destructive" }),
   });
+
+  // 修改单 key 的额度上限（usage_limit）
+  const setLimitMutation = useMutation({
+    mutationFn: async (payload: { key: string; usage_limit: number | null; usage_count?: number }) => {
+      const reqs: Promise<Response>[] = [
+        adminFetch(`/admin/keys/${encodeURIComponent(payload.key)}/set-limit`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ usage_limit: payload.usage_limit }),
+        }),
+      ];
+      if (payload.usage_count !== undefined) {
+        reqs.push(
+          adminFetch(`/admin/keys/${encodeURIComponent(payload.key)}/set-usage`, {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ usage_count: payload.usage_count }),
+          })
+        );
+      }
+      const results = await Promise.all(reqs);
+      for (const r of results) {
+        if (!r.ok) {
+          let msg = "修改失败";
+          try { msg = (await r.json()).detail ?? msg; } catch {}
+          throw new Error(msg);
+        }
+      }
+      return true;
+    },
+    onSuccess: () => {
+      toast({ title: "已保存", description: "密钥额度已更新" });
+      setEditLimitKey(null);
+      qc.invalidateQueries({ queryKey: ["admin-keys"] });
+      qc.invalidateQueries({ queryKey: ["admin-status"] });
+    },
+    onError: (e: Error) => toast({ title: "保存失败", description: e.message, variant: "destructive" }),
+  });
+
+  const openEditLimit = (m: KeyMeta) => {
+    setEditLimitKey(m.key);
+    if (m.usage_limit == null) {
+      setEditLimitUnlimited(true);
+      setEditLimitValue("");
+    } else {
+      setEditLimitUnlimited(false);
+      setEditLimitValue(String(m.usage_limit));
+    }
+    setEditUsageValue(String(m.usage_count));
+  };
+
+  const submitEditLimit = () => {
+    if (!editLimitKey) return;
+    let limit: number | null;
+    if (editLimitUnlimited) {
+      limit = null;
+    } else {
+      const n = parseInt(editLimitValue, 10);
+      if (isNaN(n) || n < 0) {
+        toast({ title: "请输入有效的额度（≥ 0 的整数）", variant: "destructive" });
+        return;
+      }
+      limit = n;
+    }
+    let usage: number | undefined;
+    if (editUsageValue.trim() !== "") {
+      const u = parseInt(editUsageValue, 10);
+      if (isNaN(u) || u < 0) {
+        toast({ title: "请输入有效的已用量（≥ 0 的整数）", variant: "destructive" });
+        return;
+      }
+      usage = u;
+    }
+    setLimitMutation.mutate({ key: editLimitKey, usage_limit: limit, usage_count: usage });
+  };
 
   const openAdjustDialog = () => {
     setPreviewValues({});
@@ -443,6 +523,15 @@ export default function ApiKeys() {
               onClick={() => copyKey(meta.key)}>
               <Copy className="w-3.5 h-3.5" />
             </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-8 w-8 p-0 text-muted-foreground hover:text-primary hover:bg-primary/10"
+              onClick={() => openEditLimit(meta)}
+              title="修改额度上限"
+            >
+              <Pencil className="w-3.5 h-3.5" />
+            </Button>
             {isBanned ? (
               <Button
                 variant="ghost"
@@ -483,8 +572,77 @@ export default function ApiKeys() {
     return (data?.keys_with_meta ?? []).filter((m) => previewValues[m.key] !== undefined);
   }, [data, previewValues]);
 
+  const editingMeta = editLimitKey ? allKeys.find((m) => m.key === editLimitKey) : null;
+  const editingMasked = editingMeta?.masked ?? (editLimitKey ? editLimitKey.slice(0, 8) + "***" : "");
+
   return (
     <div className="p-6 space-y-6">
+      {/* 修改单 key 额度上限 */}
+      <Dialog open={!!editLimitKey} onOpenChange={(o) => { if (!o) setEditLimitKey(null); }}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <Pencil className="w-4 h-4 text-primary" />
+              修改密钥额度
+            </DialogTitle>
+          </DialogHeader>
+          <div className="space-y-4 mt-2">
+            <div className="rounded-md border border-border bg-muted/30 px-3 py-2">
+              <p className="text-xs text-muted-foreground mb-1">目标密钥</p>
+              <code className="text-sm font-mono text-foreground break-all">{editingMasked}</code>
+            </div>
+
+            <div className="space-y-2">
+              <div className="flex items-center justify-between">
+                <Label>额度上限（usage_limit）</Label>
+                <label className="flex items-center gap-1.5 text-xs text-muted-foreground cursor-pointer select-none">
+                  <input
+                    type="checkbox"
+                    className="accent-primary"
+                    checked={editLimitUnlimited}
+                    onChange={(e) => setEditLimitUnlimited(e.target.checked)}
+                  />
+                  不限次数
+                </label>
+              </div>
+              <Input
+                type="number"
+                min={0}
+                placeholder={editLimitUnlimited ? "已勾选不限次数" : "例如：50"}
+                value={editLimitUnlimited ? "" : editLimitValue}
+                onChange={(e) => setEditLimitValue(e.target.value)}
+                disabled={editLimitUnlimited}
+                className="text-sm font-mono"
+              />
+              <p className="text-xs text-muted-foreground">
+                填写一个非负整数；勾选「不限次数」会把上限清空（设为 null）
+              </p>
+            </div>
+
+            <div className="space-y-2">
+              <Label>已用量（usage_count，可选）</Label>
+              <Input
+                type="number"
+                min={0}
+                placeholder="留空则不修改"
+                value={editUsageValue}
+                onChange={(e) => setEditUsageValue(e.target.value)}
+                className="text-sm font-mono"
+              />
+              <p className="text-xs text-muted-foreground">
+                同步把已用量调整到指定值；可用来"重置"（填 0）
+              </p>
+            </div>
+          </div>
+          <DialogFooter className="mt-4">
+            <Button variant="outline" onClick={() => setEditLimitKey(null)}>取消</Button>
+            <Button onClick={submitEditLimit} disabled={setLimitMutation.isPending}>
+              {setLimitMutation.isPending ? "保存中…" : "保存"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       {/* 调整用量弹窗 */}
       <Dialog open={adjustOpen} onOpenChange={(o) => { if (!o) { setAdjustOpen(false); setPreviewValues({}); } }}>
         <DialogContent className="sm:max-w-md max-h-[80vh] flex flex-col">
