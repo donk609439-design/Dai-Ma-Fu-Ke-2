@@ -2757,13 +2757,21 @@ async def _retry_pending_nc_lids():
     # 全局 proxy 轮询计数器（线程安全不需要，asyncio 单线程）
     _pnc_proxy_counter = 0
 
-    def _log(msg: str, level: str = "info", is_low=None):
-        """is_low: None=全局事件（写主日志） / True=LOW 行事件（仅写 LOW 日志） / False=主行事件（仅写主日志）"""
-        entry = {"ts": time.time(), "msg": msg, "level": level}
+    def _log(msg: str, level: str = "info", is_low=None, low_msg: str = None):
+        """
+        is_low: None=全局事件（写主日志） / True=LOW 行事件（仅写 LOW 日志） / False=主行事件（仅写主日志）
+        low_msg: 当日志会写入 LOW 用户面板时（is_low=True），优先使用此简化文案。
+                 不暴露内部术语（trusted/Untrusted/licenseId/信任凭证/NC/492/批量等），
+                 让 LOW 用户看到的日志与"普通用户单账号激活"的友好提示风格一致。
+                 不传则用 msg。主管理员侧（is_low=False/None）始终用 msg，便于排查。
+        """
         if is_low is True:
+            shown = low_msg if low_msg else msg
+            entry = {"ts": time.time(), "msg": shown, "level": level}
             _pending_nc_retry_log_low.append(entry)
-            print(f"[pending-nc:LOW] {msg}")
+            print(f"[pending-nc:LOW] {shown}")
         else:
+            entry = {"ts": time.time(), "msg": msg, "level": level}
             _pending_nc_retry_log.append(entry)
             print(f"[pending-nc] {msg}")
 
@@ -2843,7 +2851,10 @@ async def _retry_pending_nc_lids():
                     if "pending_nc_discord_id" in row.keys() else ""
                 )
                 if not email or not password:
-                    _log(f"⚠ {row['id']} 缺少邮箱/密码，跳过", "warn", is_low=row_is_low)
+                    _log(
+                        f"⚠ {row['id']} 缺少邮箱/密码，跳过", "warn", is_low=row_is_low,
+                        low_msg="⚠ 账号信息不完整，跳过本次激活",
+                    )
                     return None
                 short_email = email[:email.index("@")] + "@..." if "@" in email else email
                 def _relogin():
@@ -2863,9 +2874,15 @@ async def _retry_pending_nc_lids():
                         return None
                 id_token = await loop.run_in_executor(None, _relogin)
                 if not id_token:
-                    _log(f"❌ {short_email} 登录失败，跳过本轮", "error", is_low=row_is_low)
+                    _log(
+                        f"❌ {short_email} 登录失败，跳过本轮", "error", is_low=row_is_low,
+                        low_msg=f"❌ {short_email} 账号登录失败，稍后会自动重试",
+                    )
                     return None
-                _log(f"🔑 {short_email} 登录成功", "info", is_low=row_is_low)
+                _log(
+                    f"🔑 {short_email} 登录成功", "info", is_low=row_is_low,
+                    low_msg=f"✓ {short_email} 账号登录成功",
+                )
                 return (row, id_token, short_email)
 
             login_results = await asyncio.gather(*[_login_row(row) for row in rows])
@@ -2944,10 +2961,14 @@ async def _retry_pending_nc_lids():
                 meta = row_meta[row_id]
                 id_token = meta["id_token"]
                 row_is_low = meta.get("is_low", False)
+                _se = meta.get("short_email", "账号")  # LOW 面板用邮箱前缀代替 lid
                 status_code = res.get("status", -1)
                 if status_code == -1:
                     row_results[row_id]["still"].append(lid)
-                    _log(f"❌ {lid} → 网络异常: {res.get('error', '?')}", "error", is_low=row_is_low)
+                    _log(
+                        f"❌ {lid} → 网络异常: {res.get('error', '?')}", "error", is_low=row_is_low,
+                        low_msg=f"❌ {_se} 网络暂时不稳定，稍后会自动重试",
+                    )
                 elif status_code == 200:
                     try:
                         body = json.loads(res["body"])
@@ -2973,28 +2994,52 @@ async def _retry_pending_nc_lids():
                                     async with account_rotation_lock:
                                         JETBRAINS_ACCOUNTS.append(new_acc)
                                     await _save_account_to_db(new_acc)
-                                    _log(f"✅ {lid} → trusted，已入池", "success", is_low=row_is_low)
+                                    _log(
+                                        f"✅ {lid} → trusted，已入池", "success", is_low=row_is_low,
+                                        low_msg=f"✓ {_se} 账号激活成功，已入池",
+                                    )
                                 else:
-                                    _log(f"✅ {lid} → trusted（已在池中，跳过重复）", "success", is_low=row_is_low)
+                                    _log(
+                                        f"✅ {lid} → trusted（已在池中，跳过重复）", "success", is_low=row_is_low,
+                                        low_msg=f"✓ {_se} 账号已存在，跳过重复添加",
+                                    )
                                 row_results[row_id]["trusted"].append(real_lid)
                             else:
                                 row_results[row_id]["still"].append(lid)
-                                _log(f"⏳ {lid} → 200 但 license_type 不含 free-tier，继续等待", "warn", is_low=row_is_low)
+                                _log(
+                                    f"⏳ {lid} → 200 但 license_type 不含 free-tier，继续等待", "warn", is_low=row_is_low,
+                                    low_msg=f"⏳ {_se} 账号验证中，请稍候",
+                                )
                         else:
                             row_results[row_id]["still"].append(lid)
-                            _log(f"⏳ {lid} → 200 但无 token，继续等待", "warn", is_low=row_is_low)
+                            _log(
+                                f"⏳ {lid} → 200 但无 token，继续等待", "warn", is_low=row_is_low,
+                                low_msg=f"⏳ {_se} 账号验证中，请稍候",
+                            )
                     except Exception as e:
                         row_results[row_id]["still"].append(lid)
-                        _log(f"⚠ {lid} → 解析异常: {e}", "warn", is_low=row_is_low)
+                        _log(
+                            f"⚠ {lid} → 解析异常: {e}", "warn", is_low=row_is_low,
+                            low_msg=f"⚠ {_se} 账号信息解析异常，稍后重试",
+                        )
                 elif status_code == 492:
                     row_results[row_id]["still"].append(lid)
                     body_snippet = (res.get("body") or "")[:250].replace("\n", " ")
-                    _log(f"⏳ {lid} → 492 Untrusted，继续等待  body={body_snippet!r}", "pending", is_low=row_is_low)
+                    _log(
+                        f"⏳ {lid} → 492 Untrusted，继续等待  body={body_snippet!r}", "pending", is_low=row_is_low,
+                        low_msg=f"⏳ {_se} 账号验证中，请稍候",
+                    )
                 elif status_code == 429:
                     row_results[row_id]["still"].append(lid)
-                    _log(f"⚠ {lid} → 429 限流，保留下次重试", "warn", is_low=row_is_low)
+                    _log(
+                        f"⚠ {lid} → 429 限流，保留下次重试", "warn", is_low=row_is_low,
+                        low_msg=f"⏳ {_se} 系统繁忙，稍后会自动重试",
+                    )
                 else:
-                    _log(f"❌ {lid} → HTTP {status_code}，放弃重试", "error", is_low=row_is_low)
+                    _log(
+                        f"❌ {lid} → HTTP {status_code}，放弃重试", "error", is_low=row_is_low,
+                        low_msg=f"❌ {_se} 账号激活失败，已停止重试",
+                    )
 
             # ── Phase 3：更新 DB、按需升级密钥 ──
             for row_id, rr in row_results.items():
@@ -3014,9 +3059,17 @@ async def _retry_pending_nc_lids():
                     )
                 resolved = len(pending_lids) - len(still_pending)
                 if resolved > 0:
-                    _log(f"📊 {short_email}：本轮 {resolved} 个已信任，{len(still_pending)} 个仍等待", "info", is_low=row_is_low)
+                    _log(
+                        f"📊 {short_email}：本轮 {resolved} 个已信任，{len(still_pending)} 个仍等待",
+                        "info", is_low=row_is_low,
+                        low_msg=f"📊 {short_email}：本轮成功激活 {resolved} 个账号，{len(still_pending)} 个仍在验证中",
+                    )
                 else:
-                    _log(f"📊 {short_email}：全部 {len(still_pending)} 个仍在等待", "info", is_low=row_is_low)
+                    _log(
+                        f"📊 {short_email}：全部 {len(still_pending)} 个仍在等待",
+                        "info", is_low=row_is_low,
+                        low_msg=f"📊 {short_email}：账号仍在验证中，请耐心等待（共 {len(still_pending)} 个）",
+                    )
 
                 NC_QUOTA_THRESHOLD = 4
                 already_bound = [x for x in pending_nc_bound_ids_str.split(",") if x.strip()]
@@ -3040,6 +3093,10 @@ async def _retry_pending_nc_lids():
                                 f"LOW 用户密钥额度 +{_LOW_USER_KEY_QUOTA}（当前总额度 {new_quota}，"
                                 f"本邮箱贡献 {len(all_ids)} 个账号）",
                                 "success", is_low=True,
+                                low_msg=(
+                                    f"🎉 {short_email} 激活成功！"
+                                    f"密钥额度已增加 +{_LOW_USER_KEY_QUOTA}（当前总额度 {new_quota}）"
+                                ),
                             )
                             # 同时持久化：bound_ids 累积、本行 granted 置 TRUE
                             async with db.acquire() as _ub:
@@ -3060,6 +3117,10 @@ async def _retry_pending_nc_lids():
                             f"ℹ {short_email} 本轮新增 {len(newly_trusted_ids)} 个信任凭证，"
                             f"但本邮箱已贡献过 +{_LOW_USER_KEY_QUOTA} 额度，不重复计入",
                             "info", is_low=True,
+                            low_msg=(
+                                f"ℹ {short_email} 本轮新增 {len(newly_trusted_ids)} 个账号，"
+                                f"该批次额度已发放，不重复计入"
+                            ),
                         )
                     elif newly_trusted_ids:
                         # 未达阈值：仅累积 bound_ids，等待下轮
@@ -3072,6 +3133,10 @@ async def _retry_pending_nc_lids():
                             f"📊 {short_email} 当前 {len(all_ids)}/{NC_QUOTA_THRESHOLD} 个信任凭证，"
                             f"未达阈值",
                             "info", is_low=True,
+                            low_msg=(
+                                f"📊 {short_email} 当前已激活 {len(all_ids)}/{NC_QUOTA_THRESHOLD} 个账号，"
+                                f"继续验证中"
+                            ),
                         )
                 else:
                     # ── 普通用户（非 LOW）：保持原"全部信任后一次性升至 25"逻辑 ──
