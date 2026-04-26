@@ -150,6 +150,27 @@ def _cf_post(url: str, **kwargs) -> "requests.Response":
         return requests.post(proxy, headers=headers, **kwargs)
     return requests.post(url, **kwargs)
 
+
+def _cf_get(url: str, **kwargs) -> "requests.Response":
+    """通过 CF 代理池发送 GET 请求（无代理则直连）。
+    Worker 端按原 URL 透传 method/headers/body，因此 GET 的 query string 必须
+    预先合并到 url 里再传给 worker——这里复用 requests 自身的 params 编码：
+    若调用方传了 params=，先用一个 PreparedRequest 把它拼到 url 上，再走 worker。
+    """
+    proxy = _get_proxy_url()
+    if proxy:
+        params = kwargs.pop("params", None)
+        if params:
+            # 用 PreparedRequest 拼接 query string，与 requests.get(url, params=...) 等价
+            from requests.models import PreparedRequest as _PR
+            _pr = _PR()
+            _pr.prepare_url(url, params)
+            url = _pr.url
+        headers = dict(kwargs.pop("headers", {}))
+        headers["x-target-url"] = url
+        return requests.get(proxy, headers=headers, **kwargs)
+    return requests.get(url, **kwargs)
+
 ENCRYPTED_HOSTNAME = "837dXi0iwT8bX6hyYx/jj8C3zRdOhXGfldH6IDWxUGxhR+uNhgtqr0mXpXf/nJd5ieCAGcQXo2XtV2lzBdTEDA=="
 ENCRYPTED_USERNAME = "2iPzpOCWsIFuwgcAUOrGzZJDJA2tC1zeZXPkHWhSk5rFRoqp2BtfvhVv6yMaBp9a/opRRmMKvHgHseDc2usEmg=="
 MACHINE_ID = "17ff7a9c-ee0d-409f-a556-a85e43c4097a"
@@ -319,7 +340,9 @@ def obtain_trial(user_id, ide_product_code="II", build_number="2025.1.1 Build IU
       encoded_asset: 成功时 EncodedAsset base64 数据，失败时为空字符串。
     """
     salt = str(int(time.time() * 1000))
-    r = requests.get(f"{JB}/lservice/rpc/obtainTrial.action", params={
+    # 走 CF 代理池：obtainTrial.action 在批量激活时会被快速触发 6×N 次，
+    # 直连容易被 account.jetbrains.com 限流；无代理时 _cf_get 自动降级为直连。
+    r = _cf_get(f"{JB}/lservice/rpc/obtainTrial.action", params={
         "productFamilyId": product_family_id,
         "userId": user_id,
         "hostName": ENCRYPTED_HOSTNAME,
@@ -556,7 +579,8 @@ def get_jwt_from_ides_endpoint(encoded_assets, log_cb=None):
 
     def _try_ides(label, license_val):
         try:
-            r = requests.post(url, json={"license": license_val}, headers=hdrs, timeout=15)
+            # 走 CF 代理池：api.jetbrains.ai 是限流核心域，直连极易 429
+            r = _cf_post(url, json={"license": license_val}, headers=hdrs, timeout=15)
             if r.status_code == 200:
                 try:
                     data = r.json()
@@ -743,8 +767,9 @@ def create_nc_licenses(s, user_id, log_cb=None):
             "checkedOptions": "agreementAccepted", "machineUUID": MACHINE_UUID,
         }
         try:
-            r = requests.get(f"{JB}/lservice/rpc/obtainFreeLicense.action", params=params,
-                             headers={"User-Agent": f"{pc}/261.23567.141"}, timeout=15)
+            # 走 CF 代理池：6 个 IDE 各调一次 obtainFreeLicense.action（批量激活时压力大）
+            r = _cf_get(f"{JB}/lservice/rpc/obtainFreeLicense.action", params=params,
+                        headers={"User-Agent": f"{pc}/261.23567.141"}, timeout=15)
             rc = re.search(r"<responseCode>(.*?)</responseCode>", r.text)
             has_asset = "<EncodedAsset>" in r.text
             msg = re.search(r"<message>(.*?)</message>", r.text)
@@ -766,8 +791,9 @@ def create_nc_licenses(s, user_id, log_cb=None):
         "expiredLicenseDays": "0", "machineUUID": MACHINE_UUID,
     }
     try:
-        r_aip = requests.get(f"{JB}/lservice/rpc/obtainLicense.action", params=params_aip,
-                             headers={"User-Agent": "WebStorm/261.23567.141"}, timeout=15)
+        # 走 CF 代理池：批量场景下与 obtainFreeLicense 同源同 IP 限流
+        r_aip = _cf_get(f"{JB}/lservice/rpc/obtainLicense.action", params=params_aip,
+                        headers={"User-Agent": "WebStorm/261.23567.141"}, timeout=15)
         rc_aip = re.search(r"<responseCode>(.*?)</responseCode>", r_aip.text)
         _log(f"  [nc-create:AIP] obtainLicense rc={rc_aip.group(1) if rc_aip else '?'}", log_cb)
     except Exception as e:
@@ -802,7 +828,8 @@ def get_jwt_from_grazie_lite(id_token, log_cb=None):
 
     try:
         # 步骤1: 获取 JBALicense（含 licenseId）
-        r = requests.post(grazie_lite_url, headers=hdrs, timeout=15)
+        # 走 CF 代理池：api.jetbrains.ai 是限流核心域，与 register_grazie/get_jwt 一致
+        r = _cf_post(grazie_lite_url, headers=hdrs, timeout=15)
         _log(f"  [grazie-lite] HTTP {r.status_code}: {r.text[:300]}", log_cb)
         if r.status_code != 200:
             return None, None, f"grazie-lite HTTP {r.status_code}"
@@ -819,7 +846,8 @@ def get_jwt_from_grazie_lite(id_token, log_cb=None):
 
             # 步骤2: ★ 核心调用 — licenseId → provide-access/license/v2（含 429 重试）
             for attempt in range(1, 5):
-                r2 = requests.post(v2_url, json={"licenseId": lic_id}, headers=hdrs, timeout=15)
+                # 走 CF 代理池：高频被 429 的核心端点
+                r2 = _cf_post(v2_url, json={"licenseId": lic_id}, headers=hdrs, timeout=15)
                 _log(f"  [grazie-lite→v2] 尝试{attempt}: HTTP {r2.status_code}: {r2.text[:200]}", log_cb)
                 if r2.status_code == 200:
                     data2 = r2.json()
@@ -864,7 +892,8 @@ def get_jwt_multiformat(id_token, license_ids, encoded_assets, log_cb=None):
 
     def _try(label, url, body):
         try:
-            r = requests.post(url, json=body, headers=hdrs, timeout=15)
+            # 走 CF 代理池：multiformat 会循环尝试 7+ 种格式，全打 api.jetbrains.ai，最易触发 429
+            r = _cf_post(url, json=body, headers=hdrs, timeout=15)
             if r.status_code == 200:
                 data = r.json()
                 token = data.get("token", "")
