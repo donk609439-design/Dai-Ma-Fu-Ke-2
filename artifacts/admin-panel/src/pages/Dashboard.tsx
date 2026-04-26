@@ -1,6 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import { useState } from "react";
-import { RefreshCw, Server, Users, Key, Cpu, CheckCircle, XCircle, AlertCircle, Activity, Database, ArrowDownToLine, ClipboardPaste, ChevronDown, ChevronUp, Stethoscope } from "lucide-react";
+import { RefreshCw, Server, Users, Key, Cpu, CheckCircle, XCircle, AlertCircle, Activity, Database, ArrowDownToLine, ClipboardPaste, ChevronDown, ChevronUp, Stethoscope, Upload } from "lucide-react";
 import { adminFetch, getAdminKey } from "@/lib/admin-auth";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -8,6 +8,7 @@ import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
+import { useToast } from "@/hooks/use-toast";
 
 interface StatusData {
   status: string;
@@ -103,6 +104,7 @@ SELECT COALESCE(json_agg(row_to_json(t)), '[]'::json) FROM (
 ];
 
 export default function Dashboard() {
+  const { toast } = useToast();
   const [sourceUrl, setSourceUrl] = useState("");
   const [sourceKey, setSourceKey] = useState("");
   const [migrating, setMigrating] = useState(false);
@@ -521,17 +523,97 @@ export default function Dashboard() {
 
           {/* 粘贴区 */}
           <div className="space-y-3">
-            {SQL_INSTRUCTIONS.map(item => (
-              <div key={item.field} className="space-y-1.5">
-                <Label className="text-xs text-muted-foreground">{item.label} JSON（留空跳过）</Label>
-                <Textarea
-                  placeholder={`粘贴 ${item.label} 的 JSON 数组…`}
-                  value={jsonFields[item.field] || ""}
-                  onChange={e => setJsonFields(prev => ({ ...prev, [item.field]: e.target.value }))}
-                  className="font-mono text-xs h-20 resize-y"
-                />
-              </div>
-            ))}
+            {SQL_INSTRUCTIONS.map(item => {
+              const val = jsonFields[item.field] || "";
+              const charCount = val.length;
+              return (
+                <div key={item.field} className="space-y-1.5">
+                  <div className="flex items-center justify-between gap-2 flex-wrap">
+                    <Label className="text-xs text-muted-foreground">{item.label} JSON（留空跳过）</Label>
+                    <div className="flex items-center gap-2">
+                      {charCount > 0 && (
+                        <span className="text-[10px] text-muted-foreground font-mono">{charCount.toLocaleString()} 字符</span>
+                      )}
+                      <input
+                        type="file"
+                        accept=".json,application/json,.txt,text/plain"
+                        id={`upload-${item.field}`}
+                        className="hidden"
+                        onChange={async (e) => {
+                          const file = e.target.files?.[0];
+                          if (!file) return;
+                          try {
+                            const text = await file.text();
+                            const trimmed = text.trim();
+                            // 简单校验：必须以 [ 开头（数组）
+                            if (!trimmed.startsWith("[")) {
+                              toast({
+                                variant: "destructive",
+                                title: "文件格式错误",
+                                description: `${file.name} 不是 JSON 数组（应以 [ 开头）`,
+                              });
+                              return;
+                            }
+                            // 校验 JSON 合法性
+                            try {
+                              JSON.parse(trimmed);
+                            } catch (parseErr) {
+                              toast({
+                                variant: "destructive",
+                                title: "JSON 解析失败",
+                                description: `${file.name}: ${(parseErr as Error).message}`,
+                              });
+                              return;
+                            }
+                            setJsonFields(prev => ({ ...prev, [item.field]: trimmed }));
+                            toast({
+                              title: "已加载文件",
+                              description: `${file.name}（${(file.size / 1024).toFixed(1)} KB）`,
+                            });
+                          } catch (err) {
+                            toast({
+                              variant: "destructive",
+                              title: "读取文件失败",
+                              description: (err as Error).message,
+                            });
+                          } finally {
+                            // 清空 input 让同一文件可以再次上传
+                            e.target.value = "";
+                          }
+                        }}
+                      />
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        className="h-6 px-2 text-[11px]"
+                        onClick={() => document.getElementById(`upload-${item.field}`)?.click()}
+                      >
+                        <Upload className="w-3 h-3 mr-1" />
+                        上传 JSON 文件
+                      </Button>
+                      {charCount > 0 && (
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="ghost"
+                          className="h-6 px-2 text-[11px] text-muted-foreground hover:text-destructive"
+                          onClick={() => setJsonFields(prev => ({ ...prev, [item.field]: "" }))}
+                        >
+                          清空
+                        </Button>
+                      )}
+                    </div>
+                  </div>
+                  <Textarea
+                    placeholder={`粘贴 ${item.label} 的 JSON 数组，或点击右上角"上传 JSON 文件"…`}
+                    value={val}
+                    onChange={e => setJsonFields(prev => ({ ...prev, [item.field]: e.target.value }))}
+                    className="font-mono text-xs h-20 resize-y"
+                  />
+                </div>
+              );
+            })}
           </div>
 
           <Button
