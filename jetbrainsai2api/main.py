@@ -697,12 +697,9 @@ async def _ensure_db_tables():
         # LOW 用户个人专属密钥：绑定 Discord ID，多次激活累加配额到同一把 key
         await conn.execute("ALTER TABLE jb_client_keys ADD COLUMN IF NOT EXISTS low_admin_discord_id TEXT DEFAULT ''")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_jb_client_keys_discord ON jb_client_keys(low_admin_discord_id) WHERE low_admin_discord_id IS NOT NULL AND low_admin_discord_id <> ''")
-        # 一次性回填：将 jb_accounts.pending_nc_key 引用的 key 标记为 is_nc_key=TRUE
-        await conn.execute(
-            """UPDATE jb_client_keys SET is_nc_key = TRUE
-               WHERE key IN (SELECT pending_nc_key FROM jb_accounts WHERE pending_nc_key IS NOT NULL)
-                 AND (is_nc_key IS NULL OR is_nc_key = FALSE)"""
-        )
+        # 注意：将 pending_nc_key 引用的 key 标记 is_nc_key=TRUE 的回填，
+        # 必须放在下方 ALTER TABLE jb_accounts ADD COLUMN pending_nc_key 之后，
+        # 否则新建数据库时该列还不存在会报错。已挪至 ALTER 序列结束后。
         # 配额快照 & 外部调用检测
         await conn.execute("ALTER TABLE jb_accounts ADD COLUMN IF NOT EXISTS quota_snapshot_available DOUBLE PRECISION DEFAULT -1")
         await conn.execute("ALTER TABLE jb_accounts ADD COLUMN IF NOT EXISTS quota_snapshot_proxy_tokens BIGINT DEFAULT 0")
@@ -720,38 +717,14 @@ async def _ensure_db_tables():
         # 该邮箱（行）是否已为 LOW 用户的 key 贡献过 +16 额度
         # —— 同一邮箱凑够 4 个信任凭证只会触发一次 +16，不会重复计入
         await conn.execute("ALTER TABLE jb_accounts ADD COLUMN IF NOT EXISTS pending_nc_quota_granted BOOLEAN DEFAULT FALSE")
-        # 一次性回填：旧机制下"全部信任后一次性升 16/25"会导致 LOW key.usage_limit > 0；
-        # 切到新机制后，必须把"已经领过那次 +16 的最早一行"标记为 granted=TRUE，
-        # 否则重启后会被当作"未贡献"再次触发 +16，每个剩余 pending 行都会再加一次。
-        # 用 jb_settings 加幂等标记，确保只跑一次。
-        backfill_done = await conn.fetchval(
-            "SELECT v FROM jb_settings WHERE k = 'low_nc_quota_granted_backfill_v1'"
+        # 一次性回填：将 jb_accounts.pending_nc_key 引用的 key 标记为 is_nc_key=TRUE
+        # （必须在 jb_accounts 的 pending_nc_key 列被 ALTER 添加之后执行）
+        await conn.execute(
+            """UPDATE jb_client_keys SET is_nc_key = TRUE
+               WHERE key IN (SELECT pending_nc_key FROM jb_accounts WHERE pending_nc_key IS NOT NULL)
+                 AND (is_nc_key IS NULL OR is_nc_key = FALSE)"""
         )
-        if not backfill_done:
-            backfilled = await conn.fetchval(
-                """
-                WITH first_row_per_low_key AS (
-                    SELECT DISTINCT ON (a.pending_nc_key) a.id
-                    FROM jb_accounts a
-                    JOIN jb_client_keys k ON a.pending_nc_key = k.key
-                    WHERE a.pending_nc_low_admin = TRUE
-                      AND k.is_low_admin_key = TRUE
-                      AND COALESCE(k.usage_limit, 0) > 0
-                      AND a.pending_nc_quota_granted = FALSE
-                      AND a.pending_nc_key IS NOT NULL
-                      AND a.pending_nc_key <> ''
-                    ORDER BY a.pending_nc_key, a.id
-                )
-                UPDATE jb_accounts SET pending_nc_quota_granted = TRUE
-                WHERE id IN (SELECT id FROM first_row_per_low_key)
-                RETURNING id
-                """
-            )
-            await conn.execute(
-                "INSERT INTO jb_settings (k, v) VALUES ('low_nc_quota_granted_backfill_v1', '1') "
-                "ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v"
-            )
-            logger.info(f"✅ LOW NC 配额历史回填完成：已为已升级 LOW key 的最早一行标记 granted=TRUE")
+        # 注意：LOW NC 配额历史回填依赖 jb_settings 表，已挪到下方 jb_settings CREATE 之后。
         # 抽奖奖品表
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS lottery_prizes (
@@ -823,6 +796,36 @@ async def _ensure_db_tables():
                 v TEXT NOT NULL
             )
         """)
+        # 一次性回填：旧机制下"全部信任后一次性升 16/25"会导致 LOW key.usage_limit > 0；
+        # 切到新机制后，把"已经领过那次 +16 的最早一行"标记为 granted=TRUE，
+        # 否则重启后会被当作"未贡献"再次触发 +16。用 jb_settings 加幂等标记，确保只跑一次。
+        backfill_done = await conn.fetchval(
+            "SELECT v FROM jb_settings WHERE k = 'low_nc_quota_granted_backfill_v1'"
+        )
+        if not backfill_done:
+            await conn.execute(
+                """
+                WITH first_row_per_low_key AS (
+                    SELECT DISTINCT ON (a.pending_nc_key) a.id
+                    FROM jb_accounts a
+                    JOIN jb_client_keys k ON a.pending_nc_key = k.key
+                    WHERE a.pending_nc_low_admin = TRUE
+                      AND k.is_low_admin_key = TRUE
+                      AND COALESCE(k.usage_limit, 0) > 0
+                      AND a.pending_nc_quota_granted = FALSE
+                      AND a.pending_nc_key IS NOT NULL
+                      AND a.pending_nc_key <> ''
+                    ORDER BY a.pending_nc_key, a.id
+                )
+                UPDATE jb_accounts SET pending_nc_quota_granted = TRUE
+                WHERE id IN (SELECT id FROM first_row_per_low_key)
+                """
+            )
+            await conn.execute(
+                "INSERT INTO jb_settings (k, v) VALUES ('low_nc_quota_granted_backfill_v1', '1') "
+                "ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v"
+            )
+            logger.info("✅ LOW NC 配额历史回填完成：已为已升级 LOW key 的最早一行标记 granted=TRUE")
         # 对已有数据：从 donated_jb_accounts 预填 dc_tag（仅表存在时执行）
         await conn.execute("""
             DO $$ BEGIN
