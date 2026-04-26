@@ -1,27 +1,122 @@
-# Workspace
+# JetBrains AI Admin Panel Workspace
 
 ## Overview
 
-pnpm workspace monorepo using TypeScript. Each package manages its own dependencies.
+pnpm workspace monorepo 1:1 复刻自 https://github.com/zzz609439-stack/Code-Replica-1。
 
-## Stack
+一个完整的 JetBrains AI 账号管理与代理系统（中文界面）。
 
-- **Monorepo tool**: pnpm workspaces
-- **Node.js version**: 24
-- **Package manager**: pnpm
-- **TypeScript version**: 5.9
-- **API framework**: Express 5
-- **Database**: PostgreSQL + Drizzle ORM
-- **Validation**: Zod (`zod/v4`), `drizzle-zod`
-- **API codegen**: Orval (from OpenAPI spec)
-- **Build**: esbuild (CJS bundle)
+## 复刻状态（2026-04-26）
 
-## Key Commands
+源码已 1:1 复刻完成，三个工作流均正常运行：
+- admin-panel（端口 20130，路径 /admin-panel/）渲染中文管理员登录页
+- api-server（端口 8080）通过 spawn 子进程启动 Python 服务并代理转发
+- jetbrainsai2api（Python FastAPI，端口 8000）已连数据库并就绪
 
-- `pnpm run typecheck` — full typecheck across all packages
-- `pnpm run build` — typecheck + build all packages
-- `pnpm --filter @workspace/api-spec run codegen` — regenerate API hooks and Zod schemas from OpenAPI spec
-- `pnpm --filter @workspace/db run push` — push DB schema changes (dev only)
-- `pnpm --filter @workspace/api-server run dev` — run API server locally
+### 数据库初始化注意
 
-See the `pnpm-workspace` skill for workspace structure, TypeScript setup, and package details.
+源码 `_ensure_db_tables()` 中存在迁移顺序问题：在 `ALTER TABLE jb_accounts ADD COLUMN pending_nc_key` 之前就执行了 `SELECT pending_nc_key FROM jb_accounts` 的回填语句。
+全新数据库必须预先创建带 `pending_nc_key` 列的 `jb_accounts` 表，否则启动会失败。当前数据库已完成预建。
+若重置数据库，需重新执行：
+```sql
+DROP TABLE IF EXISTS jb_accounts CASCADE;
+DROP TABLE IF EXISTS jb_client_keys CASCADE;
+CREATE TABLE jb_accounts (
+  id TEXT PRIMARY KEY, license_id TEXT, auth_token TEXT, jwt TEXT,
+  last_updated DOUBLE PRECISION DEFAULT 0, last_quota_check DOUBLE PRECISION DEFAULT 0,
+  has_quota BOOLEAN DEFAULT TRUE, created_at TIMESTAMPTZ DEFAULT NOW(),
+  pending_nc_key TEXT DEFAULT NULL
+);
+CREATE TABLE jb_client_keys (
+  key TEXT PRIMARY KEY, usage_limit INTEGER, usage_count INTEGER DEFAULT 0,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+```
+
+### 必需的环境变量
+
+要使代理服务真正可用，需配置：
+- `ADMIN_KEY` 或 `ADMIN_KEYS` — 管理面板登录密钥
+- `jetbrainsai2api/jetbrainsai.json` — JetBrains AI 账号配置
+- `jetbrainsai2api/client_api_keys.json` — 客户端 API 密钥
+
+未配置时服务仍会启动但接口返回 503/未配置错误。
+
+## Architecture
+
+### Artifacts
+
+- **admin-panel** (`artifacts/admin-panel/`) — React + Vite frontend, port 20130, path `/admin-panel/`
+- **api-server** (`artifacts/api-server/`) — Express API server, port 8080, path `/`
+  - Proxies AI requests to Python FastAPI backend on port 8000
+  - Spawns `jetbrainsai2api/main.py` via uvicorn at startup
+
+### Key Directories
+
+- `lib/db/` — `@workspace/db` — Drizzle ORM PostgreSQL client
+- `lib/api-zod/` — `@workspace/api-zod` — Zod schemas for API validation
+- `lib/api-client-react/` — `@workspace/api-client-react` — React API client
+- `jetbrainsai2api/` — Python FastAPI backend for JetBrains AI activation
+- `cf-worker.js` — Cloudflare Worker for CF proxy pool
+
+### Frontend Pages (admin-panel)
+
+Dashboard, Accounts, ApiKeys, Models, Stats, Logs, Docs, Prizes, Partners, DonatedAccounts, ProxyPool, Activate, PendingQueue, SelfRegister, KeyUsage, Backpack, Donate, Lottery
+
+## Tech Stack
+
+- **Frontend**: React 19, Vite 7, TailwindCSS 4, shadcn/ui, wouter, @tanstack/react-query
+- **API Server**: Node.js + Express 5, pino logging, http-proxy-middleware
+- **Python Backend**: FastAPI, uvicorn, httpx, cryptography
+- **Database**: PostgreSQL via Drizzle ORM (for Node.js), SQLite (for Python via aiosqlite)
+- **Language**: TypeScript + Python 3.11
+
+## Environment Variables
+
+- `ADMIN_KEY` / `ADMIN_KEYS` — Admin authentication key(s)
+- `LOW_ADMIN_KEY` — Secondary admin key (low_admin role) — limited /admin/* whitelist (status, activate, low-cf-proxies, low-config, pending-nc/low, cf-proxies/test)
+- `DATABASE_URL` — PostgreSQL connection string
+- `SESSION_SECRET` — Session secret
+- `PORT` — Server port (8080 for API server, 20130 for admin panel)
+
+## LOW_ADMIN Subsystem
+
+LOW_ADMIN_KEY users get a separate, isolated activation flow with their own per-tier limits:
+
+- **Per-tier limits** — Constants in `main.py`: `_NORMAL_KEY_QUOTA=25`, `_LOW_USER_KEY_QUOTA=16`, `_LOW_USER_INPUT_TOKENS=300_000`, `_LOW_USER_OUTPUT_TOKENS=40_000`. Helpers `_key_tier()` and `_key_tier_limits()` resolve a key → its tier limits. `/v1/chat/completions` and `/v1/messages` enforce token caps per tier; `_activate_key_quota` upgrades quota to 16 (LOW) or 25 (normal) based on the `is_low_admin_key` column.
+- **Per-key tagging** — `jb_client_keys.is_low_admin_key` (bool) marks LOW-issued keys at creation; load/upsert/bulk-save preserve it; cleanup uses `usage_limit > 0` (no longer hard-coded 25).
+- **Dedicated CF pool, sharded by Discord ID** — `cf_proxy_pool` rows with `owner='low_admin'` are further split by `owner_discord_id` (TEXT NOT NULL DEFAULT ''). The unique key is `(url, owner, owner_discord_id)`. `jb_activate.LOW_CF_PROXY_POOL` is now `Dict[discord_id, list[url]]` and `_low_proxy_idx` is `Dict[discord_id, int]`; `_set_proxy_pool_context(use_low, discord_id)` is thread-local so `_get_proxy_url()` picks the LOW user's own sub-pool. `process_account(..., use_low_pool=True, low_discord_id=...)` propagates the routing key end-to-end. Pending-NC rows store the originating discord ID in `jb_accounts.pending_nc_discord_id`; `_retry_pending_nc_lids` reads it back and routes auto-retries to the matching sub-pool.
+- **Forced Discord auth for LOW users** — `/admin/activate` and `/admin/activate-batch` now require LOW users to send a Discord-verified `discord_token` (same gate as guests; only the daily-20 cap is skipped for LOW). The verified Discord user_id becomes `low_discord_id` and is persisted alongside every pending-NC row, so auto-retries always replay through the same Discord sub-pool.
+- **Per-Discord LOW pool admin sub-page** — `/admin/low-cf-proxies` is owner-aware: full admins see every sub-pool grouped by Discord ID and may target any bucket via `?discord_id=` (GET) or `discord_id` body field (POST). LOW users must send `X-Discord-Token` and are hard-pinned to their own bucket. New admin page `LowCfPoolAdmin.tsx` (route `/proxy-pool/low-users`) renders all sub-pools collapsibly. The LOW-user page `LowCfPool.tsx` shows a Discord login gate first, then injects the Discord token into every request.
+- **Single executor for ALL LOW work** — `_low_executor` is a single shared `ThreadPoolExecutor` returned by `_get_low_executor()`. Both single LOW activation and batch LOW activation submit to it, so the global concurrency setting throttles BOTH paths. `_reset_low_executor()` is invoked on `PATCH /admin/low-config` to rebuild the pool with the new size.
+- **Batch activate** — `POST /admin/activate-batch` accepts up to 50 `email:password` lines, enforces a 1 hour cooldown between batches, runs through `_get_low_executor()`. Each account gets a pre-issued NC key tagged `is_low_admin_key=true` and a normal `task_id`/SSE stream just like single activation.
+- **Pending-NC retry concurrency** — `_retry_pending_nc_lids` uses TWO semaphores (`sem_main=10`, `sem_low=_low_admin_concurrency`); LOW rows compete only against other LOW rows. Pending-NC rows carry `pending_nc_discord_id` so retries replay through the correct Discord sub-pool.
+- **LOW-only retry log** — `_pending_nc_retry_log_low` deque accumulates retry events for LOW rows only; surfaced via `logs_low` field on `/admin/pending-nc` (admin) and `/admin/pending-nc/low` (LOW or admin).
+- **Configuration** — `GET/PATCH /admin/low-config` returns/updates `concurrency` (1–50), persisted in the `jb_settings` k/v table and reloaded on startup.
+- **Personal key accumulation** — `GET/POST/DELETE /admin/low-user-key`: LOW users create exactly ONE personal API key (stored in `jb_client_keys` with their `low_admin_discord_id`). All subsequent single and batch activations accumulate quota (+16 each) to that key instead of generating a new pre-issued key. Helper `_get_low_personal_key(discord_id)` / `_add_low_quota(api_key, new_acc_ids)` manage this in the stream handler and pending-NC path.
+- **Personal key export / import** — `GET /admin/low-user-key/export` returns the user's personal key as a JSON payload (`version`, `owner_discord_id`, `key`, `usage_limit`, `usage_count`, `account_id` CSV, banned flags, plus an HMAC-SHA256 `signature`). `POST /admin/low-user-key/import` restores it. Security invariants enforced server-side:
+  1. **HMAC signing (anti-forgery)** — Helper `_low_key_export_sign(payload)` computes HMAC-SHA256 over the canonical JSON of `_LOW_KEY_EXPORT_SIG_FIELDS` using **`SESSION_SECRET` only** (no fallback — fails closed if env var is missing). Import rejects (400) any payload with missing or mismatched signature via `hmac.compare_digest`, blocking client-side forgery of `usage_limit` / `usage_count` / `owner_discord_id` etc. Migrating between deployments requires the same `SESSION_SECRET`.
+  2. **Auth gate** — Helper `_verify_low_user_discord(request)` requires `LOW_ADMIN_KEY` + a valid `X-Discord-Token` (admin key is rejected with 403).
+  3. **Owner consistency (defense-in-depth)** — Even after signature verification, the JSON's `owner_discord_id` must equal the verifying Discord ID (403).
+  4. **Per-Discord asyncio lock** — Helper `_get_low_user_key_lock(discord_id)` returns a per-user `asyncio.Lock`; the entire check-then-insert-then-audit sequence runs inside it. Concurrent imports for the same Discord ID are serialized — exactly one succeeds, the rest get 409.
+  5. **Pre-existence guard** — Import is rejected (409) if the user already holds a personal key (must DELETE first), or if the key string already belongs to a different Discord ID (409).
+  6. **Anti-replay audit (persistent)** — The `jb_settings` k/v table holds an audit row keyed `low_audit:{discord_id}` containing `last_usage_count`, `last_usage_limit`, `banned`, `banned_at`. Helpers `_low_audit_load` / `_low_audit_save` maintain it with monotonic-max merge for usage and sticky-True for banned (`_low_audit_save` itself wraps its load→merge→upsert in a separate `_low_audit_save_locks` per-Discord lock so concurrent saves cannot clobber each other). Write sites: `low_user_key_create` (baseline 0/0/false), `_add_low_quota` (every quota accumulation), `admin_ban_key` (manual ban), the external-usage auto-ban loop in `_external_usage_check`, and `low_user_key_delete` (snapshots current `usage_count`/`usage_limit` before removal so delete-then-import can never roll back quota). The audit row is **NOT deleted on DELETE**. On import: (a) reject 409 if `payload.usage_count < audit.last_usage_count` (prevents quota rollback), (b) reject 409 if `audit.banned == True && payload.banned == False` (prevents self-unban via pre-ban backup), (c) compute `effective_banned = payload.banned OR audit.banned` so a ban is never lost. Ban-import mutex: helper `_persist_low_user_ban(discord_id, ts)` acquires the per-Discord import lock then writes audit AND re-applies `banned=True` to the current in-memory key (and `_upsert_key_to_db`), so a ban happening concurrently with an import can never produce a runtime state where audit says banned but the active key is unbanned. `admin_ban_key` awaits this helper synchronously; the external auto-ban loop spawns it via `create_task` (the helper acquires the same import lock, so any subsequent import for that user serializes behind it). `low_user_key_delete` itself runs under the same per-Discord import lock for full mutex with import / ban paths.
+  7. **Format / version guards** — `key` is regex-validated `[A-Za-z0-9_\-\.]{8,128}` (400); `version` > `_LOW_KEY_EXPORT_VERSION` (currently 1) is rejected (400).
+  
+  On success, the key is restored with `is_low_admin_key=True` forced and the audit row updated. UI: `LowPersonalKey` panel adds three buttons — **导出备份** (downloads `jbai-personal-key-YYYY-MM-DD.json`), **删除并重置** (with confirm dialog), and **从备份导入** (hidden `<input type=file>` → POST).
+- **UI** — `Activate.tsx` renders a `LowPersonalKey` panel (LOW users see it after Discord login; shows key + usage stats + copy button), a `LowConcurrencyConfig` panel (visible to admin + low_admin), and `LowBatchPanel`. The concurrency input lives ONLY in the global panel. Tier-aware quota labels show "额度 16" / "额度 25". `PendingQueue.tsx` shows two tabs. Admin sees all LOW sub-pools grouped by Discord ID at `/proxy-pool/low-users` (`LowCfPoolAdmin.tsx`). LOW users manage their own sub-pool at `/my-cf-pool` (`LowCfPool.tsx`), which gates on Discord login and displays the user's Discord tag + ID in the header.
+
+## Call Logs & Usage Exemption
+
+- **Call log buffer** — `_call_logs` is an in-memory `deque(maxlen=500)`. Each entry now carries `discord_id` (resolved from `VALID_CLIENT_KEYS[key].low_admin_discord_id` at append time) and `exempt: bool`.
+- **`GET /admin/logs`** — admin sees ALL logs; LOW user (`X-Admin-Key=LOW_ADMIN_KEY` + `X-Discord-Token`) sees only logs whose `discord_id` matches their verified Discord user_id (401 if no Discord verification). `DELETE /admin/logs` mirrors the same scoping (LOW only erases own rows).
+- **Path whitelist** — `/admin/logs` added to `_LOW_ADMIN_ALLOWED_PREFIXES`; the endpoint internally re-verifies Discord, so LOW users cannot bypass scoping by omitting the header.
+- **Frontend `Logs.tsx`** — admin-mode shows a `Discord` column; LOW-user mode renders a Discord-login gate first and auto-injects `X-Discord-Token` on every request. Added a "计费 / 豁免" column (amber badge for exempt rows). LOW users get a `/logs` nav entry under their sidebar (`lowAdminNavItems`) and a matching `<Route path="/logs">` in `LowAdminRoutes`.
+- **Real token capture in streaming** — `openai_stream_adapter` accepts an optional `_usage_capture: Dict[str, int]` and writes the FinishMetadata-derived `prompt_tokens` / `completion_tokens` into it. `_tracked_stream` and `_stream_with_key_consume` now share the same `usage_capture` dict so log entries and consumption decisions both use real upstream tokens (falling back to char-based estimation when FinishMetadata is missing).
+- **Usage exemption (applies to ALL keys)** — `_USAGE_EXEMPT_INPUT_TOKENS = 200`, `_USAGE_EXEMPT_OUTPUT_TOKENS = 200`; helper `_is_call_exempt(p, c)` returns `True` only when BOTH are below the threshold. Streaming consumption was refactored: `_stream_with_key_consume` no longer fires on the first content chunk — the entire `async for` is now wrapped in `try/finally` so the post-loop billing decision (consume vs exempt) ALSO runs when the client disconnects mid-stream (GeneratorExit / CancelledError), preventing billing-bypass via early disconnect. The inner `_consume_key_usage` call is itself wrapped in `try/except` so a billing failure cannot block resource cleanup. Non-streaming paths (`/v1/chat/completions` and `/v1/messages`) gate `_consume_key_usage` purely on `not is_exempt` (the previous `completion_text` precondition was removed because tool_calls-only responses are legitimate billable calls). All paths write `exempt=is_exempt` into the log entry. The exemption applies to non-LOW keys too — small probe/heartbeat-style calls do not count toward `usage_count`.
+- **Token source parity** — `_tracked_stream` (which writes log rows) and `_stream_with_key_consume` (which charges) BOTH parse inline SSE `usage` chunks and use the same priority order: `FinishMetadata capture > inline SSE usage > char-based estimation`. This guarantees the token counts shown in 调用日志 match the tokens used for billing decisions, even in the fallback-estimation path.
+- **管理面板"次级管理员 key"分组（`/admin/keys` + ApiKeys.tsx）** — `GET /admin/keys` 的 `keys_with_meta` 现在额外返回 `is_low_admin_key: bool` 与 `low_admin_discord_id: str`。前端 `ApiKeys.tsx` 在 useMemo 中先把 `is_low_admin_key=true` 的密钥从 `normalKeys/multiKeys/pendingKeys` 中剔除，单独装入 `lowAdminKeys` 并按 `low_admin_discord_id` 进一步分组；UI 上以橙色 `UserCog` 图标的折叠区域呈现，每个 Discord 用户一张子卡片，显示该用户名下密钥总数与累计 `已用/上限` 次数。搜索框现在也按 `low_admin_discord_id` 匹配。所有 LOW 密钥创建路径均已通过 `_admin_cache_invalidate("keys", "status")` 失效缓存（main.py 6173/6206），因此新建密钥后 15s TTL 不会出现脏数据。
+- **Anthropic 流式计费修复（`/v1/messages` stream）** — `openai_to_anthropic_stream_adapter` 之前 `message_start` 与 `message_delta` 的 `usage` 都硬编码为 `{input_tokens: 0, output_tokens: 0}`，违反 Anthropic 规范且让客户端无法读到真实计费。现在签名扩展为 `(openai_stream, model_name, usage_capture, est_prompt_tokens)`：`message_start.usage.input_tokens` 用 `est_prompt_tokens`（与 chat_completions 保持一致），`message_delta.usage` 优先取 `usage_capture` 中由 `openai_stream_adapter` 写入的 FinishMetadata 真实 token；若上游未给（usage_capture 为空），则回退用 `est_prompt_tokens` 作 input、按 `len(content_text)//4` 估算 output（保证非零）。`messages_completions` 调用处同时传入 `usage_capture` 与 `prompt_tokens` 以打通这一链路。`/v1/chat/completions`（流式 + 非流式）以及 `/v1/messages` 非流式此前已通过 `aggregate_stream_for_non_stream_response` 与 `convert_openai_to_anthropic_response` 正确返回 `usage`，本次只补齐了 Anthropic 流式这条最后的漏洞。
+- **LOW 预签 key 的 Discord 归属修复（架构师建议）** — `/admin/activate` 与 `/admin/activate-batch` 在为 LOW 用户预签发 0 额度 key 时，过去只写了 `is_low_admin_key=True` 但漏写 `low_admin_discord_id`，导致管理面板"次级管理员 key"分组里这些预签 key 被错误归入"未知"用户。现在两个路径都把 `dc_user_id` 写入 `low_admin_discord_id` 字段，并在写入 `VALID_CLIENT_KEYS` 后立即调用 `_admin_cache_invalidate("keys", "status")`，避免 15s TTL 下管理员看到陈旧分组。
+- **Anthropic 流式 input_tokens 单调性保证** — `openai_to_anthropic_stream_adapter` 的最终 `message_delta.usage.input_tokens` 现在会被 clamp 到 `>= initial_input`（即 `message_start.usage.input_tokens` 用的估算值），防止上游 FinishMetadata 报告的 prompt_tokens 小于估算值时让严格的 Anthropic 客户端看到"input_tokens 中途下降"的非单调序列。单元测试 TEST C/D/E 全部通过：clamp 生效（10→100）、不必要时不 clamp（200 保持 200）、fallback 不为零。
+- **管理员整库迁移导出/导入补齐 `low_admin_discord_id`** — `/admin/accounts/export-all` 与 `_do_bulk_import`（被 `/admin/accounts/bulk-import` 与 `/admin/accounts/import-from-source` 复用）此前只携带 `is_low_admin_key`，漏掉 `low_admin_discord_id`，导致服务器迁移后所有 LOW key 都被前端归到「未知」分组里。现在导出 SQL 增加 `COALESCE(low_admin_discord_id, '') as low_admin_discord_id`，导出 JSON 多出该字段；`_do_bulk_import` 的 INSERT SQL 增加该列与 `$9` 参数，行构造从 payload 读 `low_admin_discord_id`，ON CONFLICT 用 `COALESCE(NULLIF(EXCLUDED.low_admin_discord_id,''), jb_client_keys.low_admin_discord_id)` 保证 upsert 不会用空值覆盖已有归属。注：LOW 用户的个人 key 单独导出/导入端点（`/admin/low-user-key/export|import`）不需要改 — 导入时已强制用调用者验证过的 Discord ID 写 `low_admin_discord_id`，不依赖备份文件里的字段（更安全）。Roundtrip 验证：导出 2 把 LOW key → 重新导入 → `/admin/keys` 显示 Discord ID 完整保留（`'1382720893633171578'` 与空串均正确）。

@@ -1,0 +1,129 @@
+/**
+ * JetBrains API Reverse Proxy — Cloudflare Worker
+ *
+ * 部署步骤：
+ * 1. 登录 https://workers.cloudflare.com
+ * 2. 新建 Worker → 把此文件内容粘贴进去 → 部署
+ * 3. 获取 Worker URL（如 https://jb-proxy.xxx.workers.dev）
+ * 4. 在管理面板 → CF代理池 → 添加该 URL
+ *
+ * 可部署多个 Worker（不同名称），组成代理池，自动轮询分散 IP。
+ *
+ * v2：新增登录代理支持
+ * - Set-Cookie 响应头中剥离 Domain 属性，使 Python requests.Session 能正确
+ *   将 JetBrains 的 cookie 存入 workers.dev 域，实现透明的会话管理
+ * - 同时代理 account.jetbrains.com 登录流程和 provide-access 接口
+ */
+
+const ALLOWED_HOSTS = [
+  "account.jetbrains.com",
+  "api.jetbrains.ai",
+  "oauth.account.jetbrains.com",
+];
+
+/**
+ * 剥离 Set-Cookie 中的 Domain 属性，并把 SameSite=Strict 降级为 Lax
+ * 使 Python requests.Session 能把 cookie 存入 Worker 域，正常发送给后续请求
+ */
+function stripCookieDomain(setCookieStr) {
+  return setCookieStr
+    .split(";")
+    .map((p) => p.trim())
+    .filter((p) => !p.toLowerCase().startsWith("domain"))
+    .map((p) =>
+      p.toLowerCase() === "samesite=strict" ? "SameSite=Lax" : p,
+    )
+    .join("; ");
+}
+
+export default {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+
+    // 健康检查
+    if (url.pathname === "/health") {
+      return new Response(JSON.stringify({ ok: true, worker: "jb-proxy" }), {
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    // 从请求头读取目标 URL
+    const targetUrl = request.headers.get("x-target-url");
+    if (!targetUrl) {
+      return new Response(
+        JSON.stringify({ error: "Missing x-target-url header" }),
+        { status: 400, headers: { "Content-Type": "application/json" } },
+      );
+    }
+
+    // 安全校验：只允许转发到 JetBrains 域
+    let targetHost;
+    try {
+      targetHost = new URL(targetUrl).hostname;
+    } catch {
+      return new Response("Invalid target URL", { status: 400 });
+    }
+    if (!ALLOWED_HOSTS.includes(targetHost)) {
+      return new Response(
+        JSON.stringify({ error: `Host ${targetHost} not allowed` }),
+        { status: 403, headers: { "Content-Type": "application/json" } },
+      );
+    }
+
+    // 构建转发请求头（去掉 x-target-url 和 host，重新设置 host）
+    const headers = new Headers();
+    for (const [k, v] of request.headers.entries()) {
+      const kl = k.toLowerCase();
+      if (kl === "x-target-url" || kl === "host") continue;
+      headers.set(k, v);
+    }
+    headers.set("host", targetHost);
+
+    // 读取请求体（GET/HEAD 无 body）
+    let body = undefined;
+    if (request.method !== "GET" && request.method !== "HEAD") {
+      body = await request.arrayBuffer();
+    }
+
+    try {
+      const resp = await fetch(targetUrl, {
+        method: request.method,
+        headers,
+        body,
+        redirect: "follow",
+      });
+
+      // ── 构建响应头 ──────────────────────────────────────────────────────────
+      // 不用 new Headers(resp.headers) 直接构造，因为它会折叠多个 Set-Cookie 为一行
+      const respHeaders = new Headers();
+      for (const [k, v] of resp.headers.entries()) {
+        const kl = k.toLowerCase();
+        if (kl === "set-cookie") continue;       // 单独处理
+        if (kl === "content-encoding") continue; // 避免 Worker 双重压缩
+        respHeaders.set(k, v);
+      }
+      respHeaders.set("x-proxy-worker", "jb-cf-proxy");
+
+      // 剥离 Set-Cookie Domain，使 Python requests.Session 正常存储 cookie
+      // CF Workers 专有 API：getAll('set-cookie') 返回每条独立的 Set-Cookie 字符串
+      const rawSetCookies =
+        typeof resp.headers.getAll === "function"
+          ? resp.headers.getAll("set-cookie")
+          : [];
+      for (const sc of rawSetCookies) {
+        respHeaders.append("set-cookie", stripCookieDomain(sc));
+      }
+
+      return new Response(resp.body, {
+        status: resp.status,
+        statusText: resp.statusText,
+        headers: respHeaders,
+      });
+    } catch (err) {
+      return new Response(
+        JSON.stringify({ error: "Upstream fetch failed", detail: err.message }),
+        { status: 502, headers: { "Content-Type": "application/json" } },
+      );
+    }
+  },
+};
