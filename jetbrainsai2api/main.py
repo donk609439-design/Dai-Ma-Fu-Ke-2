@@ -4732,10 +4732,10 @@ async def admin_bulk_import(request: Request, data: dict = Body(...)):
 
 @app.post("/admin/extra-import")
 async def admin_extra_import(request: Request, data: dict = Body(...)):
-    """从粘贴的 JSON 直接导入奖品/抽奖/积分/密码/背包/后备能源（不含账号密钥）"""
+    """从粘贴的 JSON 直接导入奖品/抽奖/积分/密码/背包/后备能源；可选附带 accounts/keys（用于源端 export-all 崩溃时手动迁移账号）"""
     if request.headers.get("X-Admin-Key", "") != ADMIN_KEY:
         return JSONResponse(status_code=403, content={"error": "forbidden"})
-    return await _do_extra_import(
+    extra = await _do_extra_import(
         prizes=data.get("prizes", []),
         saint_points=data.get("saint_points", []),
         saint_donations=data.get("saint_donations", []),
@@ -4744,6 +4744,13 @@ async def admin_extra_import(request: Request, data: dict = Body(...)):
         user_passwords=data.get("user_passwords", []),
         donated_jb_accounts=data.get("donated_jb_accounts", []),
     )
+    # 账号 / 密钥可选导入（源端 export-all 崩溃时的手动迁移路径）
+    accounts = data.get("accounts") or []
+    keys = data.get("keys") or []
+    if accounts or keys:
+        base_result = await _do_bulk_import(accounts, keys)
+        return {**base_result, **extra}
+    return extra
 
 
 @app.get("/admin/accounts/export-all")
@@ -4955,45 +4962,59 @@ async def admin_import_from_source(request: Request, data: dict = Body(...)):
         return None
 
     async with httpx.AsyncClient(verify=False, timeout=120) as client:
-        # 1. 先拉综合导出
+        # 1. 先拉综合导出（export-all）。若整个端点崩溃（500/超时/解析失败），
+        #    自动降级到"逐个单表端点"模式：账号无法通过单表拿到（/admin/accounts 脱敏），但
+        #    密钥/奖品/积分/捐献/密码/背包/球/CF代理/捐JB账号都能逐张表搬过来。
+        #    例外：401/403 鉴权失败 → 单表端点也会同样 401，没必要降级，直接报错。
+        export_all_failed_reason: Optional[str] = None
+        payload: dict = {}
         try:
             resp = await client.get(f"{source_url}/admin/accounts/export-all", headers=hdrs)
         except Exception as e:
-            return JSONResponse(
-                status_code=502,
-                content={"error": f"无法连接源服务器 {source_url}: {type(e).__name__}: {e}"},
-            )
-        if resp.status_code != 200:
-            # 透传远端响应体，方便诊断（截短到 800 字，去掉 HTML 标签噪音）
-            try:
-                body_obj = resp.json()
-                detail = body_obj.get("error") or body_obj.get("detail") or json.dumps(body_obj, ensure_ascii=False)[:800]
-            except Exception:
-                detail = (resp.text or "")[:800]
-            hint = ""
-            if resp.status_code == 401 or resp.status_code == 403:
-                hint = "（请检查 source_admin_key 是否正确）"
-            elif resp.status_code == 404:
-                hint = "（源服务器没有 /admin/accounts/export-all 接口，可能版本过旧）"
-            elif resp.status_code >= 500:
-                hint = "（源服务器内部错误，常见原因：数据库 schema 不一致或缺表，请到源服务器查看后端日志）"
-            return JSONResponse(
-                status_code=502,
-                content={"error": f"source returned {resp.status_code}{hint}: {detail}"},
-            )
-        try:
-            payload = resp.json()
-        except Exception as e:
-            return JSONResponse(
-                status_code=502,
-                content={"error": f"源服务器返回的不是合法 JSON: {type(e).__name__}: {e}"},
-            )
+            # 网络/连接/超时层失败 → 进入降级模式（单表端点可能更轻量、更易成功）
+            export_all_failed_reason = f"网络/连接/超时层失败: {type(e).__name__}: {e}"
+            resp = None  # type: ignore
+        if resp is not None:
+            if resp.status_code == 200:
+                try:
+                    payload = resp.json()
+                except Exception as e:
+                    export_all_failed_reason = f"返回的不是合法 JSON: {type(e).__name__}: {e}"
+                    payload = {}
+            else:
+                # 透传远端响应体，方便诊断（截短到 800 字，去掉 HTML 标签噪音）
+                try:
+                    body_obj = resp.json()
+                    detail = body_obj.get("error") or body_obj.get("detail") or json.dumps(body_obj, ensure_ascii=False)[:800]
+                except Exception:
+                    detail = (resp.text or "")[:800]
+                # 鉴权失败 → 单表端点也会同样失败，没必要降级，直接报错
+                if resp.status_code in (401, 403):
+                    return JSONResponse(
+                        status_code=502,
+                        content={"error": f"鉴权失败（HTTP {resp.status_code}）：{detail}（请检查 source_admin_key 是否正确）"},
+                    )
+                # 其他失败（500/404/502/...）→ 进入降级模式
+                export_all_failed_reason = f"HTTP {resp.status_code}（{detail or '响应体为空，可能源端进程崩溃或被 App Engine 前端截断'}）"
+                payload = {}
 
+        # —— 以下逐表 fallback：payload 缺字段时调用源端单表端点 ——
         # 2. 奖品：若综合导出未包含，回退到 /admin/prizes
         prizes = payload.get("prizes")
         if prizes is None:
             pr = await _try_get(client, "/admin/prizes")
             prizes = pr if isinstance(pr, list) else (pr.get("prizes", []) if isinstance(pr, dict) else [])
+
+        # 2b. 密钥：降级时回退到 /admin/keys（返回完整密钥，含 usage_limit/account_id/banned/...）
+        keys_payload = payload.get("keys")
+        if keys_payload is None:
+            kr = await _try_get(client, "/admin/keys")
+            if isinstance(kr, dict):
+                keys_payload = kr.get("keys_with_meta") or kr.get("keys") or []
+            elif isinstance(kr, list):
+                keys_payload = kr
+            else:
+                keys_payload = []
 
         # 3. 圣人积分：回退到 /admin/saint-points-export（新版端点）
         saint_points = payload.get("saint_points")
@@ -5045,7 +5066,7 @@ async def admin_import_from_source(request: Request, data: dict = Body(...)):
     # _do_bulk_import（账号+密钥）与 _do_extra_import（其余表）
     # 操作完全不同的表，无 FK 依赖，并发执行缩短导入时间
     base_result, extra = await asyncio.gather(
-        _do_bulk_import(payload.get("accounts", []), payload.get("keys", [])),
+        _do_bulk_import(payload.get("accounts", []), keys_payload or []),
         _do_extra_import(
             prizes=prizes or [],
             saint_points=saint_points or [],
@@ -5082,7 +5103,21 @@ async def admin_import_from_source(request: Request, data: dict = Body(...)):
                     except Exception as e:
                         print(f"[import-from-source] cf_proxy_pool 跳过 {url}: {e}")
             await load_cf_proxies_from_db()
-    return {**base_result, **extra, "imported_cf_proxies": cf_imported}
+
+    # 降级模式标记：让前端识别"账号未通过 export-all 拉取"
+    degraded_meta = {}
+    if export_all_failed_reason:
+        degraded_meta = {
+            "degraded": True,
+            "export_all_error": export_all_failed_reason,
+            "accounts_skipped": True,
+            "degraded_hint": (
+                "源端 /admin/accounts/export-all 失败，已降级到逐表模式：密钥/奖品/积分/捐献/密码/背包/球/CF代理/捐JB账号"
+                "已通过单表端点导入；账号数据（jb_accounts）因源端 /admin/accounts 接口脱敏，无法自动迁移，"
+                "请使用下方'JSON 粘贴导入'里的'账号 jb_accounts'输入框手动迁移。"
+            ),
+        }
+    return {**base_result, **extra, "imported_cf_proxies": cf_imported, **degraded_meta}
 
 
 @app.get("/admin/keys")

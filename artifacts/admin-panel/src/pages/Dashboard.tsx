@@ -28,7 +28,12 @@ interface MigrateResult {
   imported_saint_donations?: number;
   imported_user_items?: number;
   imported_pokeballs?: number;
+  imported_cf_proxies?: number;
   error?: string;
+  degraded?: boolean;
+  accounts_skipped?: boolean;
+  export_all_error?: string;
+  degraded_hint?: string;
 }
 
 interface ExtraImportResult {
@@ -42,6 +47,39 @@ interface ExtraImportResult {
 }
 
 const SQL_INSTRUCTIONS = [
+  {
+    label: "账号（jb_accounts）★ 当源端 export-all 崩溃时必填",
+    sql: `\\t on
+\\pset format unaligned
+SELECT COALESCE(json_agg(row_to_json(t)), '[]'::json) FROM (
+  SELECT id, license_id, auth_token, jwt,
+         COALESCE(has_quota, TRUE) AS has_quota,
+         COALESCE(last_updated, 0) AS last_updated,
+         COALESCE(last_quota_check, 0) AS last_quota_check,
+         daily_used, daily_total,
+         COALESCE(external_usage_count, 0) AS external_usage_count
+  FROM jb_accounts ORDER BY id
+) t;`,
+    field: "accounts",
+  },
+  {
+    label: "客户端密钥（jb_client_keys）",
+    sql: `\\t on
+\\pset format unaligned
+SELECT COALESCE(json_agg(row_to_json(t)), '[]'::json) FROM (
+  SELECT key,
+         COALESCE(usage_limit, 0) AS usage_limit,
+         COALESCE(usage_count, 0) AS usage_count,
+         account_id,
+         COALESCE(banned, FALSE) AS banned,
+         banned_at,
+         COALESCE(is_nc_key, FALSE) AS is_nc_key,
+         COALESCE(is_low_admin_key, FALSE) AS is_low_admin_key,
+         COALESCE(low_admin_discord_id, '') AS low_admin_discord_id
+  FROM jb_client_keys ORDER BY key
+) t;`,
+    field: "keys",
+  },
   {
     label: "背包物品（user_items）",
     sql: `SELECT json_agg(row_to_json(t)) FROM (SELECT owner_key, prize_name, metadata, used FROM user_items ORDER BY id) t;`,
@@ -392,11 +430,18 @@ export default function Dashboard() {
           })()}
 
           {migrateResult && (
-            <div className={`rounded-lg p-4 text-sm space-y-1 ${migrateResult.success ? "bg-emerald-500/10 border border-emerald-500/30" : "bg-destructive/10 border border-destructive/30"}`}>
+            <div className={`rounded-lg p-4 text-sm space-y-1 ${
+              migrateResult.success
+                ? (migrateResult.degraded
+                    ? "bg-amber-500/10 border border-amber-500/30"
+                    : "bg-emerald-500/10 border border-emerald-500/30")
+                : "bg-destructive/10 border border-destructive/30"
+            }`}>
               {migrateResult.success ? (
                 <>
-                  <p className="font-medium text-emerald-400 flex items-center gap-2">
-                    <CheckCircle className="w-4 h-4" /> 迁移完成
+                  <p className={`font-medium flex items-center gap-2 ${migrateResult.degraded ? "text-amber-400" : "text-emerald-400"}`}>
+                    {migrateResult.degraded ? <AlertCircle className="w-4 h-4" /> : <CheckCircle className="w-4 h-4" />}
+                    {migrateResult.degraded ? "迁移部分完成（降级模式）" : "迁移完成"}
                   </p>
                   <p className="text-muted-foreground">导入账号：<span className="text-foreground font-mono">{migrateResult.imported_accounts}</span>　导入密钥：<span className="text-foreground font-mono">{migrateResult.imported_keys}</span></p>
                   <p className="text-muted-foreground">当前账号总数：<span className="text-foreground font-mono">{migrateResult.total_accounts_now}</span>　密钥总数：<span className="text-foreground font-mono">{migrateResult.total_keys_now}</span></p>
@@ -410,8 +455,23 @@ export default function Dashboard() {
                   {(migrateResult.imported_user_items !== undefined) && (
                     <p className="text-muted-foreground">
                       背包物品：<span className="text-foreground font-mono">{migrateResult.imported_user_items}</span>　
-                      宝可梦球：<span className="text-foreground font-mono">{migrateResult.imported_pokeballs ?? 0}</span>
+                      宝可梦球：<span className="text-foreground font-mono">{migrateResult.imported_pokeballs ?? 0}</span>　
+                      CF 代理：<span className="text-foreground font-mono">{migrateResult.imported_cf_proxies ?? 0}</span>
                     </p>
+                  )}
+                  {migrateResult.degraded && (
+                    <div className="mt-3 pt-3 border-t border-amber-500/30 space-y-2">
+                      <p className="text-xs text-amber-300/90">
+                        <strong>源端 export-all 失败：</strong>
+                        <code className="font-mono break-all ml-1">{migrateResult.export_all_error}</code>
+                      </p>
+                      <p className="text-xs text-amber-200/80 leading-relaxed">
+                        {migrateResult.degraded_hint}
+                      </p>
+                      <p className="text-xs text-amber-100/90">
+                        ↓ 请在下方"JSON 粘贴导入"卡片里，按指引在源端 Shell 执行 SQL 拿到账号 JSON 后粘贴到"账号（jb_accounts）"输入框，最后点击"导入 JSON"。
+                      </p>
+                    </div>
                   )}
                 </>
               ) : (
