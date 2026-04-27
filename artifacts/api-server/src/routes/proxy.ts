@@ -78,11 +78,18 @@ function onProxyError(_err: Error, _req: unknown, res: any) {
 }
 
 // ── 代理实例 ──────────────────────────────────────────────────────
+// 长流式上限：10 分钟。
+// 原值 120s 在以下场景会被 Node 强制 abort（生产症状："开了流不出字"）：
+//   1) claude opus thinking 模型首 token > 2 分钟；
+//   2) _stream_with_account_fallback 在首字节前需要切多个 JWT 失效账号
+//      （每个 JetBrains JWT 刷新 ~10–30s，叠加 4 次即超 120s）；
+//   3) Python 端在 SSE 心跳器中每 25s 才发 keepalive 注释行；
+// 与 Python http_client read=900s 对齐，保留 5 分钟余量。
 const pythonProxy = createProxyMiddleware({
   target: "http://localhost:8000",
   changeOrigin: true,
-  proxyTimeout: 120_000,  // 2 分钟超时（兼容长流式请求）
-  timeout: 120_000,
+  proxyTimeout: 600_000,  // 10 分钟（流式接口需要的常规上限）
+  timeout: 600_000,
   on: { error: onProxyError },
 });
 
@@ -90,8 +97,8 @@ const anthropicProxy = createProxyMiddleware({
   target: "http://localhost:8000",
   changeOrigin: true,
   pathRewrite: { "^/anthropic": "" },
-  proxyTimeout: 120_000,
-  timeout: 120_000,
+  proxyTimeout: 600_000,
+  timeout: 600_000,
   on: { error: onProxyError },
 });
 

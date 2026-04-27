@@ -26,7 +26,24 @@ pnpm workspace monorepo 1:1 复刻自 https://github.com/zzz609439-stack/Code-Re
 
 修复：从 `_sse_with_keepalive` 移除 `is_disconnected()` 主动检测；保留 `request` 形参（兼容调用方）但不使用；保留 `try/finally + aclose`（无副作用，断连时 starlette 自己 cancel 仍会触发 GeneratorExit 走 finally，效果与主动检测等价但合规）。
 
-经架构师审查通过（`evaluate_task` + `includeGitDiff`）。最终生效改动总结：连接池配置升级 + PoolTimeout 转 503 + `_sse_with_keepalive` 的 finally aclose。
+经架构师审查通过（`evaluate_task` + `includeGitDiff`）。
+
+### 三阶段修复：Express 代理超时升至 10 分钟
+
+二阶段部署后用户再报"还是不出字"。根因（看生产日志直接命中）：
+```
+request aborted ... POST /v1/chat/completions ... statusCode=null responseTime=120002
+```
+**Node.js Express 代理层在 120 秒整点强制 abort 客户端**——`artifacts/api-server/src/routes/proxy.ts` 写死了 `proxyTimeout: 120_000` + `timeout: 120_000`，但下列场景轻松突破 2 分钟：
+1. claude opus thinking 等慢推理模型首 token > 2 分钟；
+2. `_stream_with_account_fallback` 在第一字节前需要切多个 JWT 失效账号（每个 JWT 刷新 ~10–30s，叠加 4 次即超 120s）；当前生产 grazie auth API 大量 401/500，触发概率极高；
+3. SSE 心跳器每 25s 才发 keepalive 注释行（`: ping\n\n`），开始的几秒内若没数据 Node 仍把它当"无响应"。
+
+与 Python 代码无关，纯 Node 代理配置问题。
+
+修复（`artifacts/api-server/src/routes/proxy.ts`）：将 `pythonProxy` / `anthropicProxy` 的 `proxyTimeout` 与 `timeout` 从 `120_000` 升至 `600_000`（10 分钟），与 Python `http_client` 的 `read=900s` 对齐并保留 5 分钟余量。短请求自然在毫秒级关闭，对它们零影响；只把"长流式被错杀"这条路堵上。
+
+最终生效改动总结：连接池配置升级 + PoolTimeout 转 503 + `_sse_with_keepalive` 的 finally aclose + Express 代理超时升至 10 分钟。
 
 ## 复刻状态（2026-04-26）
 
