@@ -1147,6 +1147,40 @@ async def _ensure_db_tables():
         """)
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_call_logs_ts ON call_logs(ts DESC)")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_call_logs_discord_id ON call_logs(discord_id)")
+        # ── AI 响应缓存（仅 LOW 用户）──────────────────────────────────────────
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS ai_response_cache (
+                cache_key         TEXT PRIMARY KEY,
+                scope             TEXT NOT NULL DEFAULT 'low',
+                owner_discord_id  TEXT NOT NULL DEFAULT '',
+                client_key        TEXT NOT NULL DEFAULT '',
+                route             TEXT NOT NULL,
+                model             TEXT NOT NULL,
+                request_hash      TEXT NOT NULL,
+                response_json     JSONB NOT NULL,
+                prompt_tokens     INTEGER NOT NULL DEFAULT 0,
+                completion_tokens INTEGER NOT NULL DEFAULT 0,
+                hit_count         INTEGER NOT NULL DEFAULT 0,
+                created_at        DOUBLE PRECISION NOT NULL,
+                expires_at        DOUBLE PRECISION NOT NULL
+            )
+        """)
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_ai_response_cache_owner ON ai_response_cache(owner_discord_id, expires_at)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_ai_response_cache_expires ON ai_response_cache(expires_at)")
+        # ── Idempotency-Key 缓存（仅 LOW 用户）────────────────────────────────
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS ai_idempotency_cache (
+                idempotency_key  TEXT NOT NULL,
+                owner_discord_id TEXT NOT NULL DEFAULT '',
+                client_key       TEXT NOT NULL DEFAULT '',
+                body_hash        TEXT NOT NULL,
+                response_json    JSONB NOT NULL,
+                created_at       DOUBLE PRECISION NOT NULL,
+                expires_at       DOUBLE PRECISION NOT NULL,
+                PRIMARY KEY (owner_discord_id, idempotency_key)
+            )
+        """)
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_ai_idempotency_expires ON ai_idempotency_cache(expires_at)")
     print("数据库表已就绪")
 
 
@@ -3325,6 +3359,186 @@ async def _persist_call_log(entry: dict) -> None:
         pass
 
 
+# ==================== LOW 用户 AI 响应缓存 ====================
+
+def _canonical_json(obj: Any) -> str:
+    """确定性 JSON 序列化（用于 hash）"""
+    return json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _is_low_cacheable_request(api_key: str, body: dict) -> tuple:
+    """判断本次请求是否满足 LOW 缓存条件。返回 (cacheable: bool, reason: str)"""
+    meta = VALID_CLIENT_KEYS.get(api_key, {})
+    if not meta.get("is_low_admin_key"):
+        return False, "not_low_key"
+    if body.get("stream") is True:
+        return False, "stream_not_cached"
+    try:
+        temperature = float(body.get("temperature", 1) or 1)
+    except Exception:
+        temperature = 1.0
+    if temperature > 0.3:
+        return False, "temperature_too_high"
+    if body.get("tools") or body.get("tool_choice") or body.get("functions") or body.get("function_call"):
+        return False, "tools_not_cached"
+    if len(json.dumps(body, ensure_ascii=False)) > 128 * 1024:
+        return False, "request_too_large"
+    for m in (body.get("messages") or []):
+        if isinstance(m.get("content"), list):
+            return False, "multimodal_not_cached"
+    return True, "ok"
+
+
+def _build_ai_cache_key(route: str, api_key: str, body: dict) -> tuple:
+    """生成缓存 key 与 request_hash。返回 (cache_key: str, request_hash: str)"""
+    meta = VALID_CLIENT_KEYS.get(api_key, {})
+    owner = str(meta.get("low_admin_discord_id") or "")
+    owner_scope = owner or api_key
+    normalized = dict(body)
+    normalized["stream"] = False     # 确保 key 与 stream 参数无关
+    raw = _canonical_json({"route": route, "owner_scope": owner_scope, "body": normalized})
+    request_hash = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    cache_key = f"low:{owner_scope}:{route}:{request_hash}"
+    return cache_key, request_hash
+
+
+async def _ai_cache_get(cache_key: str) -> Optional[dict]:
+    """从 DB 读取缓存行，命中则自动 hit_count +1。未命中/过期返回 None。"""
+    pool = await _get_db_pool()
+    if not pool:
+        return None
+    now = time.time()
+    try:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT response_json FROM ai_response_cache WHERE cache_key=$1 AND expires_at > $2",
+                cache_key, now,
+            )
+            if not row:
+                return None
+            await conn.execute(
+                "UPDATE ai_response_cache SET hit_count = hit_count + 1 WHERE cache_key=$1",
+                cache_key,
+            )
+            rj = row["response_json"]
+            return dict(rj) if isinstance(rj, dict) else json.loads(rj)
+    except Exception:
+        return None
+
+
+async def _ai_cache_set(
+    *,
+    cache_key: str,
+    owner_discord_id: str,
+    client_key: str,
+    route: str,
+    model: str,
+    request_hash: str,
+    response_json: dict,
+    prompt_tokens: int = 0,
+    completion_tokens: int = 0,
+    ttl_sec: int = 3600,
+) -> None:
+    """写入/更新缓存行。失败静默。"""
+    pool = await _get_db_pool()
+    if not pool:
+        return
+    now = time.time()
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO ai_response_cache (
+                    cache_key, scope, owner_discord_id, client_key,
+                    route, model, request_hash, response_json,
+                    prompt_tokens, completion_tokens,
+                    hit_count, created_at, expires_at
+                )
+                VALUES ($1,'low',$2,$3,$4,$5,$6,$7::jsonb,$8,$9,0,$10,$11)
+                ON CONFLICT (cache_key) DO UPDATE SET
+                    response_json     = EXCLUDED.response_json,
+                    prompt_tokens     = EXCLUDED.prompt_tokens,
+                    completion_tokens = EXCLUDED.completion_tokens,
+                    expires_at        = EXCLUDED.expires_at
+                """,
+                cache_key, owner_discord_id, client_key,
+                route, model, request_hash,
+                json.dumps(response_json, ensure_ascii=False),
+                prompt_tokens, completion_tokens,
+                now, now + ttl_sec,
+            )
+    except Exception as e:
+        print(f"[ai-cache] set error: {e}")
+
+
+async def _ai_idem_get(owner_scope: str, idem_key: str, body_hash: str) -> tuple:
+    """查询 Idempotency-Key 缓存。返回 (status, response_or_None)
+       status: 'miss' | 'hit' | 'conflict'
+    """
+    pool = await _get_db_pool()
+    if not pool:
+        return "miss", None
+    now = time.time()
+    try:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """SELECT body_hash, response_json FROM ai_idempotency_cache
+                   WHERE owner_discord_id=$1 AND idempotency_key=$2 AND expires_at > $3""",
+                owner_scope, idem_key, now,
+            )
+            if not row:
+                return "miss", None
+            if row["body_hash"] != body_hash:
+                return "conflict", None
+            rj = row["response_json"]
+            return "hit", (dict(rj) if isinstance(rj, dict) else json.loads(rj))
+    except Exception:
+        return "miss", None
+
+
+async def _ai_idem_set(
+    owner_scope: str, idem_key: str, client_key: str,
+    body_hash: str, response_json: dict, ttl_sec: int = 86400,
+) -> None:
+    """写入 Idempotency-Key 缓存。失败静默。"""
+    pool = await _get_db_pool()
+    if not pool:
+        return
+    now = time.time()
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO ai_idempotency_cache
+                    (idempotency_key, owner_discord_id, client_key, body_hash, response_json, created_at, expires_at)
+                VALUES ($1,$2,$3,$4,$5::jsonb,$6,$7)
+                ON CONFLICT (owner_discord_id, idempotency_key) DO NOTHING
+                """,
+                idem_key, owner_scope, client_key,
+                body_hash, json.dumps(response_json, ensure_ascii=False),
+                now, now + ttl_sec,
+            )
+    except Exception as e:
+        print(f"[ai-idem] set error: {e}")
+
+
+async def _cleanup_ai_response_cache_loop() -> None:
+    """每小时清理过期的 ai_response_cache 和 ai_idempotency_cache 行"""
+    await asyncio.sleep(3600)
+    while True:
+        try:
+            pool = await _get_db_pool()
+            if pool:
+                now = time.time()
+                async with pool.acquire() as conn:
+                    r1 = await conn.execute("DELETE FROM ai_response_cache WHERE expires_at < $1", now)
+                    r2 = await conn.execute("DELETE FROM ai_idempotency_cache WHERE expires_at < $1", now)
+                    print(f"[ai-cache] 清理完成：response_cache={r1}, idem={r2}")
+        except Exception as e:
+            print(f"[ai-cache] cleanup error: {e}")
+        await asyncio.sleep(3600)
+
+
 async def _cleanup_old_call_logs_loop() -> None:
     """每 24 小时清理 7 天前的调用日志记录。"""
     await asyncio.sleep(60)   # 启动后稍等，待 DB 池就绪
@@ -3418,6 +3632,7 @@ async def startup():
     asyncio.create_task(_retry_pending_nc_lids())       # NC 492 重试队列
     asyncio.create_task(_cf_proxy_health_check_loop())  # CF Worker 池健康检查
     asyncio.create_task(_cleanup_old_call_logs_loop())  # 调用日志 7 天自动清理
+    asyncio.create_task(_cleanup_ai_response_cache_loop())  # AI 响应缓存定期清理
     print("JetBrains AI OpenAI Compatible API 服务器已启动")
 
 
@@ -3988,6 +4203,43 @@ async def chat_completions(
     if not model_info and not models_data.get("data"):
         raise HTTPException(status_code=503, detail="服务未配置任何模型")
 
+    # ── LOW 用户缓存读取 ────────────────────────────────────────────────────
+    _req_body = request.model_dump(exclude_none=True)
+    _ai_cacheable, _cache_reason = _is_low_cacheable_request(client_key, _req_body)
+    _ai_cache_key: Optional[str] = None
+    _ai_cache_req_hash: Optional[str] = None
+    _ai_cache_owner: str = ""
+
+    if _ai_cacheable:
+        _ai_cache_key, _ai_cache_req_hash = _build_ai_cache_key("/v1/chat/completions", client_key, _req_body)
+        _meta = VALID_CLIENT_KEYS.get(client_key, {})
+        _ai_cache_owner = str(_meta.get("low_admin_discord_id") or "") or client_key
+
+        # Idempotency-Key 检查（优先）
+        _idem_header = http_request.headers.get("Idempotency-Key")
+        if _idem_header:
+            _body_hash = hashlib.sha256(_canonical_json(_req_body).encode()).hexdigest()
+            _idem_status, _idem_resp = await _ai_idem_get(_ai_cache_owner, _idem_header, _body_hash)
+            if _idem_status == "hit" and _idem_resp:
+                _idem_resp["cached"] = True
+                _idem_resp["cache_hit"] = True
+                _append_log(request.model, client_key, 0, 0, 0, "ok", exempt=True)
+                return JSONResponse(_idem_resp)
+            elif _idem_status == "conflict":
+                return JSONResponse(
+                    {"error": {"message": "Idempotency-Key conflict: body changed", "type": "conflict", "code": "409"}},
+                    status_code=409,
+                )
+
+        # Exact match 缓存
+        _cached_resp = await _ai_cache_get(_ai_cache_key)
+        if _cached_resp:
+            _cached_resp["cached"] = True
+            _cached_resp["cache_hit"] = True
+            _append_log(request.model, client_key, 0, 0, 0, "ok", exempt=True)
+            return JSONResponse(_cached_resp)
+    # ────────────────────────────────────────────────────────────────────────
+
     account = await get_next_jetbrains_account(client_key=client_key)
 
     # 从历史消息中创建 tool_call_id 到 function_name 的映射
@@ -4074,6 +4326,36 @@ async def chat_completions(
             _record_stats(account, actual_prompt, actual_completion, req_start)
             _append_log(request.model, client_key, actual_prompt, actual_completion,
                         (time.time() - req_start) * 1000, "ok", exempt=is_exempt)
+            # ── LOW 缓存写入 ────────────────────────────────────────────────
+            if _ai_cacheable and _ai_cache_key:
+                try:
+                    _resp_dict = resp.model_dump()
+                except Exception:
+                    _resp_dict = None
+            else:
+                _resp_dict = None
+            if _ai_cacheable and _ai_cache_key and _resp_dict:
+                _ttl = 86400 if float(_req_body.get("temperature", 1) or 1) == 0 else 3600
+                asyncio.get_running_loop().create_task(_ai_cache_set(
+                    cache_key=_ai_cache_key,
+                    owner_discord_id=_ai_cache_owner,
+                    client_key=client_key,
+                    route="/v1/chat/completions",
+                    model=request.model,
+                    request_hash=_ai_cache_req_hash or "",
+                    response_json=_resp_dict,
+                    prompt_tokens=actual_prompt,
+                    completion_tokens=actual_completion,
+                    ttl_sec=_ttl,
+                ))
+                # Idempotency-Key 写入（如果有且本次未命中）
+                _idem_hdr = http_request.headers.get("Idempotency-Key")
+                if _idem_hdr:
+                    _bh = hashlib.sha256(_canonical_json(_req_body).encode()).hexdigest()
+                    asyncio.get_running_loop().create_task(
+                        _ai_idem_set(_ai_cache_owner, _idem_hdr, client_key, _bh, _resp_dict)
+                    )
+            # ────────────────────────────────────────────────────────────────
             return resp
         except Exception:
             _record_stats(account, 0, 0, req_start, error=True)
@@ -4384,6 +4666,41 @@ async def messages_completions(
             status_code=404, detail=f"模型 {openai_request.model} 未找到"
         )
 
+    # ── LOW 用户缓存读取（/v1/messages） ─────────────────────────────────────
+    _msg_body = request.model_dump(exclude_none=True)
+    _msg_cacheable, _ = _is_low_cacheable_request(client_key, _msg_body)
+    _msg_cache_key: Optional[str] = None
+    _msg_cache_req_hash: Optional[str] = None
+    _msg_cache_owner: str = ""
+
+    if _msg_cacheable:
+        _msg_cache_key, _msg_cache_req_hash = _build_ai_cache_key("/v1/messages", client_key, _msg_body)
+        _msg_meta = VALID_CLIENT_KEYS.get(client_key, {})
+        _msg_cache_owner = str(_msg_meta.get("low_admin_discord_id") or "") or client_key
+
+        _idem_hdr_msg = http_request.headers.get("Idempotency-Key")
+        if _idem_hdr_msg:
+            _bh_msg = hashlib.sha256(_canonical_json(_msg_body).encode()).hexdigest()
+            _is_msg, _ir_msg = await _ai_idem_get(_msg_cache_owner, _idem_hdr_msg, _bh_msg)
+            if _is_msg == "hit" and _ir_msg:
+                _ir_msg["cached"] = True
+                _ir_msg["cache_hit"] = True
+                _append_log(openai_request.model, client_key, 0, 0, 0, "ok", exempt=True)
+                return JSONResponse(_ir_msg)
+            elif _is_msg == "conflict":
+                return JSONResponse(
+                    {"error": {"type": "invalid_request_error", "message": "Idempotency-Key conflict: body changed"}},
+                    status_code=409,
+                )
+
+        _cached_msg = await _ai_cache_get(_msg_cache_key)
+        if _cached_msg:
+            _cached_msg["cached"] = True
+            _cached_msg["cache_hit"] = True
+            _append_log(openai_request.model, client_key, 0, 0, 0, "ok", exempt=True)
+            return JSONResponse(_cached_msg)
+    # ────────────────────────────────────────────────────────────────────────
+
     account = await get_next_jetbrains_account(client_key=client_key)
 
     tool_id_to_func_name_map = {}
@@ -4485,7 +4802,35 @@ async def messages_completions(
             _record_stats(account, actual_prompt, actual_completion, req_start)
             _append_log(openai_request.model, client_key, actual_prompt, actual_completion,
                         (time.time() - req_start) * 1000, "ok", exempt=is_exempt)
-            return convert_openai_to_anthropic_response(openai_response)
+            anthropic_response = convert_openai_to_anthropic_response(openai_response)
+            # ── LOW 缓存写入（/v1/messages） ─────────────────────────────────
+            if _msg_cacheable and _msg_cache_key:
+                try:
+                    _resp_dict_msg = anthropic_response.model_dump()
+                except Exception:
+                    _resp_dict_msg = None
+                if _resp_dict_msg:
+                    _ttl_msg = 86400 if float(_msg_body.get("temperature", 1) or 1) == 0 else 3600
+                    asyncio.get_running_loop().create_task(_ai_cache_set(
+                        cache_key=_msg_cache_key,
+                        owner_discord_id=_msg_cache_owner,
+                        client_key=client_key,
+                        route="/v1/messages",
+                        model=openai_request.model,
+                        request_hash=_msg_cache_req_hash or "",
+                        response_json=_resp_dict_msg,
+                        prompt_tokens=actual_prompt,
+                        completion_tokens=actual_completion,
+                        ttl_sec=_ttl_msg,
+                    ))
+                    _idem_hdr2 = http_request.headers.get("Idempotency-Key")
+                    if _idem_hdr2:
+                        _bh2 = hashlib.sha256(_canonical_json(_msg_body).encode()).hexdigest()
+                        asyncio.get_running_loop().create_task(
+                            _ai_idem_set(_msg_cache_owner, _idem_hdr2, client_key, _bh2, _resp_dict_msg)
+                        )
+            # ─────────────────────────────────────────────────────────────────
+            return anthropic_response
         except Exception:
             _record_stats(account, 0, 0, req_start, error=True)
             _append_log(openai_request.model, client_key, prompt_tokens, 0,

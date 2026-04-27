@@ -1,0 +1,653 @@
+# 工单：修复 LOW 用户激活挤占普通用户激活
+
+## 背景
+
+当前 LOW 用户激活虽然使用 per-Discord executor，但没有 LOW 全局资源上限。
+
+现在的实际情况：
+
+```text
+LOW 总并发 = LOW 用户数 × 每个 Discord 用户并发
+```
+
+例如：
+```text
+LOW 默认并发 3
+10 个 LOW 用户同时批量激活
+=> LOW 总激活并发 = 30
+```
+
+这会挤占普通用户/admin 的激活资源，包括：
+
+- Python 线程 / CPU / GIL
+- Cloudflare Worker 请求量
+- JetBrains 上游速率限制
+- DB 写入连接
+- pending retry 后台资源
+
+目标是：**给 LOW 用户加全局资源预算，保证普通用户/admin 永远有资源可用。**
+
+---
+
+# 总体方案
+
+不优先拆 DB 池，而是新增 LOW 全局资源闸门：
+
+1. LOW 全局激活并发闸门
+2. LOW HTTP 请求闸门
+3. LOW DB 写入闸门
+4. LOW pending retry 闸门
+5. LOW 单用户并发硬上限
+6. `/admin/status` 暴露闸门状态
+
+---
+
+# 改动 1：增加 LOW 全局激活并发闸门
+
+## 文件
+
+`jetbrainsai2api/main.py`
+
+## 位置
+
+全局变量区，靠近：
+
+```python
+_low_admin_concurrency
+_low_executor_dict
+_activate_executor
+```
+
+## 新增
+
+```python
+# LOW 全局激活并发闸门：
+# 防止多个 LOW Discord 用户同时批量激活时，总并发无限放大。
+# 注意：这是 threading.BoundedSemaphore，因为 process_account 跑在线程池里，是同步函数。
+_LOW_GLOBAL_ACTIVATE_LIMIT = 6
+_low_global_activate_sem = threading.BoundedSemaphore(_LOW_GLOBAL_ACTIVATE_LIMIT)
+```
+
+---
+
+# 改动 2：LOW 单激活使用全局闸门
+
+## 文件
+
+`jetbrainsai2api/main.py`
+
+## 位置
+
+`admin_start_activate` 函数内部的 `_run()`。
+
+当前结构类似：
+
+```python
+def _run():
+    try:
+        result = _process_account(
+            req.email,
+            req.password,
+            log_cb=_log_cb,
+            use_low_pool=is_low_admin,
+            low_discord_id=(dc_user_id if is_low_admin else ""),
+        )
+        ...
+```
+
+## 替换为
+
+```python
+def _run():
+    acquired_low_slot = False
+    try:
+        if is_low_admin:
+            _log_cb("⏳ 正在等待 LOW 激活全局资源槽位...")
+            acquired_low_slot = _low_global_activate_sem.acquire(timeout=1800)
+            if not acquired_low_slot:
+                raise RuntimeError("等待 LOW 激活资源槽位超时，请稍后重试")
+            _log_cb("✓ 已获得 LOW 激活资源槽位，开始激活")
+
+        result = _process_account(
+            req.email,
+            req.password,
+            log_cb=_log_cb,
+            use_low_pool=is_low_admin,
+            low_discord_id=(dc_user_id if is_low_admin else ""),
+        )
+        _activate_tasks[task_id]["result"] = result
+
+        if result.get("new_password"):
+            _activate_tasks[task_id]["password"] = result["new_password"]
+
+        if result.get("jwt") or result.get("pending_nc_lids"):
+            _activate_tasks[task_id]["status"] = "success"
+        else:
+            _activate_tasks[task_id]["status"] = "failed"
+
+    except Exception as e:
+        _activate_tasks[task_id]["result"] = {"error": str(e)}
+        _activate_tasks[task_id]["status"] = "failed"
+        _log_cb(f"[EXCEPTION] {e}")
+    finally:
+        if acquired_low_slot:
+            try:
+                _low_global_activate_sem.release()
+            except Exception:
+                pass
+        log_queue.put(None)
+```
+
+---
+
+# 改动 3：LOW 批量激活使用全局闸门
+
+## 文件
+
+`jetbrainsai2api/main.py`
+
+## 位置
+
+`admin_activate_batch` 中 `_make_runner()` 里的 `_run()`。
+
+当前结构类似：
+
+```python
+def _run():
+    try:
+        result = _process_account(
+            _email,
+            _password,
+            log_cb=_log_cb,
+            use_low_pool=is_low_admin,
+            low_discord_id=(dc_user_id if is_low_admin else ""),
+        )
+        ...
+```
+
+## 替换为
+
+```python
+def _run():
+    acquired_low_slot = False
+    try:
+        if is_low_admin:
+            _log_cb("⏳ 正在等待 LOW 激活全局资源槽位...")
+            acquired_low_slot = _low_global_activate_sem.acquire(timeout=1800)
+            if not acquired_low_slot:
+                raise RuntimeError("等待 LOW 激活资源槽位超时，请稍后重试")
+            _log_cb("✓ 已获得 LOW 激活资源槽位，开始激活")
+
+        result = _process_account(
+            _email,
+            _password,
+            log_cb=_log_cb,
+            use_low_pool=is_low_admin,
+            low_discord_id=(dc_user_id if is_low_admin else ""),
+        )
+        _activate_tasks[_task_id]["result"] = result
+
+        if result.get("new_password"):
+            _activate_tasks[_task_id]["password"] = result["new_password"]
+
+        if result.get("jwt") or result.get("pending_nc_lids"):
+            _activate_tasks[_task_id]["status"] = "success"
+        else:
+            _activate_tasks[_task_id]["status"] = "failed"
+
+    except Exception as e:
+        _activate_tasks[_task_id]["result"] = {"error": str(e)}
+        _activate_tasks[_task_id]["status"] = "failed"
+        _log_cb(f"[EXCEPTION] {e}")
+    finally:
+        if acquired_low_slot:
+            try:
+                _low_global_activate_sem.release()
+            except Exception:
+                pass
+        _q.put(None)
+```
+
+---
+
+# 改动 4：限制 LOW 单用户并发上限
+
+## 文件
+
+`jetbrainsai2api/main.py`
+
+## 位置
+
+全局 LOW 配置区，靠近：
+
+```python
+_low_admin_concurrency
+```
+
+## 新增
+
+```python
+# 单个 LOW Discord 用户允许配置的最大并发。
+# 注意：这只是单用户上限；所有 LOW 用户总上限由 _LOW_GLOBAL_ACTIVATE_LIMIT 控制。
+_LOW_PER_DISCORD_MAX_CONCURRENCY = 6
+```
+
+## 修改 `admin_low_config_patch`
+
+把原来的最大 50 改成：
+
+```python
+val = int(req.concurrency or 0)
+
+if val < 1 or val > _LOW_PER_DISCORD_MAX_CONCURRENCY:
+    raise HTTPException(
+        status_code=400,
+        detail=f"并发数必须在 1-{_LOW_PER_DISCORD_MAX_CONCURRENCY} 之间（防止挤占普通用户资源）",
+    )
+```
+
+## 修改 `_load_low_admin_settings`
+
+读取 DB 中旧配置后 clamp：
+
+```python
+val = max(1, min(val, _LOW_PER_DISCORD_MAX_CONCURRENCY))
+```
+
+---
+
+# 改动 5：LOW HTTP 请求全局闸门
+
+## 文件
+
+`jetbrainsai2api/jb_activate.py`
+
+## 背景
+
+一个 LOW 激活账号内部会发很多请求：
+
+```text
+obtainTrial x6
+obtainFreeLicense x6
+provide-access 多格式 x7+
+grazie-lite x2
+登录/OAuth 若干
+```
+
+所以即使 LOW 总激活并发受控，也需要控制 LOW HTTP 请求瞬时并发。
+
+## 位置
+
+全局变量区，靠近：
+
+```python
+_proxy_ctx = threading.local()
+```
+
+## 新增
+
+```python
+# LOW HTTP 请求全局闸门：
+# 只限制 use_low_pool=True 的请求，普通用户/admin 不受影响。
+_LOW_HTTP_LIMIT = 12
+_low_http_sem = threading.BoundedSemaphore(_LOW_HTTP_LIMIT)
+```
+
+## 修改 `_cf_post`
+
+替换为：
+
+```python
+def _cf_post(url: str, **kwargs) -> "requests.Response":
+    use_low = bool(getattr(_proxy_ctx, "use_low", False))
+    acquired = False
+    try:
+        if use_low:
+            acquired = _low_http_sem.acquire(timeout=300)
+            if not acquired:
+                raise RuntimeError("LOW HTTP 请求资源槽位等待超时")
+
+        proxy = _get_proxy_url()
+        if proxy:
+            headers = dict(kwargs.pop("headers", {}))
+            headers["x-target-url"] = url
+            return requests.post(proxy, headers=headers, **kwargs)
+        return requests.post(url, **kwargs)
+    finally:
+        if acquired:
+            try:
+                _low_http_sem.release()
+            except Exception:
+                pass
+```
+
+## 修改 `_cf_get`
+
+替换为：
+
+```python
+def _cf_get(url: str, **kwargs) -> "requests.Response":
+    use_low = bool(getattr(_proxy_ctx, "use_low", False))
+    acquired = False
+    try:
+        if use_low:
+            acquired = _low_http_sem.acquire(timeout=300)
+            if not acquired:
+                raise RuntimeError("LOW HTTP 请求资源槽位等待超时")
+
+        proxy = _get_proxy_url()
+        if proxy:
+            params = kwargs.pop("params", None)
+            if params:
+                from requests.models import PreparedRequest as _PR
+                _pr = _PR()
+                _pr.prepare_url(url, params)
+                url = _pr.url
+            headers = dict(kwargs.pop("headers", {}))
+            headers["x-target-url"] = url
+            return requests.get(proxy, headers=headers, **kwargs)
+        return requests.get(url, **kwargs)
+    finally:
+        if acquired:
+            try:
+                _low_http_sem.release()
+            except Exception:
+                pass
+```
+
+---
+
+# 改动 6：LOW DB 写入闸门
+
+## 文件
+
+`jetbrainsai2api/main.py`
+
+## 背景
+
+不优先拆 DB 池，而是先限制 LOW 写 DB 的瞬时并发，给普通用户保留连接机会。
+
+## 位置
+
+全局变量区。
+
+## 新增
+
+```python
+# LOW DB 写入闸门：
+# 不拆 DB 池，但限制 LOW 同时写库数量，避免 LOW 批量激活占满 DB 连接池。
+_LOW_DB_WRITE_LIMIT = 4
+_low_db_write_sem = asyncio.Semaphore(_LOW_DB_WRITE_LIMIT)
+```
+
+## 修改 `admin_activate_stream`
+
+位置：`event_generator()` 开头，已有：
+
+```python
+_personal_key = task.get("personal_key", "") or ""
+```
+
+后面追加：
+
+```python
+from contextlib import asynccontextmanager
+
+_is_low_task = bool(task.get("is_low_admin"))
+
+@asynccontextmanager
+async def _db_write_guard():
+    """LOW 任务写 DB 时使用的异步闸门；普通任务不限制。"""
+    if _is_low_task:
+        async with _low_db_write_sem:
+            yield
+    else:
+        yield
+```
+
+## 包裹所有写 DB 代码块
+
+在 `event_generator` 内，把以下写 DB 操作外层包：
+
+```python
+async with _db_write_guard():
+    ...
+```
+
+需要包裹的典型位置：
+
+1. 删除 0 额度预签 key：
+```python
+async with _db_write_guard():
+    await conn.execute("DELETE FROM jb_client_keys ...")
+```
+
+2. 捐号封锁检测如果只是 SELECT 可不包；涉及 UPDATE/DELETE 时包。
+
+3. 保存新账号：
+```python
+async with _db_write_guard():
+    await _save_account_to_db(new_account)
+```
+
+4. 保存 extra account：
+```python
+async with _db_write_guard():
+    await _save_account_to_db(extra_account_obj)
+```
+
+5. 升级 key 额度：
+```python
+async with _db_write_guard():
+    await _add_low_quota(...) 或 await _activate_key_quota(...)
+```
+
+6. 写 pending_nc：
+```python
+async with _db_write_guard():
+    await conn.execute("UPDATE jb_accounts SET pending_nc_lids=... WHERE id=$9", ...)
+```
+
+7. duplicate 分支删除 preissued key：
+```python
+async with _db_write_guard():
+    await conn.execute("DELETE FROM jb_client_keys WHERE key=$1", ...)
+```
+
+> 原则：**LOW task 里所有 INSERT / UPDATE / DELETE 都包；SELECT 可以不包。**
+
+---
+
+# 改动 7：LOW pending retry 全局限流
+
+## 文件
+
+`jetbrainsai2api/main.py`
+
+## 位置
+
+全局变量区新增：
+
+```python
+# LOW pending NC 后台重试并发上限：
+# 防止 LOW pending retry 与普通用户激活争资源。
+_LOW_PENDING_RETRY_LIMIT = 4
+_low_pending_retry_sem = asyncio.Semaphore(_LOW_PENDING_RETRY_LIMIT)
+```
+
+## 修改 `_retry_pending_nc_lids`
+
+当前里面已有主/LOW semaphore，类似：
+
+```python
+sem_main = asyncio.Semaphore(10)
+sem_low = asyncio.Semaphore(_low_admin_concurrency)
+```
+
+处理 LOW 行时，额外包全局 LOW pending semaphore：
+
+```python
+if is_low:
+    async with _low_pending_retry_sem:
+        # 原 LOW retry 逻辑
+else:
+    async with sem_main:
+        # 原 main retry 逻辑
+```
+
+如果当前函数结构不是这种写法，就按原则改：
+
+> 所有 `pending_nc_low_admin=True` 的行进入重试流程前必须 acquire `_low_pending_retry_sem`；普通行不受此 semaphore 限制。
+
+---
+
+# 改动 8：`/admin/status` 增加 LOW 资源状态
+
+## 文件
+
+`jetbrainsai2api/main.py`
+
+## 位置
+
+`admin_status`
+
+## 增加返回字段
+
+```python
+"low_resource_limits": {
+    "global_activate_limit": _LOW_GLOBAL_ACTIVATE_LIMIT,
+    "global_activate_available": getattr(_low_global_activate_sem, "_value", None),
+    "per_discord_max_concurrency": _LOW_PER_DISCORD_MAX_CONCURRENCY,
+    "low_db_write_limit": _LOW_DB_WRITE_LIMIT,
+    "low_db_write_available": getattr(_low_db_write_sem, "_value", None),
+    "low_pending_retry_limit": _LOW_PENDING_RETRY_LIMIT,
+    "low_pending_retry_available": getattr(_low_pending_retry_sem, "_value", None),
+}
+```
+
+`_LOW_HTTP_LIMIT` 在 `jb_activate.py`，如果要显示可选增加：
+
+```python
+try:
+    import jb_activate as _jb_activate
+    low_http_limit = getattr(_jb_activate, "_LOW_HTTP_LIMIT", None)
+    low_http_available = getattr(getattr(_jb_activate, "_low_http_sem", None), "_value", None)
+except Exception:
+    low_http_limit = None
+    low_http_available = None
+```
+
+然后加入：
+
+```python
+"low_http_limit": low_http_limit,
+"low_http_available": low_http_available,
+```
+
+---
+
+# 推荐参数
+
+默认生产参数：
+
+```python
+_LOW_GLOBAL_ACTIVATE_LIMIT = 6
+_LOW_PER_DISCORD_MAX_CONCURRENCY = 6
+_LOW_HTTP_LIMIT = 12
+_LOW_DB_WRITE_LIMIT = 4
+_LOW_PENDING_RETRY_LIMIT = 4
+```
+
+低配 Replit 可用更保守参数：
+
+```python
+_LOW_GLOBAL_ACTIVATE_LIMIT = 4
+_LOW_PER_DISCORD_MAX_CONCURRENCY = 4
+_LOW_HTTP_LIMIT = 8
+_LOW_DB_WRITE_LIMIT = 3
+_LOW_PENDING_RETRY_LIMIT = 2
+```
+
+---
+
+# 验证方法
+
+## 场景 1：LOW 大批量 + 普通用户单激活
+
+操作：
+
+```text
+1. LOW 用户 A 设置并发 = 6
+2. LOW 用户 A 发起 50 账号批量激活
+3. LOW 用户 B 同时发起 50 账号批量激活
+4. 普通用户同时发起 /admin/activate 单激活
+```
+
+预期：
+
+```text
+LOW A + LOW B 总活跃激活数 <= _LOW_GLOBAL_ACTIVATE_LIMIT
+普通用户单激活立即开始，不等待 LOW 队列
+普通用户日志正常流出
+/admin/status 显示 global_activate_available 下降
+```
+
+## 场景 2：LOW HTTP 限速
+
+操作：
+
+```text
+多个 LOW 批量激活同时运行
+观察日志中 account.jetbrains.com / api.jetbrains.ai 的 429
+```
+
+预期：
+
+```text
+429 明显减少
+普通用户/admin 不受 LOW HTTP 闸门限制
+```
+
+## 场景 3：LOW DB 写入
+
+操作：
+
+```text
+LOW 批量激活过程中频繁请求 /admin/status
+普通用户同时完成一个激活入池
+```
+
+预期：
+
+```text
+普通用户 DB 写入不卡
+LOW DB 写入最多同时 _LOW_DB_WRITE_LIMIT 个
+```
+
+## 场景 4：并发配置上限
+
+操作：
+
+```text
+PATCH /admin/low-config concurrency=20
+```
+
+预期：
+
+```text
+返回 400
+提示并发数必须在 1-6 之间
+```
+
+---
+
+# 给 Replit Agent 的一句话指令
+
+> 请修复 LOW 用户激活挤占普通用户的问题，实现 LOW 全局资源闸门：  
+> 1. `main.py` 增加 `_LOW_GLOBAL_ACTIVATE_LIMIT=6` + `threading.BoundedSemaphore`，LOW 单激活和批量激活的 `_run()` 都必须 acquire/release；  
+> 2. `jb_activate.py` 增加 LOW HTTP 请求闸门 `_LOW_HTTP_LIMIT=12`，仅当 `_proxy_ctx.use_low=True` 时 `_cf_get/_cf_post` acquire/release；  
+> 3. `main.py` 增加 `_LOW_DB_WRITE_LIMIT=4` + `asyncio.Semaphore`，在 `admin_activate_stream` 内 LOW 任务所有写 DB 代码块外包 `_db_write_guard()`；  
+> 4. `_retry_pending_nc_lids` 增加 `_LOW_PENDING_RETRY_LIMIT=4`，LOW pending retry 单独限流；  
+> 5. `/admin/low-config` 单用户并发上限从 50 降到 6，并在 `_load_low_admin_settings` 启动读取时 clamp；  
+> 6. `/admin/status` 返回 LOW 资源闸门状态。  
+> 验证：两个 LOW 用户同时批量激活 50 个账号时，总 LOW 活跃激活数不超过 6，普通用户同时单激活能立即开始并正常输出日志。

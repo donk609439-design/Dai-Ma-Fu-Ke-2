@@ -1,0 +1,545 @@
+可以，而且**建议先只给 LOW 用户加**，风险更低、收益也最明显。
+
+因为 LOW 用户通常有个人 key、批量激活额度有限，加缓存可以明显降低他们的额度消耗；完整管理员/普通用户先不动，避免影响全站行为。
+
+---
+
+# 工单：仅给 LOW 用户增加 AI 响应缓存
+
+## 目标
+
+只对 LOW 用户的 API Key 启用缓存：
+
+- `is_low_admin_key = true`
+- 或 `_key_tier(api_key) == "low"`
+
+普通 key、admin key、普通访客 key **不走缓存**。
+
+---
+
+## 推荐先做两类缓存
+
+| 缓存类型 | 是否推荐 | 说明 |
+|---|---|---|
+| Exact Match Response Cache | ✅ 推荐 | 相同请求直接返回缓存，最省 token |
+| Idempotency-Key Cache | ✅ 推荐 | 防止客户端 retry 重复消耗 |
+| 流式响应缓存 | 暂缓 | 实现复杂，容易影响 SSE 行为 |
+| 会话摘要缓存 | 暂缓 | 省 token 但可能影响质量 |
+
+---
+
+# 一、缓存范围
+
+## 只缓存这些请求
+
+```text
+POST /v1/chat/completions
+POST /v1/messages
+```
+
+但要求：
+
+```text
+LOW 用户 key
+stream == false
+temperature <= 0.3
+无 tools / tool_choice
+无 image / file / 多模态内容
+请求体大小 <= 128KB
+```
+
+## 不缓存这些请求
+
+```text
+stream == true
+temperature > 0.3
+带 tools/function calling
+带实时上下文
+带图片/文件
+普通用户 key
+admin key
+非 LOW key
+```
+
+---
+
+# 二、缓存隔离策略
+
+缓存必须按 LOW 用户隔离，防止跨用户泄漏。
+
+推荐 scope：
+
+```text
+owner_discord_id + cache_key
+```
+
+也就是：
+
+```python
+owner_discord_id = VALID_CLIENT_KEYS[api_key]["low_admin_discord_id"]
+```
+
+同一个 LOW Discord 用户可以复用自己的缓存，不同 Discord 用户之间不能共享缓存。
+
+如果 `low_admin_discord_id` 为空，则 fallback 到：
+
+```text
+client_key + cache_key
+```
+
+---
+
+# 三、数据库表
+
+在 `_ensure_db_tables()` 里新增：
+
+```sql
+CREATE TABLE IF NOT EXISTS ai_response_cache (
+    cache_key TEXT PRIMARY KEY,
+    scope TEXT NOT NULL DEFAULT 'low',
+    owner_discord_id TEXT NOT NULL DEFAULT '',
+    client_key TEXT NOT NULL DEFAULT '',
+    route TEXT NOT NULL,
+    model TEXT NOT NULL,
+    request_hash TEXT NOT NULL,
+    response_json JSONB NOT NULL,
+    prompt_tokens INTEGER NOT NULL DEFAULT 0,
+    completion_tokens INTEGER NOT NULL DEFAULT 0,
+    hit_count INTEGER NOT NULL DEFAULT 0,
+    created_at DOUBLE PRECISION NOT NULL,
+    expires_at DOUBLE PRECISION NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_ai_response_cache_owner
+ON ai_response_cache(owner_discord_id, expires_at);
+
+CREATE INDEX IF NOT EXISTS idx_ai_response_cache_expires
+ON ai_response_cache(expires_at);
+```
+
+---
+
+# 四、缓存 key 生成规则
+
+新增 helper：
+
+```python
+def _canonical_json(obj: Any) -> str:
+    return json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _low_cache_owner(api_key: str) -> tuple[bool, str]:
+    meta = VALID_CLIENT_KEYS.get(api_key, {})
+    if not meta.get("is_low_admin_key"):
+        return False, ""
+    owner = str(meta.get("low_admin_discord_id") or "")
+    return True, owner
+
+
+def _build_ai_cache_key(route: str, api_key: str, body: dict) -> tuple[str, str]:
+    meta = VALID_CLIENT_KEYS.get(api_key, {})
+    owner = str(meta.get("low_admin_discord_id") or "")
+    owner_scope = owner or api_key
+
+    normalized = dict(body)
+
+    # 确保 stream=false 的请求才缓存
+    normalized["stream"] = False
+
+    raw = _canonical_json({
+        "route": route,
+        "owner_scope": owner_scope,
+        "body": normalized,
+    })
+
+    request_hash = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    cache_key = f"low:{owner_scope}:{route}:{request_hash}"
+    return cache_key, request_hash
+```
+
+---
+
+# 五、是否允许缓存的判断
+
+新增：
+
+```python
+def _is_low_cacheable_request(api_key: str, body: dict) -> tuple[bool, str]:
+    meta = VALID_CLIENT_KEYS.get(api_key, {})
+    if not meta.get("is_low_admin_key"):
+        return False, "not_low_key"
+
+    if body.get("stream") is True:
+        return False, "stream_not_cached"
+
+    temperature = body.get("temperature", 1)
+    try:
+        temperature = float(temperature)
+    except Exception:
+        temperature = 1
+
+    if temperature > 0.3:
+        return False, "temperature_too_high"
+
+    if body.get("tools") or body.get("tool_choice") or body.get("functions") or body.get("function_call"):
+        return False, "tools_not_cached"
+
+    raw_len = len(json.dumps(body, ensure_ascii=False))
+    if raw_len > 128 * 1024:
+        return False, "request_too_large"
+
+    # 简单排除多模态
+    messages = body.get("messages") or []
+    for m in messages:
+        content = m.get("content")
+        if isinstance(content, list):
+            return False, "multimodal_not_cached"
+
+    return True, "ok"
+```
+
+---
+
+# 六、缓存读写 helper
+
+```python
+async def _ai_cache_get(cache_key: str) -> Optional[dict]:
+    pool = await _get_db_pool()
+    if not pool:
+        return None
+
+    now = time.time()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT response_json
+            FROM ai_response_cache
+            WHERE cache_key=$1 AND expires_at > $2
+            """,
+            cache_key,
+            now,
+        )
+        if not row:
+            return None
+
+        await conn.execute(
+            "UPDATE ai_response_cache SET hit_count = hit_count + 1 WHERE cache_key=$1",
+            cache_key,
+        )
+
+        return dict(row["response_json"])
+
+
+async def _ai_cache_set(
+    *,
+    cache_key: str,
+    owner_discord_id: str,
+    client_key: str,
+    route: str,
+    model: str,
+    request_hash: str,
+    response_json: dict,
+    prompt_tokens: int = 0,
+    completion_tokens: int = 0,
+    ttl_sec: int = 3600,
+):
+    pool = await _get_db_pool()
+    if not pool:
+        return
+
+    now = time.time()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO ai_response_cache (
+                cache_key, scope, owner_discord_id, client_key,
+                route, model, request_hash, response_json,
+                prompt_tokens, completion_tokens,
+                hit_count, created_at, expires_at
+            )
+            VALUES ($1, 'low', $2, $3, $4, $5, $6, $7, $8, $9, 0, $10, $11)
+            ON CONFLICT (cache_key) DO UPDATE SET
+                response_json=EXCLUDED.response_json,
+                prompt_tokens=EXCLUDED.prompt_tokens,
+                completion_tokens=EXCLUDED.completion_tokens,
+                expires_at=EXCLUDED.expires_at
+            """,
+            cache_key,
+            owner_discord_id,
+            client_key,
+            route,
+            model,
+            request_hash,
+            json.dumps(response_json, ensure_ascii=False),
+            prompt_tokens,
+            completion_tokens,
+            now,
+            now + ttl_sec,
+        )
+```
+
+注意：如果 asyncpg 对 JSONB 参数不能直接吃字符串，就改：
+
+```python
+response_json
+```
+
+为：
+
+```python
+json.dumps(response_json)
+```
+
+并确保 SQL 里 `$7::jsonb`。
+
+---
+
+# 七、接入 `/v1/chat/completions`
+
+在 `chat_completions` 中，完成鉴权拿到 `api_key` 和 body 后、真正调用上游之前，加：
+
+```python
+cacheable, reason = _is_low_cacheable_request(api_key, req_dict)
+
+if cacheable:
+    cache_key, request_hash = _build_ai_cache_key("/v1/chat/completions", api_key, req_dict)
+    cached = await _ai_cache_get(cache_key)
+    if cached:
+        cached.setdefault("cached", True)
+        cached.setdefault("cache_hit", True)
+
+        # 缓存命中：不扣 usage_count，只写日志
+        try:
+            _append_log(
+                model=req_dict.get("model", ""),
+                client_key=api_key,
+                prompt_tokens=0,
+                completion_tokens=0,
+                exempt=True,
+                cached=True,
+            )
+        except Exception:
+            pass
+
+        return JSONResponse(cached)
+```
+
+在非流式真实响应完成后，写缓存：
+
+```python
+if cacheable and isinstance(response_obj, dict):
+    usage = response_obj.get("usage") or {}
+    await _ai_cache_set(
+        cache_key=cache_key,
+        owner_discord_id=str(VALID_CLIENT_KEYS.get(api_key, {}).get("low_admin_discord_id") or ""),
+        client_key=api_key,
+        route="/v1/chat/completions",
+        model=req_dict.get("model", ""),
+        request_hash=request_hash,
+        response_json=response_obj,
+        prompt_tokens=int(usage.get("prompt_tokens") or 0),
+        completion_tokens=int(usage.get("completion_tokens") or 0),
+        ttl_sec=3600 if float(req_dict.get("temperature", 1) or 1) > 0 else 86400,
+    )
+```
+
+---
+
+# 八、接入 `/v1/messages`
+
+同理，route 改成：
+
+```python
+"/v1/messages"
+```
+
+缓存 key 生成时也要包含 route，避免 OpenAI/Anthropic 响应互相串。
+
+---
+
+# 九、Idempotency-Key 缓存
+
+请求头：
+
+```http
+Idempotency-Key: xxx
+```
+
+只对 LOW 用户生效。
+
+新增表可以复用 `ai_response_cache`，cache_key 用：
+
+```python
+idempotency_cache_key = f"idem:low:{owner_scope}:{idempotency_key}:{body_hash}"
+```
+
+处理逻辑：
+
+1. 如果 LOW 用户请求带 `Idempotency-Key`
+2. 先查 idem cache
+3. 命中直接返回
+4. 未命中则正常调用
+5. 调用成功后写入 idem cache，TTL 推荐 24h
+
+注意：
+
+```python
+同一个 Idempotency-Key 但 body_hash 不同，要返回 409 conflict
+```
+
+可以新增表更清晰：
+
+```sql
+CREATE TABLE IF NOT EXISTS ai_idempotency_cache (
+    idempotency_key TEXT NOT NULL,
+    owner_discord_id TEXT NOT NULL DEFAULT '',
+    client_key TEXT NOT NULL DEFAULT '',
+    body_hash TEXT NOT NULL,
+    response_json JSONB NOT NULL,
+    created_at DOUBLE PRECISION NOT NULL,
+    expires_at DOUBLE PRECISION NOT NULL,
+    PRIMARY KEY (owner_discord_id, idempotency_key)
+);
+```
+
+---
+
+# 十、定期清理缓存
+
+新增后台任务：
+
+```python
+async def _cleanup_ai_response_cache_loop():
+    while True:
+        try:
+            await asyncio.sleep(3600)
+            pool = await _get_db_pool()
+            if not pool:
+                continue
+            now = time.time()
+            async with pool.acquire() as conn:
+                await conn.execute("DELETE FROM ai_response_cache WHERE expires_at < $1", now)
+                await conn.execute("DELETE FROM ai_idempotency_cache WHERE expires_at < $1", now)
+        except Exception as e:
+            print(f"[ai-cache] cleanup error: {e}")
+```
+
+在 `startup()` 里：
+
+```python
+asyncio.create_task(_cleanup_ai_response_cache_loop())
+```
+
+---
+
+# 十一、前端/管理面板展示
+
+LOW 用户调用日志里可以加一列：
+
+```text
+缓存命中 / 真实调用
+```
+
+如果 `_append_log` 当前不支持 `cached` 字段，可以先只在返回 JSON 里加：
+
+```json
+{
+  "cached": true,
+  "cache_hit": true
+}
+```
+
+后面再扩展日志表。
+
+---
+
+# 十二、计费策略
+
+建议：
+
+| 场景 | 是否扣 LOW usage_count |
+|---|---|
+| 真实上游调用 | 正常扣 |
+| Exact cache 命中 | 不扣 |
+| Idempotency replay | 不扣 |
+| 小请求豁免 | 继续按现有规则 |
+
+也就是：
+
+```python
+cache hit return 之前，不调用 _consume_key_usage()
+```
+
+---
+
+# 十三、风险控制
+
+必须加这些限制：
+
+```text
+只对 LOW key 生效
+只缓存 stream=false
+只缓存 temperature<=0.3
+不缓存 tools/function calling
+不缓存多模态
+按 owner_discord_id 隔离
+TTL 默认 1h
+temperature=0 可放宽到 24h
+```
+
+---
+
+# 十四、验证方法
+
+## 1. LOW exact cache
+
+```text
+LOW key 请求同一个 body 两次
+第一次：真实上游调用
+第二次：返回 cached=true
+usage_count 不增加
+```
+
+## 2. 普通 key 不缓存
+
+```text
+普通 key 请求同一个 body 两次
+两次都真实调用
+```
+
+## 3. 不同 LOW 用户不串缓存
+
+```text
+LOW A 请求 body X
+LOW B 请求 body X
+LOW B 不能命中 LOW A 的缓存
+```
+
+## 4. stream 不缓存
+
+```text
+stream=true 请求两次
+两次都真实调用
+```
+
+## 5. temperature 高不缓存
+
+```text
+temperature=0.8 请求两次
+两次都真实调用
+```
+
+## 6. Idempotency-Key
+
+```text
+同 LOW 用户：
+Idempotency-Key: abc + body A → 真实调用
+Idempotency-Key: abc + body A → replay cache
+Idempotency-Key: abc + body B → 409 conflict
+```
+
+---
+
+# 给 Replit Agent 的一句话工单
+
+> 请只给 LOW 用户增加 AI 响应缓存：新增 `ai_response_cache` 和 `ai_idempotency_cache` 两张表；只对 `is_low_admin_key=true` 的 key 生效；缓存 `/v1/chat/completions` 和 `/v1/messages` 的 `stream=false`、`temperature<=0.3`、无 tools、无多模态请求；缓存按 `low_admin_discord_id` 隔离；缓存命中直接返回并加 `cached=true/cache_hit=true`，不扣 usage_count；真实调用完成后写缓存；支持 `Idempotency-Key` 防 retry 重复消耗；新增每小时清理过期缓存任务；普通 key 完全不受影响。

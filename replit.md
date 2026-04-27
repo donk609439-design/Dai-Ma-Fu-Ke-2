@@ -109,6 +109,48 @@ return winner[0] if winner else None
 
 最终生效改动总结：上述四阶段 + `_first_ready` 滑动窗口分批并发。
 
+## LOW 用户 AI 响应缓存（2026-04-27）
+
+工单级别：LOW。仅对 `is_low_admin_key=true` 的 key 生效。
+
+### 数据库表
+
+`ai_response_cache`（cache_key TEXT PK、scope、owner_discord_id、client_key、route、model、request_hash、response_json JSONB、prompt_tokens、completion_tokens、hit_count、created_at、expires_at）+ 两个索引。
+
+`ai_idempotency_cache`（idempotency_key + owner_discord_id 复合 PK、client_key、body_hash、response_json JSONB、created_at、expires_at）+ 过期索引。
+
+### 缓存条件（`_is_low_cacheable_request`）
+
+stream=False、temperature≤0.3、无 tools/tool_choice/functions/function_call、无多模态 content list、body≤128KB，且调用方为 LOW key。
+
+### 接入端点
+
+- `/v1/chat/completions`（非流式路径）：缓存读取在 `get_next_jetbrains_account` 之前，写入在 `_append_log` 之后、`return resp` 之前（用 `resp.model_dump()` 序列化 Pydantic 对象）。
+- `/v1/messages`（非流式路径）：缓存读取在 `get_next_jetbrains_account` 之前（基于 Anthropic 原始请求体），写入在 `convert_openai_to_anthropic_response` 之后（用 `anthropic_response.model_dump()`）。
+
+### Idempotency-Key
+
+同 LOW 用户同 key 同 body_hash → 直接 replay（HTTP 200）；同 key 不同 body_hash → 409。
+
+### TTL
+
+temperature=0 → 86400s（24h）；其他 → 3600s（1h）。
+
+### 缓存命中行为
+
+命中不调 `_consume_key_usage`，调用日志以 `exempt=True` 写入（不计费），响应体附加 `"cached": true, "cache_hit": true`。
+
+### 后台清理
+
+`_cleanup_ai_response_cache_loop`：每小时对两张表 DELETE WHERE expires_at < now()，在 `startup()` 中注册为 asyncio task。
+
+### 架构师审查结论
+
+- `_is_low_cacheable_request` 基本覆盖（细微遗漏：Anthropic `system` 字段可能为多模态 list，但极少见，风险低）。
+- `_ai_cache_set` asyncpg JSONB 传递（`json.dumps` + `::jsonb` 强转）可行。
+- **修复 Bug**：`chat_completions` 缓存写入原先 `isinstance(resp, dict)` 永远为 False（`resp` 是 `ChatCompletionResponse` Pydantic 对象）→ 已改为 `resp.model_dump()`。
+- cleanup loop 正确清理两张表。
+
 ## 排队记录入队超时自动清理（2026-04-27）
 
 新增机制：**超过 1 小时仍在排队的邮箱，自动从排队列表清除**。

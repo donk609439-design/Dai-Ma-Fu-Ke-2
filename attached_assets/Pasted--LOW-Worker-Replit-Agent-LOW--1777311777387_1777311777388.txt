@@ -1,0 +1,589 @@
+# 工单：基于现有 LOW Worker 池做资源隔离，防止挤占普通用户激活
+
+直接复制下面整段给 Replit Agent。
+
+---
+
+## 📋 背景
+
+项目现在已经有 LOW Worker 池：
+
+```python
+_get_low_executor(discord_id)
+_low_executor_dict
+_low_admin_concurrency
+```
+
+LOW 单激活 / 批量激活已经不走普通用户的 `_activate_executor`，而是走 per-Discord 的 LOW executor。
+
+但是当前仍然存在挤占问题：
+
+```text
+LOW executor 只隔离了线程队列
+没有隔离 DB 连接池
+```
+
+LOW 批量激活完成后，会在 `admin_activate_stream` 里大量写库：
+
+- `jb_accounts`
+- `jb_client_keys`
+- `pending_nc_*`
+- personal key 额度
+- 删除/升级 preissued key
+
+这些写库操作仍然走全局：
+
+```python
+_get_db_pool()
+```
+
+也就是普通用户/admin/chat/后台任务共用的 DB pool。
+
+所以当 LOW 批量激活很多账号时，会占满主 DB pool，导致普通用户 `/admin/activate` 卡顿、超时或 503。
+
+---
+
+## 🎯 目标
+
+**不限制 LOW 用户批量激活速度**，但把 LOW 写库资源与普通用户/admin 隔离。
+
+保留现有 LOW Worker 池，不新增 LOW 全局限速。
+
+最终资源模型：
+
+```text
+普通用户 / admin / chat / 普通后台任务
+    → DB_POOL_MAIN
+    → _get_db_pool()
+
+LOW 单激活 / LOW 批量激活 / LOW pending retry
+    → DB_POOL_LOW
+    → _get_low_db_pool()
+```
+
+---
+
+# 改动 1：新增 LOW 专用 DB Pool
+
+## 文件
+
+`jetbrainsai2api/main.py`
+
+## 位置
+
+找到当前 `DB_POOL` 和 `_get_db_pool()` 定义，约 line 670 附近。
+
+当前类似：
+
+```python
+DB_POOL = None
+
+async def _get_db_pool():
+    global DB_POOL
+    if DB_POOL is None:
+        DB_POOL = await asyncpg.create_pool(database_url, min_size=2, max_size=20, ...)
+    return DB_POOL
+```
+
+## 修改为
+
+```python
+DB_POOL: Optional[asyncpg.Pool] = None       # 主池：普通用户 / admin / chat / 主后台任务
+DB_POOL_LOW: Optional[asyncpg.Pool] = None   # LOW 专用池：LOW 激活 / LOW pending retry
+
+async def _get_db_pool() -> Optional[asyncpg.Pool]:
+    """主 DB 连接池：普通用户、admin、chat、主后台任务使用。"""
+    global DB_POOL
+    if DB_POOL is None and DATABASE_URL:
+        try:
+            DB_POOL = await asyncpg.create_pool(
+                DATABASE_URL,
+                min_size=2,
+                max_size=15,
+                command_timeout=60,
+                statement_cache_size=0,
+            )
+        except Exception as e:
+            print(f"[DB] 主池初始化失败: {e}")
+            return None
+    return DB_POOL
+
+
+async def _get_low_db_pool() -> Optional[asyncpg.Pool]:
+    """LOW 专用 DB 连接池：LOW 激活与 LOW pending retry 使用。
+    
+    不限制 LOW 激活速度，只把 LOW 写库压力隔离到独立 DB pool，
+    避免 LOW 批量激活占满普通用户/admin 的主 DB pool。
+    """
+    global DB_POOL_LOW
+    if DB_POOL_LOW is None and DATABASE_URL:
+        try:
+            DB_POOL_LOW = await asyncpg.create_pool(
+                DATABASE_URL,
+                min_size=1,
+                max_size=20,   # LOW 专用池，不限制速度；如 PG 连接数不足可调小到 10/15
+                command_timeout=60,
+                statement_cache_size=0,
+            )
+        except Exception as e:
+            print(f"[DB] LOW 池初始化失败: {e}")
+            return None
+    return DB_POOL_LOW
+```
+
+---
+
+# 改动 2：shutdown 时关闭 LOW Pool
+
+## 文件
+
+`jetbrainsai2api/main.py`
+
+## 位置
+
+找到 `async def shutdown():`
+
+## 在关闭主池后追加
+
+```python
+if DB_POOL_LOW is not None:
+    try:
+        await DB_POOL_LOW.close()
+    except Exception:
+        pass
+```
+
+---
+
+# 改动 3：写库 helper 支持显式 pool
+
+LOW 路径要显式传 LOW pool，所以几个写库 helper 需要支持可选 `pool` 参数。
+
+## 文件
+
+`jetbrainsai2api/main.py`
+
+---
+
+## 3.1 修改 `_save_account_to_db`
+
+找到：
+
+```python
+async def _save_account_to_db(account: dict):
+```
+
+改成：
+
+```python
+async def _save_account_to_db(account: dict, pool: Optional[asyncpg.Pool] = None):
+    if pool is None:
+        pool = await _get_db_pool()
+    if not pool:
+        return
+    # 后续保持原逻辑，但不要再在函数内部重新 await _get_db_pool()
+```
+
+如果函数内部已有：
+
+```python
+pool = await _get_db_pool()
+```
+
+删除这行，使用入参 `pool`。
+
+---
+
+## 3.2 修改 `_upsert_key_to_db`
+
+找到：
+
+```python
+async def _upsert_key_to_db(key: str, meta: dict):
+```
+
+改成：
+
+```python
+async def _upsert_key_to_db(key: str, meta: dict, pool: Optional[asyncpg.Pool] = None):
+    if pool is None:
+        pool = await _get_db_pool()
+    if not pool:
+        return
+    # 后续保持原逻辑
+```
+
+---
+
+## 3.3 修改 `_delete_key_from_db`
+
+找到：
+
+```python
+async def _delete_key_from_db(key: str):
+```
+
+改成：
+
+```python
+async def _delete_key_from_db(key: str, pool: Optional[asyncpg.Pool] = None):
+    if pool is None:
+        pool = await _get_db_pool()
+    if not pool:
+        return
+    # 后续保持原逻辑
+```
+
+---
+
+## 3.4 `_add_low_quota` 不需要改
+
+`_add_low_quota(api_key, new_acc_ids, pool)` 已经接受 pool 参数，保持不变。
+
+---
+
+# 改动 4：`admin_activate_stream` 按 task 身份选择 DB Pool
+
+## 文件
+
+`jetbrainsai2api/main.py`
+
+## 位置
+
+找到：
+
+```python
+@app.get("/admin/activate/{task_id}/stream")
+async def admin_activate_stream(task_id: str):
+```
+
+在其内部 `event_generator()` 开头，已有：
+
+```python
+_personal_key = task.get("personal_key", "") or ""
+```
+
+## 在后面追加
+
+```python
+_is_low_task = bool(task.get("is_low_admin"))
+
+async def _get_pool_for_task():
+    """LOW 任务使用 LOW DB 池；普通/admin 任务使用主 DB 池。"""
+    return await _get_low_db_pool() if _is_low_task else await _get_db_pool()
+```
+
+---
+
+## 替换 event_generator 内部所有 `_get_db_pool()`
+
+在 `event_generator()` 范围内，把所有：
+
+```python
+await _get_db_pool()
+```
+
+替换为：
+
+```python
+await _get_pool_for_task()
+```
+
+包括但不限于：
+
+```python
+_cdb = await _get_db_pool()
+_db_pool = await _get_db_pool()
+_db2 = await _get_db_pool()
+_db3 = await _get_db_pool()
+_dup_db = await _get_db_pool()
+```
+
+统一改成对应变量接收：
+
+```python
+_cdb = await _get_pool_for_task()
+_db_pool = await _get_pool_for_task()
+_db2 = await _get_pool_for_task()
+_db3 = await _get_pool_for_task()
+_dup_db = await _get_pool_for_task()
+```
+
+---
+
+## 修改 helper 调用，传入显式 pool
+
+在 `event_generator()` 内找到所有：
+
+```python
+await _save_account_to_db(new_account)
+```
+
+改成：
+
+```python
+_task_pool = await _get_pool_for_task()
+await _save_account_to_db(new_account, pool=_task_pool)
+```
+
+找到所有：
+
+```python
+await _save_account_to_db(extra_account_obj)
+```
+
+改成：
+
+```python
+_task_pool = await _get_pool_for_task()
+await _save_account_to_db(extra_account_obj, pool=_task_pool)
+```
+
+如果有：
+
+```python
+await _upsert_key_to_db(...)
+await _delete_key_from_db(...)
+```
+
+同样改成传：
+
+```python
+pool=await _get_pool_for_task()
+```
+
+---
+
+# 改动 5：`_retry_pending_nc_lids` 按 LOW 身份选 DB Pool
+
+## 文件
+
+`jetbrainsai2api/main.py`
+
+## 位置
+
+找到：
+
+```python
+async def _retry_pending_nc_lids():
+```
+
+## 目标
+
+`pending_nc_low_admin=True` 的行必须使用 LOW DB Pool，普通 pending 行继续使用主池。
+
+## 修改原则
+
+当前如果代码是：
+
+```python
+pool = await _get_db_pool()
+...
+async with pool.acquire() as conn:
+    ...
+```
+
+在处理每一行时改成：
+
+```python
+is_low_row = bool(row.get("pending_nc_low_admin"))
+pool = await _get_low_db_pool() if is_low_row else await _get_db_pool()
+```
+
+然后用这个 `pool` 执行该行的写库操作。
+
+## 推荐实现结构
+
+如果当前函数是先批量 SELECT pending 行：
+
+```python
+main_pool = await _get_db_pool()
+async with main_pool.acquire() as conn:
+    rows = await conn.fetch(...)
+```
+
+这部分 SELECT 可以继续用主池。
+
+处理每一行时：
+
+```python
+async def _process_row(row):
+    is_low_row = bool(row.get("pending_nc_low_admin"))
+    pool = await _get_low_db_pool() if is_low_row else await _get_db_pool()
+    if not pool:
+        return
+    async with pool.acquire() as conn:
+        # 原本针对该 row 的 UPDATE / INSERT / DELETE 全部放这里
+```
+
+---
+
+# 改动 6：`/admin/status` 增加两个 DB Pool 状态
+
+## 文件
+
+`jetbrainsai2api/main.py`
+
+## 位置
+
+找到：
+
+```python
+async def admin_status(request: Request):
+```
+
+在返回 dict 里追加：
+
+```python
+"db_pool_main": {
+    "size": DB_POOL.get_size() if DB_POOL else 0,
+    "free": DB_POOL.get_idle_size() if DB_POOL else 0,
+    "max": 15,
+} if DB_POOL else None,
+
+"db_pool_low": {
+    "size": DB_POOL_LOW.get_size() if DB_POOL_LOW else 0,
+    "free": DB_POOL_LOW.get_idle_size() if DB_POOL_LOW else 0,
+    "max": 20,
+} if DB_POOL_LOW else None,
+```
+
+---
+
+# 改动 7（可选）：Dashboard 显示两个 DB Pool
+
+## 文件
+
+`artifacts/admin-panel/src/pages/Dashboard.tsx`
+
+如果方便，在 admin dashboard 加两个卡片：
+
+```text
+主 DB Pool：使用中 / max
+LOW DB Pool：使用中 / max
+```
+
+这个是可选项，不影响后端修复。
+
+---
+
+# 重要说明
+
+## 不要做这些
+
+因为本工单目标是**不限制 LOW 批量激活速度**，所以不要做：
+
+```text
+不要加 LOW_GLOBAL_ACTIVATE_LIMIT
+不要加 LOW HTTP semaphore
+不要降低 /admin/low-config 并发上限
+不要把所有 LOW 用户塞进一个全局队列
+```
+
+本工单只做**资源隔离**，不做 LOW 限速。
+
+---
+
+# 效果预期
+
+## 修改前
+
+```text
+LOW 批量激活 50 个账号
+  → 所有写库走 DB_POOL(max=20)
+  → 普通用户/admin 也走同一个 DB_POOL
+  → LOW 吃满连接，普通用户卡住
+```
+
+## 修改后
+
+```text
+LOW 批量激活
+  → 写库走 DB_POOL_LOW(max=20)
+
+普通用户/admin/chat
+  → 写库/查询走 DB_POOL_MAIN(max=15)
+
+两边 DB 连接池互不抢占。
+```
+
+---
+
+# 验证方法
+
+## 1. 启动验证
+
+```text
+启动 Python 后调 /admin/status
+应看到：
+db_pool_main.max = 15
+db_pool_low.max = 20
+```
+
+如果 LOW 池尚未初始化，`db_pool_low` 可能是 null；触发一次 LOW 激活后应出现。
+
+---
+
+## 2. 挤占测试
+
+操作：
+
+```text
+1. LOW 用户发起 50 个账号批量激活
+2. 同时普通用户发起 /admin/activate 单激活
+3. 同时刷新 /admin/status
+```
+
+预期：
+
+```text
+LOW 批量激活期间：
+  db_pool_low 使用率升高
+  db_pool_main 使用率不被 LOW 拉满
+
+普通用户单激活：
+  能正常开始
+  日志正常流出
+  不因为 DB acquire 阻塞超时
+```
+
+---
+
+## 3. pending_nc 测试
+
+操作：
+
+```text
+1. 制造 LOW pending_nc 行
+2. 等待 _retry_pending_nc_lids 后台任务运行
+3. 同时普通用户激活
+```
+
+预期：
+
+```text
+LOW pending retry 使用 LOW DB pool
+普通用户不被 pending retry 挤占
+```
+
+---
+
+# 注意事项
+
+1. **PostgreSQL 总连接数增加**
+   - 原来约 20
+   - 现在主池 15 + LOW 池 20 = 35
+   - 如果托管 PG 连接数较低，可以把 LOW max 调成 10 或 15
+
+2. **这是资源隔离，不是物理隔离**
+   - 仍然共用同一个 Python 进程、CPU、socket
+   - 但最容易造成普通用户卡死的 DB 连接挤占会被解决
+
+3. **如果未来 LOW 仍然影响普通用户**
+   - 下一步应把 LOW Worker 拆成独立子进程或独立 Replit 实例
+
+---
+
+# 给 Replit Agent 的一句话指令
+
+> 当前项目已有 `_get_low_executor(discord_id)` 的 LOW Worker 池，不要重写它，也不要加 LOW 全局限速。请在现有 LOW Worker 池基础上做 DB 资源隔离：新增 `DB_POOL_LOW` 和 `_get_low_db_pool()`；主池 `_get_db_pool()` 改为 max_size=15，LOW 池 max_size=20；`admin_activate_stream` 内根据 `task.is_low_admin` 选择 DB pool，LOW 任务所有写库操作走 LOW pool；`_save_account_to_db` / `_upsert_key_to_db` / `_delete_key_from_db` 支持显式传 pool；`_retry_pending_nc_lids` 根据 `pending_nc_low_admin` 选择 LOW pool；`/admin/status` 增加 `db_pool_main/db_pool_low` 状态。目标是在不降低 LOW 批量激活速度的情况下，防止 LOW 写库占满普通用户的 DB 连接池。
