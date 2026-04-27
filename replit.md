@@ -6,6 +6,21 @@ pnpm workspace monorepo 1:1 复刻自 https://github.com/zzz609439-stack/Code-Re
 
 一个完整的 JetBrains AI 账号管理与代理系统（中文界面）。
 
+## 生产稳定性修复（2026-04-27）
+
+修复生产环境 `httpcore.PoolTimeout` 风暴（症状：`/admin/pending-nc` 卡 120s、`/key/discord-callback` 500、所有走全局 `http_client` 的接口逐步 500）。
+
+根因：全局 `http_client = httpx.AsyncClient(timeout(read=None), max_connections=200)` + 长流式 SSE（如 claude opus thinking 模型）— 客户端断开 ASGI 连接后，`async for response.aiter_lines()` 在没有上游下一行字节前不会被取消，僵尸连接长时间占用池槽位，逐步耗尽 200 个连接。
+
+修复（`jetbrainsai2api/main.py`，4 处改动）：
+1. **3186 行 `http_client` 配置升级**：`read=None → 900.0`、`pool=5.0 → 30.0`、`max_connections=200 → 500`、`max_keepalive=50 → 100`；给僵尸连接一个最终回收兜底 + 池等待 30s 缓冲突发流量。
+2. **457 行 `generic_exception_handler` 加 PoolTimeout 兜底**：识别 `httpx.PoolTimeout` / `httpcore.PoolTimeout` → 转 503 + `Retry-After: 5`（语义正确，便于客户端退避重试，不再 500 风暴）。
+3. **3285 行 `_sse_with_keepalive` 加 ASGI 断连检测**：新增 `request: Optional[Request] = None` 参数。每 25s keepalive 心跳触发 `await request.is_disconnected()` 检测，断了主动 `return` 让上游 `async with http_client.stream(...)` 退出归还连接。
+4. **3285 行 `_sse_with_keepalive` 加 `try/finally` 显式 `aclose`**：确保任何路径（正常/断连/异常）退出时显式 `await it.aclose()` 关闭下游生成器链，不依赖 GC 即可立刻归还连接池连接。
+5. **3765 行 `chat_completions`、4142 行 `messages_completions` 加 `http_request: Request` 形参**：调用 `_sse_with_keepalive(..., request=http_request)` 传入。第三处调用（`/admin/activate`，8945 行）保持原签名向后兼容。
+
+经架构师审查通过（`evaluate_task` + `includeGitDiff`），从"缓解"升级为"彻底堵漏"。
+
 ## 复刻状态（2026-04-26）
 
 源码已 1:1 复刻完成，三个工作流均正常运行：

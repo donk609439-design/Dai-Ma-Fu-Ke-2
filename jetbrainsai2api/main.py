@@ -471,6 +471,27 @@ async def generic_exception_handler(request: Request, exc: Exception):
                 }
             },
         )
+    # 连接池耗尽：转 503 + Retry-After，让客户端能够退避重试，避免 500 风暴
+    # （httpx.PoolTimeout 是 httpx.TimeoutException 子类；底层 httpcore.PoolTimeout 偶尔会原样冒泡）
+    pool_timeout_types = (httpx.PoolTimeout,)
+    try:
+        import httpcore  # type: ignore
+        pool_timeout_types = (httpx.PoolTimeout, httpcore.PoolTimeout)
+    except Exception:
+        pass
+    if isinstance(exc, pool_timeout_types):
+        print(f"[未处理异常] 连接池超时 PoolTimeout: 全局 http_client 池已饱和")
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": {
+                    "message": "上游连接池繁忙，请稍后重试",
+                    "type": "server_error",
+                    "code": "503",
+                }
+            },
+            headers={"Retry-After": "5"},
+        )
     print(f"[未处理异常] {type(exc).__name__}: {exc}")
     return JSONResponse(
         status_code=500,
@@ -3184,11 +3205,12 @@ async def startup():
     await _load_discord_sessions_from_db()
     await _load_low_admin_settings()
     http_client = httpx.AsyncClient(
-        # 连接阶段最多等 15 秒；流式读取不设超时（响应可能持续很久）
-        timeout=httpx.Timeout(connect=15.0, read=None, write=15.0, pool=5.0),
+        # 连接阶段最多等 15 秒；流式读取兜底 900 秒（避免僵尸 SSE 永久占用连接池连接）；
+        # 池等待 30 秒（应对突发流量排队，比直接 PoolTimeout 友好）
+        timeout=httpx.Timeout(connect=15.0, read=900.0, write=15.0, pool=30.0),
         limits=httpx.Limits(
-            max_connections=200,
-            max_keepalive_connections=50,
+            max_connections=500,
+            max_keepalive_connections=100,
             keepalive_expiry=60,
         ),
     )
@@ -3260,20 +3282,46 @@ async def list_models(_: str = Depends(authenticate_any_client)):
 async def _sse_with_keepalive(
     gen: AsyncGenerator[str, None],
     interval: float = 25.0,
+    request: Optional[Request] = None,
 ) -> AsyncGenerator[str, None]:
     """SSE 心跳包装器：超过 interval 秒无数据时注入 SSE 注释行 ': ping'，
     防止 Replit 反向代理的 idle timeout（默认 300s）截断长流式响应。
     SSE 注释行以冒号开头，OpenAI/Anthropic 兼容客户端会将其忽略。
+
+    若传入 request：每个 interval 周期会检查 ASGI 客户端是否断连。一旦断连立即 return，
+    生成器链上的 ``async with http_client.stream(...)`` 会随之退出并归还连接池连接，
+    避免僵尸 SSE 连接长时间占用 httpx 全局池导致后续请求 PoolTimeout。
+
+    无论是正常结束、客户端断连还是异常，finally 都会显式 aclose 下游生成器链，
+    确保 ``async with`` 上下文立即退出（不依赖 GC），连接立刻归还池。
     """
     it = gen.__aiter__()
-    while True:
+    try:
+        while True:
+            try:
+                chunk = await asyncio.wait_for(it.__anext__(), timeout=interval)
+                yield chunk
+            except asyncio.TimeoutError:
+                # 客户端断连 → 主动结束生成器（让上游 async with 块退出释放连接）
+                if request is not None:
+                    try:
+                        if await request.is_disconnected():
+                            print(f"[SSE] 客户端已断连，提前结束流式响应以释放上游连接")
+                            return
+                    except Exception:
+                        pass
+                yield ": ping\n\n"
+            except StopAsyncIteration:
+                break
+    finally:
+        # 显式关闭下游生成器链（含 http_client.stream 的 async with），
+        # 确保不依赖 GC 即可立刻归还连接池连接
         try:
-            chunk = await asyncio.wait_for(it.__anext__(), timeout=interval)
-            yield chunk
-        except asyncio.TimeoutError:
-            yield ": ping\n\n"
-        except StopAsyncIteration:
-            break
+            aclose = getattr(it, "aclose", None)
+            if aclose is not None:
+                await aclose()
+        except Exception as _close_err:
+            print(f"[SSE] 关闭下游生成器时出错（忽略）: {_close_err}")
 
 
 def _convert_openai_messages_to_jetbrains(
@@ -3726,7 +3774,9 @@ def _estimate_input_tokens(messages) -> int:
 
 @app.post("/v1/chat/completions")
 async def chat_completions(
-    request: ChatCompletionRequest, client_key: str = Depends(authenticate_client)
+    request: ChatCompletionRequest,
+    http_request: Request,
+    client_key: str = Depends(authenticate_client),
 ):
     """创建聊天完成"""
     max_in, max_out, _ = _key_tier_limits(client_key)
@@ -3808,7 +3858,7 @@ async def chat_completions(
             usage_capture=usage_capture, est_prompt_tokens=prompt_tokens,
         )
         return StreamingResponse(
-            _sse_with_keepalive(final_stream),
+            _sse_with_keepalive(final_stream, request=http_request),
             media_type="text/event-stream",
             headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
         )
@@ -4101,7 +4151,9 @@ def convert_openai_to_anthropic_response(
 
 @app.post("/v1/messages", response_model=None)
 async def messages_completions(
-    request: AnthropicMessageRequest, client_key: str = Depends(authenticate_anthropic_client)
+    request: AnthropicMessageRequest,
+    http_request: Request,
+    client_key: str = Depends(authenticate_anthropic_client),
 ):
     """创建符合 Anthropic 规范的聊天完成"""
     # 估算 token 数：消息 + system prompt
@@ -4219,7 +4271,7 @@ async def messages_completions(
             usage_capture=usage_capture, est_prompt_tokens=prompt_tokens,
         )
         return StreamingResponse(
-            _sse_with_keepalive(anthropic_stream),
+            _sse_with_keepalive(anthropic_stream, request=http_request),
             media_type="text/event-stream",
             headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
         )
