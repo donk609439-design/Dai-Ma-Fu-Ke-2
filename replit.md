@@ -164,6 +164,8 @@ LOW 激活 / LOW pending retry        → DB_POOL_LOW  (max=20)
 
 **Bug 2（崩溃风险）**：`_retry_pending_nc_lids` Phase 3 中 `_row_pool = await _get_low_db_pool() if row_is_low else db`，如果 LOW pool 初始化失败返回 None，后续 `_row_pool.acquire()` 会崩溃 → 已在 `_row_pool` 赋值后加 `if not _row_pool: continue` 保护。
 
+**后续修改（2026-04-27）**：`_LOW_USER_INPUT_TOKENS` 改为 `2_000_000_000`（实际无限制），LOW 用户输入不再受长度限制。
+
 **低优先级（未改，可接受）**：
 - `_get_db_pool()` / `_get_low_db_pool()` 懒加载存在多协程竞争初始化，极低概率创建多余连接池（GC 最终回收）；startup 初始化可彻底消除此问题，但超出本工单最简改动原则。
 - `/admin/status` pool 状态字段在 5s 缓存 TTL 内可能显示 null（LOW 池懒加载），可接受。
