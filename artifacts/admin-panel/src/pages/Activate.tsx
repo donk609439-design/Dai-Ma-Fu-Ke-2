@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useMemo } from "react";
-import { UserPlus, Play, CheckCircle, XCircle, Loader2, Mail, Lock, TerminalSquare, Copy, Check, AlertTriangle, FlaskConical, LogIn, LogOut, Layers, Settings2 } from "lucide-react";
+import { UserPlus, Play, CheckCircle, XCircle, Loader2, Mail, Lock, TerminalSquare, Copy, Check, AlertTriangle, FlaskConical, LogIn, LogOut, Layers, Settings2, Sparkles, ShieldCheck, Wand2 } from "lucide-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { getAdminKey, isFullAdmin, getAdminRole, adminFetch } from "@/lib/admin-auth";
 import { useDiscordAuth } from "@/hooks/useDiscordAuth";
@@ -313,23 +313,56 @@ export default function Activate() {
   };
 
   return (
-    <div className="p-6 max-w-2xl mx-auto">
-      <div className="flex items-center gap-3 mb-6">
-        <div className="flex items-center justify-center w-10 h-10 rounded-lg bg-primary/10">
-          <UserPlus className="w-5 h-5 text-primary" />
+    <div className="premium-page-shell mx-auto max-w-5xl space-y-6">
+      <section className="premium-hero-panel rounded-[2rem] p-5 sm:p-7">
+        <div className="relative z-10 grid gap-6 lg:grid-cols-[1fr_300px] lg:items-center">
+          <div>
+            <div className="mb-4 inline-flex items-center gap-2 rounded-full border border-white/70 bg-white/60 px-3 py-1.5 text-xs font-black uppercase tracking-[0.2em] text-orange-700 shadow-sm backdrop-blur">
+              <Sparkles className="h-3.5 w-3.5" />
+              Account Activation Lab
+            </div>
+            <h1 className="text-3xl font-black tracking-tight text-foreground sm:text-5xl">
+              账号<span className="citrus-text">激活</span>
+            </h1>
+            <p className="mt-3 max-w-2xl text-sm leading-6 text-muted-foreground sm:text-base">
+              {isAdmin ? "将 JetBrains AI 账号接入系统池，自动完成凭证校验、额度检查与密钥签发。" : "自动完成账号验证、绑卡解绑与专属 API 密钥生成，流程进度实时可见。"}
+            </p>
+            <div className="mt-5 flex flex-wrap gap-2">
+              <span className="inline-flex items-center gap-2 rounded-2xl bg-white/58 px-3 py-2 text-xs font-bold text-foreground ring-1 ring-white/65">
+                <ShieldCheck className="h-4 w-4 text-cyan-700" />
+                Discord Guard
+              </span>
+              <span className="inline-flex items-center gap-2 rounded-2xl bg-white/58 px-3 py-2 text-xs font-bold text-foreground ring-1 ring-white/65">
+                <Wand2 className="h-4 w-4 text-orange-600" />
+                Auto Provision
+              </span>
+              <span className="inline-flex items-center gap-2 rounded-2xl bg-white/58 px-3 py-2 text-xs font-bold text-foreground ring-1 ring-white/65">
+                <TerminalSquare className="h-4 w-4 text-emerald-700" />
+                Live Logs
+              </span>
+            </div>
+          </div>
+          <div className="rounded-[1.75rem] border border-white/70 bg-white/56 p-4 shadow-xl shadow-orange-950/5 backdrop-blur-xl">
+            <div className="flex items-center gap-3">
+              <div className="citrus-orb grid h-14 w-14 place-items-center rounded-2xl">
+                <UserPlus className="h-6 w-6 text-white" />
+              </div>
+              <div>
+                <p className="text-xs font-black uppercase tracking-[0.22em] text-muted-foreground">Mode</p>
+                <p className="mt-1 text-lg font-black text-foreground">{isAdmin ? "Admin No-card" : isLowAdmin ? "LOW Admin" : "Guest Auto"}</p>
+              </div>
+            </div>
+            <p className="mt-4 text-xs leading-5 text-muted-foreground">
+              密钥生成后请立即复制保存；激活过程中的预签密钥会在凭证确认后自动升级额度。
+            </p>
+          </div>
         </div>
-        <div>
-          <h1 className="text-xl font-semibold text-foreground">账号激活</h1>
-          <p className="text-sm text-muted-foreground">
-            {isAdmin ? "添加 JetBrains AI 账号到系统" : "绑定账号并获取专属 API 密钥"}
-          </p>
-        </div>
-      </div>
+      </section>
 
       {/* 说明卡片 */}
-      <div className="mb-5 p-4 rounded-lg border border-emerald-500/30 bg-emerald-500/5 text-sm text-muted-foreground space-y-1.5">
-        <p className="font-medium text-emerald-400 flex items-center gap-1.5">
-          <span className="inline-block w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+      <div className="premium-surface rounded-[1.75rem] p-5 text-sm text-muted-foreground space-y-1.5">
+        <p className="font-black text-cyan-700 flex items-center gap-2">
+          <span className="inline-block w-2 h-2 rounded-full bg-cyan-500 animate-pulse shadow-[0_0_16px_rgba(6,182,212,0.6)]" />
           {isAdmin ? "无卡激活模式" : "自动激活模式"}
         </p>
         {isAdmin ? (
@@ -353,9 +386,9 @@ export default function Activate() {
 
       {/* 次级管理员专属提示（仅 low_admin 可见） */}
       {isLowAdmin && (
-        <div className="mb-5 p-4 rounded-lg border border-emerald-500/30 bg-emerald-500/10 text-sm space-y-1.5">
-          <p className="font-medium text-emerald-400 flex items-center gap-1.5">
-            <span className="inline-block w-2 h-2 rounded-full bg-emerald-400" />
+        <div className="premium-surface rounded-[1.75rem] p-5 text-sm space-y-1.5">
+          <p className="font-black text-cyan-700 flex items-center gap-2">
+            <span className="inline-block w-2 h-2 rounded-full bg-cyan-500 shadow-[0_0_16px_rgba(6,182,212,0.6)]" />
             次级管理员模式
           </p>
           <ul className="list-disc list-inside space-y-1 text-emerald-300/90">
@@ -392,32 +425,41 @@ export default function Activate() {
 
       {/* Discord 登录门控（普通访客 + LOW 用户均须 Discord 登录；仅完整管理员跳过） */}
       {!isAdmin && (
-        <div className="mb-4">
+        <div className="premium-surface rounded-[1.75rem] p-4">
           {dcLoggedIn ? (
-            <div className="flex items-center gap-2 flex-wrap px-3 py-2 rounded-lg border border-indigo-500/30 bg-indigo-500/5">
-              <div className="flex items-center gap-1.5 text-xs font-semibold text-indigo-400">
-                <span className="inline-block w-1.5 h-1.5 rounded-full bg-indigo-400" />
-                Discord：{userTag}
+            <div className="flex items-center gap-3 flex-wrap">
+              <div className="grid h-10 w-10 place-items-center rounded-2xl bg-indigo-100 text-indigo-700 ring-1 ring-indigo-200">
+                <ShieldCheck className="w-4 h-4" />
+              </div>
+              <div>
+                <p className="text-xs font-black uppercase tracking-[0.18em] text-indigo-500">Discord verified</p>
+                <p className="text-sm font-bold text-foreground">{userTag}</p>
               </div>
               <button
                 type="button"
                 onClick={dcLogout}
-                className="ml-auto flex items-center gap-1 px-2.5 py-1 rounded text-xs border border-border text-muted-foreground hover:bg-muted/30 transition-colors"
+                className="ml-auto flex items-center gap-1.5 px-3 py-2 rounded-2xl border border-white/70 bg-white/60 text-xs font-bold text-muted-foreground hover:bg-white transition-colors"
               >
-                <LogOut className="w-3 h-3" />
+                <LogOut className="w-3.5 h-3.5" />
                 退出
               </button>
             </div>
           ) : (
-            <div className="flex flex-col items-center gap-3 py-8 rounded-lg border border-dashed border-indigo-500/30 bg-indigo-500/5">
-              <p className="text-sm text-muted-foreground">需要 Discord 验证才能激活账号</p>
+            <div className="flex flex-col items-center gap-4 py-8 rounded-[1.5rem] border border-dashed border-indigo-300/70 bg-indigo-50/60 text-center">
+              <div className="grid h-12 w-12 place-items-center rounded-2xl bg-indigo-100 text-indigo-700 ring-1 ring-indigo-200">
+                <LogIn className="w-5 h-5" />
+              </div>
+              <div>
+                <p className="text-sm font-black text-foreground">需要 Discord 验证才能激活账号</p>
+                <p className="mt-1 text-xs text-muted-foreground">仅验证服务器成员身份，不读取敏感信息</p>
+              </div>
               <button
                 type="button"
                 onClick={dcLogin}
-                className="flex items-center gap-2 px-5 py-2.5 rounded-lg text-sm font-bold border border-indigo-400 text-indigo-400 hover:bg-indigo-500/10 transition-colors"
+                className="flex items-center gap-2 px-5 py-3 rounded-2xl text-sm font-black bg-indigo-600 text-white shadow-lg shadow-indigo-500/20 hover:bg-indigo-700 transition-colors"
               >
                 <LogIn className="w-4 h-4" />
-                Discord 登录（仅验服务器成员）
+                Discord 登录
               </button>
             </div>
           )}
@@ -425,7 +467,7 @@ export default function Activate() {
       )}
 
       {/* 输入表单（非管理员须先登录 DC） */}
-      <form onSubmit={handleSubmit} className="space-y-4 mb-5">
+      <form onSubmit={handleSubmit} className="premium-surface rounded-[1.75rem] p-5 space-y-4">
         <div>
           <label className="block text-sm font-medium text-foreground mb-1.5">JetBrains 邮箱</label>
           <div className="relative">
@@ -437,7 +479,7 @@ export default function Activate() {
               placeholder="user@example.com"
               disabled={isRunning}
               required
-              className="w-full pl-9 pr-4 py-2.5 rounded-md border border-input bg-background text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary/30 disabled:opacity-50"
+              className="w-full pl-10 pr-4 py-3 rounded-2xl border border-white/70 bg-white/70 text-sm text-foreground placeholder:text-muted-foreground shadow-inner focus:outline-none focus:ring-4 focus:ring-orange-200/60 disabled:opacity-50"
             />
           </div>
         </div>
@@ -452,7 +494,7 @@ export default function Activate() {
               placeholder="••••••••"
               disabled={isRunning}
               required
-              className="w-full pl-9 pr-4 py-2.5 rounded-md border border-input bg-background text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary/30 disabled:opacity-50"
+              className="w-full pl-10 pr-4 py-3 rounded-2xl border border-white/70 bg-white/70 text-sm text-foreground placeholder:text-muted-foreground shadow-inner focus:outline-none focus:ring-4 focus:ring-orange-200/60 disabled:opacity-50"
             />
           </div>
         </div>
@@ -460,7 +502,7 @@ export default function Activate() {
           <button
             type="submit"
             disabled={isRunning || !email || !password || (!isAdmin && !dcLoggedIn)}
-            className="flex items-center gap-2 px-5 py-2.5 rounded-md bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+            className="flex items-center gap-2 px-5 py-3 rounded-2xl bg-gradient-to-r from-orange-400 to-orange-600 text-white text-sm font-black shadow-lg shadow-orange-500/20 hover:-translate-y-0.5 disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:translate-y-0 transition-all"
           >
             {isRunning ? (
               <><Loader2 className="w-4 h-4 animate-spin" />激活中...</>
@@ -473,7 +515,7 @@ export default function Activate() {
               type="button"
               onClick={handleReset}
               disabled={isRunning}
-              className="px-4 py-2.5 rounded-md border border-border text-sm font-medium text-muted-foreground hover:bg-muted/30 disabled:opacity-50 transition-colors"
+              className="px-4 py-3 rounded-2xl border border-white/70 bg-white/60 text-sm font-bold text-muted-foreground hover:bg-white disabled:opacity-50 transition-colors"
             >
               重置
             </button>
@@ -627,15 +669,15 @@ export default function Activate() {
 
       {/* 日志面板 */}
       {logs.length > 0 && (
-        <div className="rounded-lg border border-border overflow-hidden">
-          <div className="flex items-center gap-2 px-4 py-2.5 bg-muted/30 border-b border-border">
+        <div className="premium-surface rounded-[1.75rem] overflow-hidden">
+          <div className="flex items-center gap-2 px-4 py-3 bg-white/45 border-b border-white/60">
             <TerminalSquare className="w-4 h-4 text-muted-foreground" />
             <span className="text-xs font-medium text-muted-foreground">
               {isAdmin ? "激活日志" : "操作日志"}
             </span>
             {isRunning && <Loader2 className="w-3 h-3 animate-spin text-primary ml-auto" />}
           </div>
-          <div className="bg-[#0d1117] p-4 h-72 overflow-y-auto font-mono text-xs space-y-0.5">
+          <div className="premium-terminal p-4 h-80 overflow-y-auto font-mono text-xs space-y-0.5">
             {renderLogs()}
             <div ref={logsEndRef} />
           </div>

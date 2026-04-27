@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Package, Zap, Plus, Trash2, Copy, Check, ChevronDown, ChevronUp, X, CreditCard, LogIn, LogOut, Download } from "lucide-react";
+import { Package, Zap, Plus, Trash2, Copy, Check, ChevronDown, ChevronUp, X, CreditCard, LogIn, LogOut, Download, Sparkles, ShieldCheck, Archive, Gem, Wand2 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useToast } from "@/hooks/use-toast";
 import { useDiscordAuth } from "@/hooks/useDiscordAuth";
@@ -45,8 +45,8 @@ function CopyButton({ text }: { text: string }) {
     });
   };
   return (
-    <button onClick={copy} className="p-1 rounded text-muted-foreground hover:text-foreground transition-colors">
-      {copied ? <Check className="w-3.5 h-3.5 text-green-500" /> : <Copy className="w-3.5 h-3.5" />}
+    <button onClick={copy} className="rounded-xl bg-white/60 p-1.5 text-muted-foreground shadow-sm ring-1 ring-white/70 transition hover:bg-white hover:text-foreground">
+      {copied ? <Check className="w-3.5 h-3.5 text-cyan-600" /> : <Copy className="w-3.5 h-3.5" />}
     </button>
   );
 }
@@ -289,19 +289,19 @@ function PokeballCard({ pb, ownerKey, onRefresh }: { pb: Pokeball; ownerKey: str
   };
 
   return (
-    <div className="rounded-xl border border-border bg-card overflow-hidden">
+    <div className="backpack-item-card rounded-[1.65rem] overflow-hidden">
       {/* header */}
       <div className="p-4">
         <div className="flex items-start justify-between gap-3 mb-3">
           <div className="flex items-center gap-2.5">
-            <div className="text-2xl">🔮</div>
+            <div className="backpack-orb grid h-12 w-12 place-items-center rounded-2xl text-2xl">🔮</div>
             <div>
               <p className="font-semibold text-foreground text-sm">{pb.name}</p>
               <p className="text-xs text-muted-foreground">容量 {pb.capacity} · {pb.members.length} 个成员</p>
             </div>
           </div>
           <div className="flex items-center gap-2 shrink-0">
-            <span className="text-xs px-2 py-0.5 rounded-full bg-primary/10 text-primary font-medium">激活中</span>
+            <span className="text-xs px-2.5 py-1 rounded-full bg-orange-100 text-orange-700 font-black ring-1 ring-orange-200/70">激活中</span>
             {!confirming && (
               <button
                 onClick={() => setConfirming(true)}
@@ -338,7 +338,7 @@ function PokeballCard({ pb, ownerKey, onRefresh }: { pb: Pokeball; ownerKey: str
         )}
 
         {/* key display */}
-        <div className="flex items-center gap-1.5 bg-muted/40 rounded-lg px-3 py-2 mb-3">
+        <div className="flex items-center gap-1.5 bg-white/58 rounded-2xl px-3 py-2 mb-3 ring-1 ring-white/70">
           <code className="flex-1 text-xs text-primary font-mono truncate">{pb.ball_key}</code>
           <CopyButton text={pb.ball_key} />
         </div>
@@ -349,8 +349,8 @@ function PokeballCard({ pb, ownerKey, onRefresh }: { pb: Pokeball; ownerKey: str
             <span>已用 {pb.total_used} / {pb.capacity}</span>
             <span>{pct}%</span>
           </div>
-          <div className="h-1.5 rounded-full bg-muted overflow-hidden">
-            <div className="h-full rounded-full bg-primary transition-all" style={{ width: `${Math.min(pct, 100)}%` }} />
+          <div className="h-2 rounded-full bg-orange-100 overflow-hidden">
+            <div className="h-full rounded-full bg-gradient-to-r from-orange-400 to-orange-600 transition-all" style={{ width: `${Math.min(pct, 100)}%` }} />
           </div>
         </div>
       </div>
@@ -358,7 +358,7 @@ function PokeballCard({ pb, ownerKey, onRefresh }: { pb: Pokeball; ownerKey: str
       {/* expand toggle */}
       <button
         onClick={() => setExpanded(v => !v)}
-        className="w-full flex items-center justify-center gap-1 py-2 border-t border-border text-xs text-muted-foreground hover:bg-muted/30 transition-colors"
+        className="w-full flex items-center justify-center gap-1 py-2.5 border-t border-white/60 text-xs font-bold text-muted-foreground hover:bg-white/45 transition-colors"
       >
         {expanded ? <><ChevronUp className="w-3.5 h-3.5" />收起成员</>
           : <><ChevronDown className="w-3.5 h-3.5" />管理成员</>}
@@ -366,7 +366,7 @@ function PokeballCard({ pb, ownerKey, onRefresh }: { pb: Pokeball; ownerKey: str
 
       {/* expanded member management */}
       {expanded && (
-        <div className="border-t border-border p-4 space-y-3 bg-muted/10">
+        <div className="border-t border-white/60 p-4 space-y-3 bg-white/28">
           {pb.members.length === 0 ? (
             <p className="text-xs text-muted-foreground text-center py-2">暂无成员，添加 Key 后将按轮询分发请求</p>
           ) : (
@@ -649,33 +649,72 @@ export default function Backpack() {
   const activePokeballs = data?.pokeballs ?? [];
 
   return (
-    <div className="max-w-2xl mx-auto space-y-6">
-      <div>
-        <h1 className="text-2xl font-bold text-foreground flex items-center gap-2">
-          <Package className="w-6 h-6 text-primary" />
-          我的背包
-        </h1>
-        <p className="text-sm text-muted-foreground mt-1">用 Discord 登录查看您的背包内容</p>
-      </div>
+    <div className="premium-page-shell mx-auto max-w-5xl space-y-6">
+      <section className="premium-hero-panel rounded-[2rem] p-5 sm:p-7">
+        <div className="relative z-10 grid gap-6 lg:grid-cols-[1fr_320px] lg:items-center">
+          <div>
+            <div className="mb-4 inline-flex items-center gap-2 rounded-full border border-white/70 bg-white/60 px-3 py-1.5 text-xs font-black uppercase tracking-[0.2em] text-orange-700 shadow-sm backdrop-blur">
+              <Sparkles className="h-3.5 w-3.5" />
+              Discord Backpack Vault
+            </div>
+            <h1 className="text-3xl font-black tracking-tight text-foreground sm:text-5xl">
+              我的<span className="citrus-text">背包</span>
+            </h1>
+            <p className="mt-3 max-w-2xl text-sm leading-6 text-muted-foreground sm:text-base">
+              管理橘子机奖品、额度道具与宝可梦球聚合 Key。所有物品与 Discord 账号绑定，支持导入旧账号资产。
+            </p>
+            <div className="mt-5 flex flex-wrap gap-2">
+              <span className="inline-flex items-center gap-2 rounded-2xl bg-white/58 px-3 py-2 text-xs font-bold text-foreground ring-1 ring-white/65">
+                <Archive className="h-4 w-4 text-orange-600" />
+                Prize Vault
+              </span>
+              <span className="inline-flex items-center gap-2 rounded-2xl bg-white/58 px-3 py-2 text-xs font-bold text-foreground ring-1 ring-white/65">
+                <Gem className="h-4 w-4 text-cyan-700" />
+                Quota Items
+              </span>
+              <span className="inline-flex items-center gap-2 rounded-2xl bg-white/58 px-3 py-2 text-xs font-bold text-foreground ring-1 ring-white/65">
+                <Wand2 className="h-4 w-4 text-purple-600" />
+                Pokéball Keys
+              </span>
+            </div>
+          </div>
+          <div className="rounded-[1.75rem] border border-white/70 bg-white/56 p-4 shadow-xl shadow-orange-950/5 backdrop-blur-xl">
+            <div className="flex items-center gap-3">
+              <div className="backpack-orb grid h-14 w-14 place-items-center rounded-2xl">
+                <Package className="h-6 w-6 text-white" />
+              </div>
+              <div>
+                <p className="text-xs font-black uppercase tracking-[0.22em] text-muted-foreground">Inventory</p>
+                <p className="mt-1 text-lg font-black text-foreground">
+                  {data ? `${unusedPokeballs.length + unusedQuotaItems.length + activePokeballs.length} active` : "Secure"}
+                </p>
+              </div>
+            </div>
+            <p className="mt-4 text-xs leading-5 text-muted-foreground">
+              宝可梦球可聚合多个成员 Key；额度道具可直接为指定 API Key 充值上限。
+            </p>
+          </div>
+        </div>
+      </section>
 
       {/* DC 登录状态栏 */}
-      <div className="flex items-center gap-2 flex-wrap">
+      <div className="premium-surface rounded-[1.75rem] p-4 flex items-center gap-2 flex-wrap">
         {dcLoggedIn ? (
           <>
-            <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold border"
-              style={{ background: "rgba(99,102,241,0.1)", borderColor: "#818cf8", color: "#4338ca" }}>
+            <div className="flex items-center gap-2 px-3 py-2 rounded-2xl text-xs font-black border border-indigo-200 bg-indigo-50 text-indigo-700">
+              <ShieldCheck className="w-3.5 h-3.5" />
               <span>Discord：{userTag}</span>
             </div>
             <button
               onClick={dcLogout}
-              className="flex items-center gap-1 px-3 py-1.5 rounded-lg text-xs border text-muted-foreground hover:bg-muted/30"
+              className="flex items-center gap-1 px-3 py-2 rounded-2xl text-xs font-bold border border-white/70 bg-white/60 text-muted-foreground hover:bg-white"
             >
               <LogOut className="w-3 h-3" />
               退出
             </button>
             <button
               onClick={() => setShowImport(true)}
-              className="flex items-center gap-1 px-3 py-1.5 rounded-lg text-xs border text-indigo-500 border-indigo-300 hover:bg-indigo-50"
+              className="flex items-center gap-1 px-3 py-2 rounded-2xl text-xs font-bold border border-indigo-200 bg-indigo-50 text-indigo-600 hover:bg-indigo-100"
             >
               <Download className="w-3 h-3" />
               从密码导入
@@ -684,8 +723,7 @@ export default function Backpack() {
         ) : (
           <button
             onClick={dcLogin}
-            className="flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-bold border"
-            style={{ background: "rgba(99,102,241,0.1)", borderColor: "#818cf8", color: "#4338ca" }}
+            className="flex items-center gap-1.5 px-4 py-3 rounded-2xl text-sm font-black bg-indigo-600 text-white shadow-lg shadow-indigo-500/20 hover:bg-indigo-700"
           >
             <LogIn className="w-3.5 h-3.5" />
             Discord 登录查看背包
@@ -695,13 +733,15 @@ export default function Backpack() {
 
       {/* 未登录提示 */}
       {!dcLoggedIn && (
-        <div className="flex flex-col items-center justify-center py-16 gap-4 text-center">
-          <Package className="w-12 h-12 text-muted-foreground/40" />
-          <p className="text-sm text-muted-foreground">请先用 Discord 登录，才能查看背包内容</p>
+        <div className="premium-surface flex flex-col items-center justify-center py-16 gap-4 text-center rounded-[2rem]">
+          <div className="backpack-orb grid h-16 w-16 place-items-center rounded-3xl">
+            <Package className="w-8 h-8 text-white" />
+          </div>
+          <p className="text-sm font-bold text-foreground">请先用 Discord 登录，才能查看背包内容</p>
+          <p className="max-w-sm text-xs text-muted-foreground">登录后可以查看奖品、激活宝可梦球、充值额度，以及从旧密码账号导入资产。</p>
           <button
             onClick={dcLogin}
-            className="flex items-center gap-1.5 px-5 py-2.5 rounded-xl text-sm font-bold border"
-            style={{ background: "rgba(99,102,241,0.1)", borderColor: "#818cf8", color: "#4338ca" }}
+            className="flex items-center gap-1.5 px-5 py-3 rounded-2xl text-sm font-black bg-indigo-600 text-white shadow-lg shadow-indigo-500/20 hover:bg-indigo-700"
           >
             <LogIn className="w-4 h-4" />
             Discord 登录
@@ -757,15 +797,15 @@ export default function Backpack() {
                 <span className="text-base">🎁</span>未使用道具
               </h2>
               {unusedPokeballs.map(item => (
-                <div key={item.id} className="flex items-center gap-3 p-3 rounded-xl border border-amber-500/30 bg-amber-500/5">
-                  <div className="text-2xl shrink-0">🔮</div>
+                <div key={item.id} className="backpack-item-card flex items-center gap-3 p-4 rounded-[1.5rem]">
+                  <div className="backpack-orb grid h-12 w-12 place-items-center rounded-2xl text-2xl shrink-0">🔮</div>
                   <div className="flex-1 min-w-0">
                     <p className="text-sm font-medium text-foreground">{item.prize_name}</p>
                     <p className="text-xs text-muted-foreground">容量 {(item.metadata.capacity as number) ?? "?"} · {new Date(item.created_at).toLocaleDateString("zh-CN")}</p>
                   </div>
                   <button
                     onClick={() => setActivatingItem(item)}
-                    className="shrink-0 px-3 py-1.5 rounded-lg bg-primary text-primary-foreground text-xs font-medium hover:bg-primary/90"
+                    className="shrink-0 px-4 py-2 rounded-2xl bg-gradient-to-r from-orange-400 to-orange-600 text-white text-xs font-black shadow-lg shadow-orange-500/20 hover:-translate-y-0.5 transition"
                   >
                     激活
                   </button>
@@ -783,8 +823,10 @@ export default function Backpack() {
               {unusedQuotaItems.map(item => {
                 const amount = item.metadata?.quota_amount as number | undefined;
                 return (
-                  <div key={item.id} className="flex items-center gap-3 p-3 rounded-xl border border-blue-500/30 bg-blue-500/5">
-                    <CreditCard className="w-6 h-6 text-blue-400 shrink-0" />
+                  <div key={item.id} className="backpack-item-card flex items-center gap-3 p-4 rounded-[1.5rem]">
+                    <div className="grid h-12 w-12 shrink-0 place-items-center rounded-2xl bg-cyan-100 text-cyan-700 ring-1 ring-cyan-200">
+                      <CreditCard className="w-6 h-6" />
+                    </div>
                     <div className="flex-1 min-w-0">
                       <p className="text-sm font-medium text-foreground">{item.prize_name}</p>
                       <p className="text-xs text-muted-foreground">
@@ -793,7 +835,7 @@ export default function Backpack() {
                     </div>
                     <button
                       onClick={() => setRedeemingItem(item)}
-                      className="shrink-0 px-3 py-1.5 rounded-lg bg-blue-500 text-white text-xs font-medium hover:bg-blue-600"
+                      className="shrink-0 px-4 py-2 rounded-2xl bg-cyan-600 text-white text-xs font-black shadow-lg shadow-cyan-500/20 hover:bg-cyan-700 transition"
                     >
                       使用
                     </button>
@@ -821,7 +863,7 @@ export default function Backpack() {
             <section className="space-y-2">
               <h2 className="text-sm font-semibold text-muted-foreground">其他奖品记录</h2>
               {usedItems.filter(i => !/宝可梦/.test(i.prize_name)).map(item => (
-                <div key={item.id} className="flex items-center gap-3 p-3 rounded-lg border border-border bg-muted/20 opacity-60">
+                <div key={item.id} className="backpack-item-card flex items-center gap-3 p-4 rounded-[1.5rem] opacity-70">
                   {isQuota(item.prize_name)
                     ? <CreditCard className="w-5 h-5 text-blue-400 shrink-0" />
                     : <div className="text-lg">🎫</div>
@@ -837,9 +879,11 @@ export default function Backpack() {
           )}
 
           {unusedPokeballs.length === 0 && unusedQuotaItems.length === 0 && activePokeballs.length === 0 && usedItems.length === 0 && (
-            <div className="text-center py-12 text-muted-foreground">
-              <Package className="w-10 h-10 mx-auto mb-3 opacity-30" />
-              <p className="text-sm">背包空空如也</p>
+            <div className="premium-surface text-center py-14 text-muted-foreground rounded-[2rem]">
+              <div className="backpack-orb mx-auto mb-4 grid h-14 w-14 place-items-center rounded-3xl">
+                <Package className="w-7 h-7 text-white" />
+              </div>
+              <p className="text-sm font-black text-foreground">背包空空如也</p>
               <p className="text-xs mt-1">去橘子机抽一个宝可梦球吧！</p>
             </div>
           )}
