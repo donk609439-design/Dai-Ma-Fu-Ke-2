@@ -862,6 +862,175 @@
       0 14px 30px rgba(249, 115, 22, 0.22);
   }
 
+  /*
+    Universal premium polish for legacy pages that were not individually rebuilt.
+    This upgrades Accounts / Keys / Models / Stats / Logs / Docs / Pools / Queue /
+    Prizes / Partners / Donate / Self-register etc. without touching business logic.
+  */
+  .premium-main-scroll h1 {
+    letter-spacing: -0.035em;
+    font-weight: 950;
+  }
+
+  .premium-main-scroll h1,
+  .premium-main-scroll h2,
+  .premium-main-scroll h3 {
+    text-wrap: balance;
+  }
+
+  .premium-main-scroll h1 svg,
+  .premium-main-scroll h2 svg,
+  .premium-main-scroll h3 svg {
+    color: #f97316;
+    filter: drop-shadow(0 8px 18px rgba(249, 115, 22, 0.18));
+  }
+
+  .premium-main-scroll > div > div:not(.premium-page-shell):not(.lottery-stage),
+  .premium-main-scroll > div > section:not(.premium-hero-panel) {
+    max-width: 100%;
+  }
+
+  .premium-main-scroll :is(
+    [class*="border-border"],
+    [class*="border-card-border"],
+    [class*="border-input"]
+  ):not(input):not(textarea):not(select) {
+    border-color: rgba(255, 255, 255, 0.66) !important;
+  }
+
+  .premium-main-scroll :is(
+    [class*="bg-card"],
+    [class*="bg-muted/"],
+    [class*="bg-background"]
+  ):not(input):not(textarea):not(select):not(button) {
+    backdrop-filter: blur(14px);
+  }
+
+  .premium-main-scroll :is(table, [role="table"]) {
+    width: 100%;
+  }
+
+  .premium-main-scroll :is(th, td) {
+    vertical-align: middle;
+  }
+
+  .premium-main-scroll tbody tr {
+    border-color: rgba(255, 255, 255, 0.55);
+  }
+
+  .premium-main-scroll :is(button, a)[class*="bg-primary"],
+  .premium-main-scroll button[type="submit"] {
+    box-shadow: 0 12px 30px rgba(249, 115, 22, 0.16);
+  }
+
+  .premium-main-scroll :is(input, textarea, select) {
+    border-radius: 1rem;
+  }
+
+  .premium-main-scroll pre,
+  .premium-main-scroll code {
+    overflow-wrap: anywhere;
+  }
+
+  /*
+    Replace yellow/amber foreground UI with orange for readability.
+    Large page backgrounds remain unchanged; this targets text, borders, rings,
+    controls and small state chips that previously looked too pale.
+  */
+  [class*="text-yellow"],
+  [class*="text-amber"] {
+    color: rgb(234 88 12) !important;
+  }
+
+  [class*="border-yellow"],
+  [class*="border-amber"] {
+    border-color: rgba(249, 115, 22, 0.56) !important;
+  }
+
+  [class*="ring-yellow"],
+  [class*="ring-amber"] {
+    --tw-ring-color: rgba(249, 115, 22, 0.34) !important;
+  }
+
+  [class*="from-yellow"],
+  [class*="from-amber"] {
+    --tw-gradient-from: #fb923c var(--tw-gradient-from-position) !important;
+    --tw-gradient-to: rgba(251, 146, 60, 0) var(--tw-gradient-to-position) !important;
+    --tw-gradient-stops: var(--tw-gradient-from), var(--tw-gradient-to) !important;
+  }
+
+  [class*="to-yellow"],
+  [class*="to-amber"] {
+    --tw-gradient-to: #ea580c var(--tw-gradient-to-position) !important;
+  }
+
+  [class*="via-yellow"],
+  [class*="via-amber"] {
+    --tw-gradient-via: #f97316 var(--tw-gradient-via-position) !important;
+    --tw-gradient-stops: var(--tw-gradient-from), var(--tw-gradient-via), var(--tw-gradient-to) !important;
+  }
+
+  button[class*="bg-yellow"],
+  button[class*="bg-amber"],
+  a[class*="bg-yellow"],
+  a[class*="bg-amber"],
+  [role="button"][class*="bg-yellow"],
+  [role="button"][class*="bg-amber"] {
+    background-color: #f97316 !important;
+    color: white !important;
+    border-color: rgba(234, 88, 12, 0.55) !important;
+    box-shadow: 0 12px 30px rgba(249, 115, 22, 0.2);
+  }
+
+  .premium-main-scroll [class*="bg-yellow"]:not(body):not(.app-shell):not(.lottery-stage),
+  .premium-main-scroll [class*="bg-amber"]:not(body):not(.app-shell):not(.lottery-stage) {
+    color: rgb(154 52 18);
+    border-color: rgba(249, 115, 22, 0.34) !important;
+  }
+
+  @media (max-width: 768px) {
+    .premium-main-scroll {
+      padding-inline: 0.75rem;
+    }
+
+    .premium-main-scroll > div {
+      max-width: 100%;
+    }
+
+    .premium-main-scroll :is(h1) {
+      font-size: clamp(1.75rem, 8vw, 2.65rem);
+      line-height: 1;
+    }
+
+    .premium-main-scroll :is(h2) {
+      font-size: clamp(1.15rem, 5vw, 1.6rem);
+    }
+
+    .premium-main-scroll :is(.grid) {
+      min-width: 0;
+    }
+
+    .premium-main-scroll :is(table) {
+      min-width: 680px;
+    }
+
+    .premium-main-scroll :is(.overflow-x-auto, [data-radix-scroll-area-viewport]) {
+      -webkit-overflow-scrolling: touch;
+    }
+
+    .premium-main-scroll :is(input, textarea, select) {
+      font-size: 16px;
+    }
+
+    .premium-main-scroll :is(button, a[role="button"]) {
+      min-height: 2.5rem;
+    }
+
+    .premium-main-scroll .flex.items-center.justify-between {
+      gap: 0.75rem;
+    }
+  }
+
   @media (max-width: 640px) {
     .premium-page-shell {
       max-width: 100%;
