@@ -1,3 +1,0 @@
-replit-pull-test-ok
-created-at: 2026-04-28 02:53 Asia/Shanghai
-purpose: verify Replit successfully pulled latest GitHub commit
