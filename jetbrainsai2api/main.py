@@ -36,6 +36,9 @@ POKEBALL_KEYS: dict = {}      # ball_key -> {"id", "name", "capacity", "total_us
 JETBRAINS_ACCOUNTS: list = []
 current_account_index: int = 0
 account_rotation_lock = asyncio.Lock()
+# JWT 刷新全局节流：防止高并发时 grazie auth 接口被击穿
+# 即使 _first_ready 给每个请求做了批内并发限制（8），多个用户同时请求时累积仍会超过上游能承受的速率。
+_jwt_refresh_sem = asyncio.Semaphore(20)
 # 每个账号 ID 对应一把 JWT 刷新锁，防止并发请求重复刷新同一账号
 _jwt_refresh_locks: Dict[str, asyncio.Lock] = {}
 # 当前正在进行 _check_quota 的账号 ID 集合（防止同一账号并发重入）
@@ -139,7 +142,7 @@ def _append_log(model: str, client_key: str, prompt_tokens: int,
     # 解析 key → Discord ID（用于 LOW 用户私有日志过滤）
     meta = VALID_CLIENT_KEYS.get(client_key) or {}
     discord_id = str(meta.get("low_admin_discord_id", "") or "")
-    _call_logs.append({
+    entry: Dict[str, Any] = {
         "id":               _log_id_counter,
         "ts":               time.time(),
         "model":            model,
@@ -150,7 +153,13 @@ def _append_log(model: str, client_key: str, prompt_tokens: int,
         "elapsed_ms":       round(elapsed_ms),
         "status":           status,
         "exempt":           bool(exempt),  # True 表示本次未计费（豁免）
-    })
+    }
+    _call_logs.append(entry)
+    # 同时异步持久化到数据库（fire-and-forget，失败不影响响应）
+    try:
+        asyncio.get_running_loop().create_task(_persist_call_log(entry))
+    except RuntimeError:
+        pass
 
 def _account_id(account: dict) -> str:
     """生成账户唯一标识（优先用 licenseId，否则用 JWT 的 SHA256 哈希）。
@@ -1105,6 +1114,12 @@ async def _ensure_db_tables():
                 END IF;
             END $$;
         """)
+        await conn.execute(
+            "ALTER TABLE cf_proxy_pool ADD COLUMN IF NOT EXISTS last_health_check DOUBLE PRECISION DEFAULT 0"
+        )
+        await conn.execute(
+            "ALTER TABLE cf_proxy_pool ADD COLUMN IF NOT EXISTS consecutive_failures INTEGER DEFAULT 0"
+        )
         # pending NC 任务的 LOW 标记：True 时该任务由 LOW_ADMIN 触发，
         # 后台重试探测时必须使用 LOW_CF_PROXY_POOL。
         await conn.execute(
@@ -1114,6 +1129,24 @@ async def _ensure_db_tables():
         await conn.execute(
             "ALTER TABLE jb_accounts ADD COLUMN IF NOT EXISTS pending_nc_discord_id TEXT NOT NULL DEFAULT ''"
         )
+        # 调用日志持久化表（任务5）
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS call_logs (
+                id             BIGSERIAL PRIMARY KEY,
+                ts             DOUBLE PRECISION NOT NULL,
+                model          TEXT NOT NULL DEFAULT '',
+                api_key        TEXT NOT NULL DEFAULT '',
+                discord_id     TEXT NOT NULL DEFAULT '',
+                prompt_tokens  INTEGER NOT NULL DEFAULT 0,
+                completion_tokens INTEGER NOT NULL DEFAULT 0,
+                elapsed_ms     INTEGER NOT NULL DEFAULT 0,
+                status         TEXT NOT NULL DEFAULT '',
+                exempt         BOOLEAN NOT NULL DEFAULT FALSE,
+                created_at     TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_call_logs_ts ON call_logs(ts DESC)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_call_logs_discord_id ON call_logs(discord_id)")
     print("数据库表已就绪")
 
 
@@ -2043,83 +2076,84 @@ async def _check_quota(account: dict):
 
 
 async def _refresh_jetbrains_jwt(account: dict):
-    """使用 licenseId 和 authorization 刷新 JWT"""
-    if not http_client:
-        raise HTTPException(status_code=500, detail="HTTP 客户端未初始化")
+    async with _jwt_refresh_sem:
+        """使用 licenseId 和 authorization 刷新 JWT"""
+        if not http_client:
+            raise HTTPException(status_code=500, detail="HTTP 客户端未初始化")
 
-    license_id = account.get("licenseId", "<unknown>")
-    auth_token = account.get("authorization")
+        license_id = account.get("licenseId", "<unknown>")
+        auth_token = account.get("authorization")
 
-    if not auth_token:
-        print(f"无法刷新 licenseId {license_id} 的 JWT：账号缺少 authorization 令牌（需重新激活）")
-        raise HTTPException(
-            status_code=503,
-            detail=f"账号 {license_id} 的 JWT 已过期且无法自动刷新，请在管理面板重新激活此账号",
-        )
+        if not auth_token:
+            print(f"无法刷新 licenseId {license_id} 的 JWT：账号缺少 authorization 令牌（需重新激活）")
+            raise HTTPException(
+                status_code=503,
+                detail=f"账号 {license_id} 的 JWT 已过期且无法自动刷新，请在管理面板重新激活此账号",
+            )
 
-    print(f"正在为 licenseId {license_id} 刷新 JWT...")
-    try:
-        headers = {
-            "User-Agent": "ktor-client",
-            "Content-Type": "application/json",
-            "Accept-Charset": "UTF-8",
-            "authorization": f"Bearer {auth_token}",
-        }
+        print(f"正在为 licenseId {license_id} 刷新 JWT...")
+        try:
+            headers = {
+                "User-Agent": "ktor-client",
+                "Content-Type": "application/json",
+                "Accept-Charset": "UTF-8",
+                "authorization": f"Bearer {auth_token}",
+            }
 
-        _lite_url = "https://api.jetbrains.ai/auth/jetbrains-jwt/license/obtain/grazie-lite"
-        _jwt_url = "https://api.jetbrains.ai/auth/jetbrains-jwt/provide-access/license/v2"
-        stored_lid = account.get("licenseId", "")
-        actual_license_id = stored_lid or license_id
+            _lite_url = "https://api.jetbrains.ai/auth/jetbrains-jwt/license/obtain/grazie-lite"
+            _jwt_url = "https://api.jetbrains.ai/auth/jetbrains-jwt/provide-access/license/v2"
+            stored_lid = account.get("licenseId", "")
+            actual_license_id = stored_lid or license_id
 
-        # ★ free-tier 账号（非 AIP- 开头，且已有存储的 licenseId）直接使用存储的 licenseId 刷新，
-        # 跳过 obtain/grazie-lite，防止覆盖为 grazie-lite（10K）licenseId
-        is_free_tier = bool(stored_lid) and not stored_lid.startswith("AIP")
-        if not is_free_tier:
-            # grazie.individual.lite / AIP 账号：先 obtain/grazie-lite 确认最新 licenseId
-            lite_response = await http_client.post(_lite_url, headers=headers, timeout=DEFAULT_REQUEST_TIMEOUT)
-            if lite_response.status_code == 200:
-                lite_data = lite_response.json()
-                lite_lic = lite_data.get("license", {})
-                if isinstance(lite_lic, dict) and lite_lic.get("licenseId"):
-                    actual_license_id = lite_lic["licenseId"]
-                    print(f"  [refresh] grazie-lite → licenseId={actual_license_id}")
-        else:
-            print(f"  [refresh] free-tier 账号，直接使用存储 licenseId={actual_license_id}")
+            # ★ free-tier 账号（非 AIP- 开头，且已有存储的 licenseId）直接使用存储的 licenseId 刷新，
+            # 跳过 obtain/grazie-lite，防止覆盖为 grazie-lite（10K）licenseId
+            is_free_tier = bool(stored_lid) and not stored_lid.startswith("AIP")
+            if not is_free_tier:
+                # grazie.individual.lite / AIP 账号：先 obtain/grazie-lite 确认最新 licenseId
+                lite_response = await http_client.post(_lite_url, headers=headers, timeout=DEFAULT_REQUEST_TIMEOUT)
+                if lite_response.status_code == 200:
+                    lite_data = lite_response.json()
+                    lite_lic = lite_data.get("license", {})
+                    if isinstance(lite_lic, dict) and lite_lic.get("licenseId"):
+                        actual_license_id = lite_lic["licenseId"]
+                        print(f"  [refresh] grazie-lite → licenseId={actual_license_id}")
+            else:
+                print(f"  [refresh] free-tier 账号，直接使用存储 licenseId={actual_license_id}")
 
-        payload = {"licenseId": actual_license_id}
-        response = await http_client.post(_jwt_url, json=payload, headers=headers, timeout=DEFAULT_REQUEST_TIMEOUT)
-        # 429 限流：等待后重试一次
-        if response.status_code == 429:
-            await asyncio.sleep(3 + (hash(license_id) % 5))   # 3~7s 抖动，避免雷同账号同时重试
+            payload = {"licenseId": actual_license_id}
             response = await http_client.post(_jwt_url, json=payload, headers=headers, timeout=DEFAULT_REQUEST_TIMEOUT)
-        response.raise_for_status()
+            # 429 限流：等待后重试一次
+            if response.status_code == 429:
+                await asyncio.sleep(3 + (hash(license_id) % 5))   # 3~7s 抖动，避免雷同账号同时重试
+                response = await http_client.post(_jwt_url, json=payload, headers=headers, timeout=DEFAULT_REQUEST_TIMEOUT)
+            response.raise_for_status()
 
-        data = response.json()
-        new_token = data.get("token")
-        state = data.get("state", "")
-        # grazie.individual.lite 账号的 state 始终为 NONE，但 token 完全有效
-        VALID_STATES = {"ACTIVE", "PAID", "TRIAL", "FULL", "NONE"}
-        if new_token and state in VALID_STATES:
-            account["jwt"] = new_token
-            account["last_updated"] = time.time()
-            print(f"成功刷新 licenseId {account['licenseId']} 的 JWT (state={state})")
-            try:
-                await _save_account_to_db(account)
-            except Exception as e:
-                print(f"[后台] 保存刷新后 JWT 到数据库时出错: {e}")
-        else:
-            print(f"刷新 JWT 失败: 响应中无 token 或 state 未知，state={state}")
-            raise HTTPException(status_code=500, detail=f"刷新 JWT 失败: {data}")
+            data = response.json()
+            new_token = data.get("token")
+            state = data.get("state", "")
+            # grazie.individual.lite 账号的 state 始终为 NONE，但 token 完全有效
+            VALID_STATES = {"ACTIVE", "PAID", "TRIAL", "FULL", "NONE"}
+            if new_token and state in VALID_STATES:
+                account["jwt"] = new_token
+                account["last_updated"] = time.time()
+                print(f"成功刷新 licenseId {account['licenseId']} 的 JWT (state={state})")
+                try:
+                    await _save_account_to_db(account)
+                except Exception as e:
+                    print(f"[后台] 保存刷新后 JWT 到数据库时出错: {e}")
+            else:
+                print(f"刷新 JWT 失败: 响应中无 token 或 state 未知，state={state}")
+                raise HTTPException(status_code=500, detail=f"刷新 JWT 失败: {data}")
 
-    except httpx.HTTPStatusError as e:
-        print(f"刷新 JWT 时 HTTP 错误: {e.response.status_code} {e.response.text}")
-        raise HTTPException(
-            status_code=e.response.status_code,
-            detail=f"刷新 JWT 失败: {e.response.text}",
-        )
-    except Exception as e:
-        print(f"刷新 JWT 时发生未知错误: {e}")
-        raise HTTPException(status_code=500, detail=f"刷新 JWT 时发生未知错误: {e}")
+        except httpx.HTTPStatusError as e:
+            print(f"刷新 JWT 时 HTTP 错误: {e.response.status_code} {e.response.text}")
+            raise HTTPException(
+                status_code=e.response.status_code,
+                detail=f"刷新 JWT 失败: {e.response.text}",
+            )
+        except Exception as e:
+            print(f"刷新 JWT 时发生未知错误: {e}")
+            raise HTTPException(status_code=500, detail=f"刷新 JWT 时发生未知错误: {e}")
 
 
 async def get_next_jetbrains_account(client_key: Optional[str] = None) -> dict:
@@ -2744,7 +2778,9 @@ _pending_nc_retry_log_low: _deque = _deque(maxlen=100)     # LOW 用户专属滚
 # ────────── LOW_ADMIN 批量激活 / 并发配置 ──────────
 _LOW_BATCH_MAX: int = 50                 # 单次批量最多账号数
 _LOW_BATCH_COOLDOWN: int = 3600          # 批量激活冷却（秒）
-_low_admin_last_batch_at: float = 0.0    # 上次启动批量激活的时间戳
+# Per-Discord 批量激活冷却时间戳（dc_user_id → epoch_seconds）
+# admin 用空字符串 "" 作为 key
+_low_admin_last_batch_at: Dict[str, float] = {}
 
 # LOW 用户并发：同时控制 (a) pending-nc 重试中 LOW 行的并发探测数；
 # (b) 批量激活时一次启动多少个账号并行处理。与普通用户的固定 10 区分。
@@ -3271,6 +3307,87 @@ async def _retry_pending_nc_lids():
         await asyncio.sleep(300)  # 每 5 分钟重试一次
 
 
+async def _persist_call_log(entry: dict) -> None:
+    """将单条调用日志写入 call_logs 表（fire-and-forget，失败静默）。"""
+    pool = await _get_db_pool()
+    if not pool:
+        return
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO call_logs (ts,model,api_key,discord_id,prompt_tokens,completion_tokens,elapsed_ms,status,exempt) "
+                "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
+                entry["ts"], entry["model"], entry["key"], entry["discord_id"],
+                int(entry["prompt_tokens"] or 0), int(entry["completion_tokens"] or 0),
+                int(entry["elapsed_ms"] or 0), entry["status"], bool(entry["exempt"]),
+            )
+    except Exception:
+        pass
+
+
+async def _cleanup_old_call_logs_loop() -> None:
+    """每 24 小时清理 7 天前的调用日志记录。"""
+    await asyncio.sleep(60)   # 启动后稍等，待 DB 池就绪
+    while True:
+        try:
+            pool = await _get_db_pool()
+            if pool:
+                cutoff = time.time() - 7 * 24 * 3600
+                async with pool.acquire() as conn:
+                    result = await conn.execute("DELETE FROM call_logs WHERE ts < $1", cutoff)
+                print(f"[日志清理] 已清理 7 天前调用日志，受影响行：{result}")
+        except Exception as e:
+            print(f"[日志清理] 失败：{e}")
+        await asyncio.sleep(24 * 3600)
+
+
+async def _cf_proxy_health_check_loop():
+    """每 5 分钟探活所有 CF Worker URL，连续 3 次失败自动 is_active=false"""
+    while True:
+        try:
+            await asyncio.sleep(300)
+            pool = await _get_db_pool()
+            if not pool:
+                continue
+            async with pool.acquire() as conn:
+                rows = await conn.fetch(
+                    "SELECT id, url, consecutive_failures FROM cf_proxy_pool WHERE is_active = TRUE"
+                )
+
+            async with httpx.AsyncClient(timeout=8) as client:
+                for row in rows:
+                    ok = False
+                    try:
+                        r = await client.get(f"{row['url']}/health")
+                        ok = (r.status_code == 200)
+                    except Exception:
+                        ok = False
+
+                    async with pool.acquire() as conn:
+                        if ok:
+                            await conn.execute(
+                                "UPDATE cf_proxy_pool SET last_health_check=$1, consecutive_failures=0 WHERE id=$2",
+                                time.time(), row["id"]
+                            )
+                        else:
+                            new_fails = (row["consecutive_failures"] or 0) + 1
+                            if new_fails >= 3:
+                                await conn.execute(
+                                    "UPDATE cf_proxy_pool SET is_active=FALSE, last_health_check=$1, consecutive_failures=$2 WHERE id=$3",
+                                    time.time(), new_fails, row["id"]
+                                )
+                                print(f"[cf-health] 自动停用 {row['url']}（连续失败 {new_fails} 次）")
+                            else:
+                                await conn.execute(
+                                    "UPDATE cf_proxy_pool SET last_health_check=$1, consecutive_failures=$2 WHERE id=$3",
+                                    time.time(), new_fails, row["id"]
+                                )
+
+            await load_cf_proxies_from_db()
+        except Exception as e:
+            print(f"[cf-health] loop error: {e}")
+
+
 @app.on_event("startup")
 async def startup():
     global models_data, http_client
@@ -3299,6 +3416,8 @@ async def startup():
     asyncio.create_task(_startup_resume_bind_tasks())
     asyncio.create_task(_flush_key_increments_loop())   # 批量刷新 key 用量到 DB
     asyncio.create_task(_retry_pending_nc_lids())       # NC 492 重试队列
+    asyncio.create_task(_cf_proxy_health_check_loop())  # CF Worker 池健康检查
+    asyncio.create_task(_cleanup_old_call_logs_loop())  # 调用日志 7 天自动清理
     print("JetBrains AI OpenAI Compatible API 服务器已启动")
 
 
@@ -4378,27 +4497,55 @@ async def messages_completions(
 
 @app.get("/admin/logs")
 async def admin_get_logs(request: Request, limit: int = 200):
-    """返回最近调用日志（最多 500 条，默认 200，倒序排列）。
+    """返回最近调用日志（默认 200，最多 5000，倒序排列）。
     - ADMIN_KEY：返回全部日志。
     - LOW_ADMIN_KEY + X-Discord-Token：仅返回该 Discord 用户名下密钥的日志。
+    优先从数据库查询，无 DB 时回退内存 deque。
     """
-    logs = list(_call_logs)
-    logs.reverse()  # 最新的在前
+    limit = max(1, min(int(limit), 5000))
     # 区分调用者角色：LOW 用户必须按 Discord ID 过滤
     provided = request.headers.get("X-Admin-Key", "")
     is_low = bool(LOW_ADMIN_KEY and provided == LOW_ADMIN_KEY and provided != ADMIN_KEY)
+    discord_id = ""
     if is_low:
         token = request.headers.get("X-Discord-Token", "").strip()
         dc_info = _DISCORD_VERIFIED.get(token) if token else None
         if not dc_info or time.time() - dc_info.get("ts", 0) > 1800:
             raise HTTPException(status_code=401, detail="请先完成 Discord 验证后再查看调用日志")
         discord_id = str(dc_info.get("user_id", "") or "")
+
+    pool = await _get_db_pool()
+    if pool:
+        try:
+            async with pool.acquire() as conn:
+                if is_low:
+                    rows = await conn.fetch(
+                        "SELECT * FROM call_logs WHERE discord_id=$1 ORDER BY ts DESC LIMIT $2",
+                        discord_id, limit,
+                    )
+                else:
+                    rows = await conn.fetch(
+                        "SELECT * FROM call_logs ORDER BY ts DESC LIMIT $1", limit
+                    )
+            logs = []
+            for r in rows:
+                row = dict(r)
+                row["key"] = row.pop("api_key", "")
+                logs.append(row)
+            return {"logs": logs, "total": len(logs)}
+        except Exception:
+            pass  # DB 失败时回退内存
+
+    # 内存 deque 回退
+    logs = list(_call_logs)
+    logs.reverse()
+    if is_low:
         logs = [lg for lg in logs if str(lg.get("discord_id") or "") == discord_id]
-    return {"logs": logs[:min(limit, 500)], "total": len(logs)}
+    return {"logs": logs[:limit], "total": len(logs)}
 
 @app.delete("/admin/logs")
 async def admin_clear_logs(request: Request):
-    """清空调用日志。
+    """清空调用日志（同时清数据库和内存 deque）。
     - ADMIN_KEY：清空全部。
     - LOW_ADMIN_KEY + X-Discord-Token：仅清空该 Discord 用户名下的日志。
     """
@@ -4410,11 +4557,28 @@ async def admin_clear_logs(request: Request):
         if not dc_info or time.time() - dc_info.get("ts", 0) > 1800:
             raise HTTPException(status_code=401, detail="请先完成 Discord 验证后再清空日志")
         discord_id = str(dc_info.get("user_id", "") or "")
+        # 数据库删除
+        pool = await _get_db_pool()
+        if pool:
+            try:
+                async with pool.acquire() as conn:
+                    await conn.execute("DELETE FROM call_logs WHERE discord_id=$1", discord_id)
+            except Exception:
+                pass
+        # 内存 deque 同步
         kept = [lg for lg in _call_logs if str(lg.get("discord_id") or "") != discord_id]
         _call_logs.clear()
         for lg in kept:
             _call_logs.append(lg)
         return {"success": True, "scope": "low_user", "discord_id": discord_id}
+    # 管理员清空全部
+    pool = await _get_db_pool()
+    if pool:
+        try:
+            async with pool.acquire() as conn:
+                await conn.execute("DELETE FROM call_logs")
+        except Exception:
+            pass
     _call_logs.clear()
     return {"success": True, "scope": "all"}
 
@@ -6607,7 +6771,10 @@ async def admin_low_config_get(request: Request):
                 discord_id = str(info.get("user_id", "") or "")
 
     now = time.time()
-    cd_remaining = max(0, int(_low_admin_last_batch_at + _LOW_BATCH_COOLDOWN - now))
+    # per-Discord cooldown：LOW 用户按 discord_id 查，admin 用 ""
+    _cfg_cooldown_key = discord_id if (not is_admin) else ""
+    _cfg_last_at = _low_admin_last_batch_at.get(_cfg_cooldown_key, 0.0)
+    cd_remaining = max(0, int(_cfg_last_at + _LOW_BATCH_COOLDOWN - now))
     concurrency = _get_low_concurrency(discord_id)
     resp: Dict[str, Any] = {
         "concurrency":         concurrency,
@@ -6615,7 +6782,7 @@ async def admin_low_config_get(request: Request):
         "concurrency_max":     _LOW_CONCURRENCY_MAX,
         "batch_max":           _LOW_BATCH_MAX,
         "cooldown_seconds":    _LOW_BATCH_COOLDOWN,
-        "last_batch_at":       _low_admin_last_batch_at,
+        "last_batch_at":       _cfg_last_at,
         "cooldown_remaining":  cd_remaining,
         "server_time":         now,
         "discord_id":          discord_id,
@@ -7172,7 +7339,6 @@ async def admin_activate_batch(req: BatchActivateRequest, request: Request):
        - 复用 _activate_tasks，前端可对每个 task_id 用 /admin/activate/{id}/stream 流式查看；
        - 与单条激活逻辑完全一致：预签 key → process_account → 凭证到位升级配额 → 入池。
     """
-    global _low_admin_last_batch_at
     role = _check_low_or_admin(request)
     is_low_admin = (role == "low_admin")
 
@@ -7196,14 +7362,17 @@ async def admin_activate_batch(req: BatchActivateRequest, request: Request):
     if len(accounts) > _LOW_BATCH_MAX:
         raise HTTPException(status_code=400, detail=f"单次最多 {_LOW_BATCH_MAX} 个账号（实际 {len(accounts)}）")
 
+    # per-Discord 冷却：admin 走 "" key，LOW 用户走自己的 dc_user_id
+    _cooldown_key = dc_user_id if is_low_admin else ""
     now = time.time()
-    cd_remaining = int(_low_admin_last_batch_at + _LOW_BATCH_COOLDOWN - now)
+    last_at = _low_admin_last_batch_at.get(_cooldown_key, 0.0)
+    cd_remaining = int(last_at + _LOW_BATCH_COOLDOWN - now)
     if cd_remaining > 0:
         raise HTTPException(
             status_code=429,
-            detail=f"距离上次批量激活仅 {int(now - _low_admin_last_batch_at)} 秒，请 {cd_remaining} 秒后再试",
+            detail=f"距离上次批量激活仅 {int(now - last_at)} 秒，请 {cd_remaining} 秒后再试",
         )
-    _low_admin_last_batch_at = now
+    _low_admin_last_batch_at[_cooldown_key] = now
 
     # 决定执行器：LOW 用户走 per-Discord 独立线程池；完整管理员用主激活池
     if is_low_admin:
@@ -7292,7 +7461,7 @@ async def admin_activate_batch(req: BatchActivateRequest, request: Request):
         "started": started,
         "count": len(started),
         "concurrency": pool_size,
-        "next_allowed_at": _low_admin_last_batch_at + _LOW_BATCH_COOLDOWN,
+        "next_allowed_at": now + _LOW_BATCH_COOLDOWN,
         "personal_key": batch_personal_key,   # 前端展示用
     }
 
@@ -9603,13 +9772,26 @@ async def _activate_key_quota(api_key: str, acc_ids: list, pool) -> bool:
 
 def _get_low_personal_key(discord_id: str) -> str:
     """从内存中查找 LOW 用户的个人专属密钥（按 low_admin_discord_id 匹配）。
-    返回 key 字符串，未找到返回空字符串。"""
+    返回 key 字符串，未找到返回空字符串。
+
+    优先级（避免命中预签 key 等孤儿）：
+      1. usage_count > 0（已被使用过的 key 更可能是真个人 key）
+      2. usage_limit > 0（有真实额度）
+      3. 没有上述特征则按字典顺序兜底
+    """
     if not discord_id:
         return ""
-    for k, v in VALID_CLIENT_KEYS.items():
-        if v.get("low_admin_discord_id") == discord_id:
-            return k
-    return ""
+    candidates = [
+        (k, v) for k, v in VALID_CLIENT_KEYS.items()
+        if v.get("low_admin_discord_id") == discord_id
+    ]
+    if not candidates:
+        return ""
+    candidates.sort(key=lambda kv: (
+        -int(kv[1].get("usage_count") or 0),
+        -int(kv[1].get("usage_limit") or 0),
+    ))
+    return candidates[0][0]
 
 
 async def _add_low_quota(api_key: str, new_acc_ids: list, pool) -> int:

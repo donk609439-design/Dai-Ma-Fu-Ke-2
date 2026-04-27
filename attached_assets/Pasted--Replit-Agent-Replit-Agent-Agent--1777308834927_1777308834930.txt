@@ -1,0 +1,496 @@
+# 修复指令（可直接交给 Replit Agent 执行）
+
+下面每一条都是独立任务，可单独派给 Replit Agent。**务必让 Agent 按顺序逐条做，每条做完跑一次冒烟测试再做下一条**。
+
+---
+
+## 任务 1：API Server graceful shutdown（P0，30 分钟）
+
+**文件**：`artifacts/api-server/src/index.ts`
+
+**问题**：现在收到 SIGTERM 立即 `py.kill()` + `process.exit(0)`，所有正在跑的长流式请求被硬切，用户看到"开了流不出字"。
+
+**改动**：把现有
+
+```ts
+process.on("exit", () => py.kill());
+process.on("SIGTERM", () => { py.kill(); process.exit(0); });
+process.on("SIGINT",  () => { py.kill(); process.exit(0); });
+```
+
+替换为：
+
+```ts
+let shuttingDown = false;
+let httpServer: any = null;  // app.listen 的返回值，需要把 app.listen 改成保留 server 引用
+
+async function gracefulShutdown(signal: string) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  logger.info({ signal }, "Graceful shutdown initiated");
+
+  // 1) 停止接受新连接（保留 in-flight）
+  if (httpServer) httpServer.close(() => logger.info("HTTP server closed"));
+
+  // 2) 给 Python 发 SIGTERM 等它处理完当前请求；最多 30s 强 KILL
+  try { py.kill("SIGTERM"); } catch {}
+  await new Promise<void>((resolve) => {
+    const timer = setTimeout(() => { try { py.kill("SIGKILL"); } catch {} resolve(); }, 30_000);
+    py.once("exit", () => { clearTimeout(timer); resolve(); });
+  });
+
+  process.exit(0);
+}
+
+process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+process.on("SIGINT",  () => gracefulShutdown("SIGINT"));
+```
+
+把文件底部的 `app.listen(port, ...)` 改成：
+
+```ts
+httpServer = app.listen(port, (err) => { ... });
+```
+
+**验证**：本地 `kill -TERM <pid>` Express 进程，应看到日志依次出现 `Graceful shutdown initiated` → `HTTP server closed` → 进程退出。开个长流式 chat 同时 SIGTERM，流应该正常跑完而不是被斩断。
+
+---
+
+## 任务 2：JWT 刷新加全局 Semaphore（P0，10 行）
+
+**文件**：`jetbrainsai2api/main.py`
+
+**问题**：`_first_ready` 已用 batch_size=8 切批，但批内 8 个候选每个都可能触发 `_refresh_jetbrains_jwt`；并发用户数 N，瞬时 JWT 刷新数最多 8N。grazie auth 大量 401/429 时仍可能击穿连接池。
+
+**改动**：
+
+1. 在文件顶部已有的全局变量区（在 `account_rotation_lock = asyncio.Lock()` 附近）加：
+
+```python
+# JWT 刷新全局节流：防止高并发时 grazie auth 接口被击穿
+# 即使 _first_ready 给每个请求做了批内并发限制（8），多个用户同时请求时累积仍会超过上游能承受的速率。
+_jwt_refresh_sem = asyncio.Semaphore(20)
+```
+
+2. 找到 `async def _refresh_jetbrains_jwt(account):` 函数体最开头，加一行 `async with` 包住整个函数体：
+
+```python
+async def _refresh_jetbrains_jwt(account: dict):
+    async with _jwt_refresh_sem:
+        # ↑ 新增这一行；下面是原有的所有逻辑（保持缩进+1 级）
+        ... 原有代码 ...
+```
+
+注意：要把整个函数体内层缩进+4 个空格。
+
+**验证**：生产部署后观察 `/admin/status` 的连接池使用率指标（如果有 metrics）。或者打开几个终端同时高频访问 `/v1/models`，应不再出现 PoolTimeout 风暴。
+
+---
+
+## 任务 3：`_get_low_personal_key` 5 行绷带修复（P0，最小改动）
+
+**文件**：`jetbrainsai2api/main.py`，找到 `def _get_low_personal_key(discord_id: str) -> str:`（约 line 9604）
+
+**问题**：会把 LOW 用户名下的孤儿预签 key 误当作个人 key 返回，导致批量激活的额度发到错误对象上。
+
+**改动**：替换整个函数：
+
+```python
+def _get_low_personal_key(discord_id: str) -> str:
+    """从内存中查找 LOW 用户的个人专属密钥（按 low_admin_discord_id 匹配）。
+    返回 key 字符串，未找到返回空字符串。
+    
+    优先级（避免命中预签 key 等孤儿）：
+      1. usage_count > 0（已被使用过的 key 更可能是真个人 key）
+      2. usage_limit > 0（有真实额度）
+      3. 没有上述特征则按字典顺序兜底
+    """
+    if not discord_id:
+        return ""
+    candidates = [
+        (k, v) for k, v in VALID_CLIENT_KEYS.items()
+        if v.get("low_admin_discord_id") == discord_id
+    ]
+    if not candidates:
+        return ""
+    candidates.sort(key=lambda kv: (
+        -int(kv[1].get("usage_count") or 0),
+        -int(kv[1].get("usage_limit") or 0),
+    ))
+    return candidates[0][0]
+```
+
+**验证**：
+- `pytest` 单元测试（如有）跑一遍
+- 模拟一个 LOW 用户：先调 `/admin/activate`（产生孤儿预签 key），再调 `/admin/low-user-key` POST 创建真 personal key（usage_limit=0），再调 `/admin/activate-batch` → 累加额度应该上到真 personal key 而不是预签 key。
+- 不需要 schema 变更或迁移。
+
+---
+
+## 任务 4：批量激活 cooldown 改成 per-Discord（P1）
+
+**文件**：`jetbrainsai2api/main.py`
+
+**问题**：现在 `_low_admin_last_batch_at` 是全局变量，所有 LOW 用户共享一个 cooldown，A 用户刚跑完 B 用户就要等 1 小时。
+
+**改动**：
+
+1. 找到全局变量 `_low_admin_last_batch_at` 的声明，改成：
+
+```python
+# Per-Discord 批量激活冷却时间戳（dc_user_id → epoch_seconds）
+# admin 用空字符串 "" 作为 key
+_low_admin_last_batch_at: Dict[str, float] = {}
+```
+
+2. 在 `admin_activate_batch` 函数（line 7167 附近）里，把：
+
+```python
+global _low_admin_last_batch_at
+...
+now = time.time()
+cd_remaining = int(_low_admin_last_batch_at + _LOW_BATCH_COOLDOWN - now)
+if cd_remaining > 0:
+    raise HTTPException(...)
+_low_admin_last_batch_at = now
+```
+
+替换为：
+
+```python
+# 注意：admin 走 "" key，LOW 用户走自己的 dc_user_id
+_cooldown_key = dc_user_id if is_low_admin else ""
+now = time.time()
+last_at = _low_admin_last_batch_at.get(_cooldown_key, 0.0)
+cd_remaining = int(last_at + _LOW_BATCH_COOLDOWN - now)
+if cd_remaining > 0:
+    raise HTTPException(
+        status_code=429,
+        detail=f"距离上次批量激活仅 {int(now - last_at)} 秒，请 {cd_remaining} 秒后再试",
+    )
+_low_admin_last_batch_at[_cooldown_key] = now
+```
+
+3. 删除函数顶部的 `global _low_admin_last_batch_at`（dict 不需要 global 声明也能修改）。
+
+**验证**：两个不同 Discord ID 的 LOW 用户依次发起批量激活，第二个不应被 429 阻挡。
+
+---
+
+## 任务 5：调用日志持久化到 PostgreSQL（P1，最有价值的一个）
+
+**文件**：`jetbrainsai2api/main.py`
+
+**问题**：`_call_logs = deque(maxlen=500)` 是内存的，重启即失，500 条对生产体量太小。
+
+**改动**：
+
+1. 在 `_ensure_db_tables()` 里加新表（在已有的 `CREATE TABLE` 群组后面）：
+
+```python
+await conn.execute("""
+    CREATE TABLE IF NOT EXISTS call_logs (
+        id           BIGSERIAL PRIMARY KEY,
+        ts           DOUBLE PRECISION NOT NULL,
+        model        TEXT NOT NULL,
+        client_key   TEXT NOT NULL,
+        prompt_tokens     INTEGER NOT NULL DEFAULT 0,
+        completion_tokens INTEGER NOT NULL DEFAULT 0,
+        exempt       BOOLEAN NOT NULL DEFAULT FALSE,
+        discord_id   TEXT NOT NULL DEFAULT ''
+    )
+""")
+await conn.execute("CREATE INDEX IF NOT EXISTS idx_call_logs_ts ON call_logs(ts DESC)")
+await conn.execute("CREATE INDEX IF NOT EXISTS idx_call_logs_discord ON call_logs(discord_id, ts DESC) WHERE discord_id != ''")
+await conn.execute("CREATE INDEX IF NOT EXISTS idx_call_logs_key ON call_logs(client_key, ts DESC)")
+```
+
+2. 改造 `_append_log()` 函数：保留内存 deque 作为快速读缓存（限 200 条最新），同步异步写入 DB：
+
+```python
+def _append_log(model, client_key, prompt_tokens, completion_tokens, exempt=False):
+    discord_id = ""
+    meta = VALID_CLIENT_KEYS.get(client_key, {})
+    if meta.get("is_low_admin_key"):
+        discord_id = str(meta.get("low_admin_discord_id") or "")
+    
+    entry = {
+        "ts": time.time(),
+        "model": model,
+        "key": client_key,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "exempt": exempt,
+        "discord_id": discord_id,
+    }
+    _call_logs.append(entry)  # 保留内存快速读
+    
+    # 异步写 DB（不阻塞调用方）
+    asyncio.create_task(_persist_call_log(entry))
+
+
+async def _persist_call_log(entry: dict):
+    try:
+        pool = await _get_db_pool()
+        if not pool:
+            return
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO call_logs (ts, model, client_key, prompt_tokens, completion_tokens, exempt, discord_id) "
+                "VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                entry["ts"], entry["model"], entry["key"],
+                entry["prompt_tokens"], entry["completion_tokens"],
+                entry["exempt"], entry["discord_id"],
+            )
+    except Exception as e:
+        print(f"[call_log] persist failed: {e}")
+```
+
+3. 改造 `admin_get_logs` 端点：从 DB 查而不是从 deque 读：
+
+```python
+@app.get("/admin/logs")
+async def admin_get_logs(request: Request, limit: int = 200):
+    role = _check_low_or_admin(request)
+    pool = await _get_db_pool()
+    if not pool:
+        raise HTTPException(503, "DB 不可用")
+    
+    discord_filter = ""
+    if role == "low_admin":
+        # LOW 用户只能看自己的
+        token = request.headers.get("X-Discord-Token", "").strip()
+        dc_info = _DISCORD_VERIFIED.get(token) if token else None
+        if not dc_info or time.time() - dc_info.get("ts", 0) > 1800:
+            raise HTTPException(401, "Discord 验证失效")
+        discord_filter = str(dc_info.get("user_id", ""))
+    
+    limit = max(1, min(limit, 1000))
+    async with pool.acquire() as conn:
+        if discord_filter:
+            rows = await conn.fetch(
+                "SELECT ts, model, client_key, prompt_tokens, completion_tokens, exempt, discord_id "
+                "FROM call_logs WHERE discord_id = $1 ORDER BY ts DESC LIMIT $2",
+                discord_filter, limit,
+            )
+        else:
+            rows = await conn.fetch(
+                "SELECT ts, model, client_key, prompt_tokens, completion_tokens, exempt, discord_id "
+                "FROM call_logs ORDER BY ts DESC LIMIT $1",
+                limit,
+            )
+    return {"logs": [dict(r) for r in rows]}
+```
+
+4. 加定期清理任务（保留 7 天）：
+
+```python
+async def _cleanup_old_call_logs():
+    while True:
+        try:
+            await asyncio.sleep(3600)  # 每小时一次
+            cutoff = time.time() - 7 * 86400
+            pool = await _get_db_pool()
+            if pool:
+                async with pool.acquire() as conn:
+                    deleted = await conn.execute("DELETE FROM call_logs WHERE ts < $1", cutoff)
+                    if deleted:
+                        print(f"[call_log] 清理 {deleted} 条 7 天前日志")
+        except Exception as e:
+            print(f"[call_log] cleanup error: {e}")
+```
+
+在 `startup()` 里加 `asyncio.create_task(_cleanup_old_call_logs())`。
+
+5. 同样改造 `DELETE /admin/logs`：从删 deque 改成 `DELETE FROM call_logs WHERE discord_id = $1`。
+
+**验证**：跑几次 chat 请求 → `/admin/logs` 应返回；重启 Python 后再访问，**历史日志仍在**（之前 deque 会丢）。LOW 用户带 X-Discord-Token 访问只见自己的，admin 见全量。
+
+---
+
+## 任务 6：CF Worker 池健康检查（P1）
+
+**文件**：`jetbrainsai2api/main.py`
+
+**问题**：失效的 Worker URL 仍然在轮询里被抽到，每次抽到失败一次。
+
+**改动**：
+
+1. `cf_proxy_pool` 表加字段：
+
+```python
+# 在 _ensure_db_tables 里
+await conn.execute("ALTER TABLE cf_proxy_pool ADD COLUMN IF NOT EXISTS last_health_check DOUBLE PRECISION DEFAULT 0")
+await conn.execute("ALTER TABLE cf_proxy_pool ADD COLUMN IF NOT EXISTS consecutive_failures INTEGER DEFAULT 0")
+```
+
+2. 加后台任务：
+
+```python
+async def _cf_proxy_health_check_loop():
+    """每 5 分钟探活所有 CF Worker URL，连续 3 次失败自动 is_active=false"""
+    while True:
+        try:
+            await asyncio.sleep(300)
+            pool = await _get_db_pool()
+            if not pool:
+                continue
+            async with pool.acquire() as conn:
+                rows = await conn.fetch(
+                    "SELECT id, url, consecutive_failures FROM cf_proxy_pool WHERE is_active = TRUE"
+                )
+            
+            async with httpx.AsyncClient(timeout=8) as client:
+                for row in rows:
+                    ok = False
+                    try:
+                        r = await client.get(f"{row['url']}/health")
+                        ok = (r.status_code == 200)
+                    except Exception:
+                        ok = False
+                    
+                    async with pool.acquire() as conn:
+                        if ok:
+                            await conn.execute(
+                                "UPDATE cf_proxy_pool SET last_health_check=$1, consecutive_failures=0 WHERE id=$2",
+                                time.time(), row["id"]
+                            )
+                        else:
+                            new_fails = (row["consecutive_failures"] or 0) + 1
+                            if new_fails >= 3:
+                                await conn.execute(
+                                    "UPDATE cf_proxy_pool SET is_active=FALSE, last_health_check=$1, consecutive_failures=$2 WHERE id=$3",
+                                    time.time(), new_fails, row["id"]
+                                )
+                                print(f"[cf-health] 自动停用 {row['url']}（连续失败 {new_fails} 次）")
+                            else:
+                                await conn.execute(
+                                    "UPDATE cf_proxy_pool SET last_health_check=$1, consecutive_failures=$2 WHERE id=$3",
+                                    time.time(), new_fails, row["id"]
+                                )
+            
+            # 触发重新加载内存池
+            await load_cf_proxies_from_db()
+        except Exception as e:
+            print(f"[cf-health] loop error: {e}")
+```
+
+3. `startup()` 里：
+
+```python
+asyncio.create_task(_cf_proxy_health_check_loop())
+```
+
+4. 前端 `ProxyPool.tsx` 可加显示 `last_health_check` 和 `consecutive_failures` 字段（通过修改 `/admin/cf-proxies` 端点返回值）。
+
+**验证**：手动把数据库里某个 URL 改成不可达的（如 `https://nonexistent.workers.dev`），等 15 分钟（3 次健康检查）后该 URL 应被自动 `is_active=false`。
+
+---
+
+## 任务 7：CF Worker 支持手动重定向（让 OAuth 也走代理，P2）
+
+**文件**：`cf-worker.js`
+
+**问题**：当前 Worker 写死 `redirect: "follow"`，吃掉所有 302 → OAuth PKCE 必须直连 → 登录 IP 没分散。
+
+**改动**：替换 fetch 调用部分：
+
+```javascript
+// 在原来 const response = await fetch(targetUrl, {...}); 之前
+const redirectMode = request.headers.get("x-redirect-mode") || "follow";
+const validRedirectModes = ["follow", "manual", "error"];
+const finalRedirectMode = validRedirectModes.includes(redirectMode) ? redirectMode : "follow";
+
+const response = await fetch(targetUrl, {
+    method: request.method,
+    headers,
+    body: request.method !== "GET" && request.method !== "HEAD" ? request.body : undefined,
+    redirect: finalRedirectMode,  // ★ 改这里
+});
+
+// 手动重定向时透传 Location
+if (finalRedirectMode === "manual" && response.status >= 300 && response.status < 400) {
+    const responseHeaders = new Headers();
+    for (const [k, v] of response.headers.entries()) {
+        const kl = k.toLowerCase();
+        if (kl === "set-cookie") {
+            responseHeaders.append("set-cookie", stripCookieDomain(v));
+        } else {
+            responseHeaders.set(k, v);
+        }
+    }
+    return new Response(null, { status: response.status, headers: responseHeaders });
+}
+// 后续逻辑保持原样
+```
+
+**Python 侧改动**：`jb_activate.py` 的 `oauth_pkce` 函数里把 `s.get(url, allow_redirects=False)` 改成走 `_cf_get`：
+
+```python
+# 在 oauth_pkce 内部循环里
+def _oauth_get(url):
+    proxy = _get_proxy_url()
+    if proxy:
+        headers = {"x-target-url": url, "x-redirect-mode": "manual"}
+        # 必须复用 session 的 cookies
+        cookies_str = "; ".join(f"{k}={v}" for k, v in s.cookies.get_dict().items())
+        if cookies_str:
+            headers["Cookie"] = cookies_str
+        return requests.get(proxy, headers=headers, allow_redirects=False, timeout=15)
+    return s.get(url, allow_redirects=False, timeout=15)
+
+# 把 r = s.get(url, allow_redirects=False, timeout=15) 改成 r = _oauth_get(url)
+```
+
+**验证**：批量激活时观察 JetBrains 服务端看到的源 IP 列表（如果有日志），OAuth `/oauth/login` 链路的 IP 应该不再固定。
+
+---
+
+## 任务 8：前端重试 + jitter（P3，10 行）
+
+**文件**：`artifacts/admin-panel/src/App.tsx`
+
+**问题**：`retry: failureCount < 5` 在 503 时多个 tab 同时打开会放大流量。
+
+**改动**：替换 `queryClient` 的配置：
+
+```ts
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      retry: (failureCount, error: any) => {
+        const status = error?.status ?? error?.response?.status;
+        if (status === 503 || status === 502) return failureCount < 3;  // 5 → 3
+        return failureCount < 1;
+      },
+      retryDelay: (attempt) => 
+        Math.min(1000 * 2 ** attempt + Math.random() * 1000, 15000),  // 加 jitter
+      staleTime: 30_000,
+      gcTime: 5 * 60_000,
+      refetchOnWindowFocus: false,
+      refetchOnReconnect: true,
+    },
+  },
+});
+```
+
+**验证**：本地开 5 个 tab 同时打开管理面板，故意让 Python 5 秒内返回 503，应不再看到上游被重试洪水击穿。
+
+---
+
+## 📋 执行顺序建议（给 Replit Agent 的 README）
+
+请按这个顺序丢给 Agent，每条做完确认线上无回归再做下一条：
+
+| 序号 | 任务 | 风险 | 时间 |
+|---|---|---|---|
+| 1 | 任务 1 — graceful shutdown | 低（只在退出时生效） | 30 分钟 |
+| 2 | 任务 2 — JWT Semaphore | 低 | 10 分钟 |
+| 3 | 任务 3 — `_get_low_personal_key` 排序 | 低（不动 schema） | 5 分钟 |
+| 4 | 任务 4 — per-Discord cooldown | 低 | 15 分钟 |
+| 5 | 任务 8 — 前端 retry jitter | 极低 | 5 分钟 |
+| 6 | 任务 6 — CF 池健康检查 | 中（涉及数据库 ALTER） | 1 小时 |
+| 7 | 任务 5 — 调用日志持久化 | 中（涉及数据库 + 端点改造） | 半天 |
+| 8 | 任务 7 — Worker 手动重定向 | 高（要重新部署所有 Worker） | 视 Worker 数量 |
+
+把整段复制给 Replit Agent + 一句 "请按顺序逐条实现，每条做完跑一次冒烟测试" 即可。

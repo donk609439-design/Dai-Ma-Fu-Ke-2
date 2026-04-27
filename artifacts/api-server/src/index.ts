@@ -17,11 +17,41 @@ if (Number.isNaN(port) || port <= 0) {
   throw new Error(`Invalid PORT value: "${rawPort}"`);
 }
 
+let pyProcess: ReturnType<typeof spawn> | null = null;
+let httpServer: any = null;
+let shuttingDown = false;
+
+async function gracefulShutdown(signal: string) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  logger.info({ signal }, "Graceful shutdown initiated");
+
+  if (httpServer) httpServer.close(() => logger.info("HTTP server closed"));
+
+  try { if (pyProcess) pyProcess.kill("SIGTERM"); } catch {}
+  await new Promise<void>((resolve) => {
+    const timer = setTimeout(() => {
+      try { if (pyProcess) pyProcess.kill("SIGKILL"); } catch {}
+      resolve();
+    }, 30_000);
+    if (pyProcess) {
+      pyProcess.once("exit", () => { clearTimeout(timer); resolve(); });
+    } else {
+      clearTimeout(timer);
+      resolve();
+    }
+  });
+
+  process.exit(0);
+}
+
+process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+process.on("SIGINT",  () => gracefulShutdown("SIGINT"));
+process.on("exit",    () => { if (pyProcess) pyProcess.kill(); });
+
 function startPythonService() {
   const { existsSync } = require("fs");
 
-  // 在生产（从 monorepo 根目录启动）和开发（从 artifacts/api-server/ 启动）两种情况下
-  // 正确找到 monorepo 根目录：检查哪个路径包含 jetbrainsai2api 目录
   const repoRoot = (() => {
     const candidates = [
       process.cwd(),
@@ -37,7 +67,6 @@ function startPythonService() {
 
   const pythonDir = path.join(repoRoot, "jetbrainsai2api");
 
-  // Python 二进制：优先环境变量，其次查 .pythonlibs，最后回退系统 python3
   const pythonBin =
     process.env.PYTHON_BIN ||
     (() => {
@@ -50,12 +79,11 @@ function startPythonService() {
       for (const c of binCandidates) {
         if (existsSync(c)) return c;
       }
-      return "python3"; // 最后回退
+      return "python3";
     })();
 
   logger.info({ pythonDir, pythonBin, repoRoot }, "Starting Python AI service");
 
-  // 将 .pythonlibs/bin 加入 PATH，只有该目录存在时才加入 PYTHONPATH
   const pythonLibsBin = path.join(repoRoot, ".pythonlibs", "bin");
   const pythonSitePkgs = path.join(repoRoot, ".pythonlibs", "lib", "python3.11", "site-packages");
   const childEnv: Record<string, string> = {
@@ -66,7 +94,7 @@ function startPythonService() {
     childEnv["PYTHONPATH"] = pythonSitePkgs;
   }
 
-  const py = spawn(
+  pyProcess = spawn(
     pythonBin,
     ["-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"],
     {
@@ -76,25 +104,21 @@ function startPythonService() {
     },
   );
 
-  py.on("error", (err) => {
+  pyProcess.on("error", (err) => {
     logger.error({ err }, "Failed to start Python AI service");
   });
 
-  py.on("exit", (code, signal) => {
+  pyProcess.on("exit", (code, signal) => {
     if (code !== 0) {
       logger.warn({ code, signal }, "Python AI service exited, restarting in 3s...");
       setTimeout(startPythonService, 3000);
     }
   });
-
-  process.on("exit", () => py.kill());
-  process.on("SIGTERM", () => { py.kill(); process.exit(0); });
-  process.on("SIGINT",  () => { py.kill(); process.exit(0); });
 }
 
 startPythonService();
 
-app.listen(port, (err) => {
+httpServer = app.listen(port, (err) => {
   if (err) {
     logger.error({ err }, "Error listening on port");
     process.exit(1);

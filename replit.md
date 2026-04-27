@@ -251,4 +251,28 @@ LOW_ADMIN_KEY users get a separate, isolated activation flow with their own per-
   1. **多 tool_calls 全发送 + tool_choice 过滤** — 抽出共享辅助 `_convert_openai_messages_to_jetbrains(messages)`（main.py 3282）：assistant 消息若带多个 `tool_calls`，按 OpenAI 规范应作为多条独立 JetBrains `assistant_message` 下发（每条带一个 `functionCall`），第一条携带原 `content`、其余 `content=""`；之前的实现只取 `tool_calls[0]` 直接丢失并行调用。同时新增 `_filter_tools_by_choice(openai_tools, tool_choice)`（main.py 3342）实现代理层 `tool_choice` 语义近似：`"none"` → 返回 `[]`（不发 tools）；`{type:"function",function:{name:X}}` → 仅保留指定的那个；`"auto"`/`"required"`/未提供 → 全发（JetBrains 后端无 `tool_choice` 公开 hook，"required" 退化为 auto 是必要折衷）。OpenAI 端 `chat_completions` 与 Anthropic 端 `convert_anthropic_to_openai` 转换出的 jetbrains_messages 都改用同一对辅助函数，行为一致。
   2. **流式 `tool_calls.index` 修复** — `openai_stream_adapter`（main.py 3389）原本对每个 JetBrains `FunctionCall` 事件硬编码 `tool_id = 0`，导致：(a) 真正并行 tool_calls 时所有 delta 都堆到 index=0 客户端无法拆分；(b) 一个 tool_call 内 arguments 的多个增量 chunk 也都重复发送 `id`/`name`/`type`。新逻辑用 `current_tool_call_index` 跟踪状态：见到带 `name` 的事件 → 视为新的 tool_call（`current_tool_call_index += 1`，下发 `id`+`type`+`function.name`+初始 `arguments`）；见到 `name=null` 的事件 → 视为当前 tool_call 的 arguments 增量（沿用 index，仅下发 `function.arguments` 增量片段，不重发 id/name/type）。这样既正确处理 JetBrains 把单 tool_call 拆成多条 FunctionCall 事件的流送方式，也支持真正的并行 tool_calls 按 (index, id) 正确切分。端到端验证：单工具 `get_weather({"city":"Tokyo"})` 现在表现为 1 条带 id+name 的首块 + 5 条只带 arguments 增量的后续块，完全符合 OpenAI streaming 协议。
   3. **tool_choice 端到端验证** — 用临时 client_key 跑了三组 curl：(T1) 普通 tools 调用 → 正确返回单 tool_call 流；(T2) `tool_choice:"none"` + tools → 0 个 tool_calls 块（只输出文本，证明 tools 被过滤掉）；(T3) `tool_choice:{type:"function",function:{name:"get_weather"}}` + 提供 `[get_weather, get_news]` 两个 tools → 模型只能调用 `get_weather`（证明只发了指定的那个 tool）。
+## 批量稳定性修复（2026-04-27）
+
+以下 6 条改动经架构师两轮审查，最终 Pass：
+
+1. **graceful shutdown（api-server/src/index.ts）**：将 `py` 提升为模块级 `pyProcess`；新增 `gracefulShutdown()` 先 `httpServer.close()` 再向 Python 发 SIGTERM（30s 后强 SIGKILL）；`process.on("SIGTERM"/"SIGINT")` 改为调用 `gracefulShutdown`；保留 `process.on("exit")` 作为意外退出兜底；`app.listen` 返回值保存为 `httpServer`。效果：长流式请求不再被 SIGTERM 硬切。
+
+2. **JWT 刷新全局 Semaphore（main.py）**：新增 `_jwt_refresh_sem = asyncio.Semaphore(20)`，`_refresh_jetbrains_jwt` 整个函数体缩进至 `async with _jwt_refresh_sem:` 下。配合 `_first_ready` 批内 8 并发限制，高并发刷新数从潜在"8N"收敛到 ≤ 20，防止 grazie auth 接口被击穿。
+
+3. **`_get_low_personal_key` 排序修复（main.py）**：原来返回第一个匹配 `low_admin_discord_id` 的 key（可能命中孤儿预签 key）；改为按 `usage_count DESC, usage_limit DESC` 排序，优先选已被真实使用/有真实额度的 key。修复"批量激活额度发错 Discord 账号"根因。
+
+4. **per-Discord 批量激活 cooldown（main.py）**：`_low_admin_last_batch_at` 从 `float` 改为 `Dict[str, float]`（admin 用 `""` 键，LOW 用 `dc_user_id` 键）；`/admin/activate-batch` 与 `/admin/low-config` 均改为按各自 discord_id 读写，不再共享全局 cooldown。两个不同 Discord ID 的 LOW 用户可以独立触发批量激活。
+
+5. **CF Worker 池健康检查（main.py）**：`cf_proxy_pool` 表加两列 `last_health_check`（DOUBLE PRECISION）和 `consecutive_failures`（INTEGER）；新增后台任务 `_cf_proxy_health_check_loop()`，每 5 分钟对所有 `is_active=TRUE` 的 Worker URL 发 `GET /health`，连续 3 次失败自动 `is_active=FALSE` 并打印日志，成功则重置计数；检查结束后调 `load_cf_proxies_from_db()` 刷内存池；已在 `startup()` 里注册。
+
+6. **前端 retry jitter（admin-panel/src/App.tsx）**：503/502 重试次数从 5 降为 3；`retryDelay` 加随机抖动 `Math.min(1000 * 2^attempt + random()*1000, 15000)`，多 tab 并发重试不再同步打后端。
+
+7. **调用日志持久化到 PostgreSQL（main.py 任务5）**：
+   - 新增 `call_logs` 表（BIGSERIAL PK + ts/model/api_key/discord_id/prompt_tokens/completion_tokens/elapsed_ms/status/exempt/created_at），含 `idx_call_logs_ts(ts DESC)` 和 `idx_call_logs_discord_id(discord_id)` 两个索引。
+   - `_persist_call_log(entry)` 异步辅助函数：从 pool acquire 连接后 INSERT 一行，失败静默。
+   - `_cleanup_old_call_logs_loop()`：启动 60s 后首次运行，每 24h 清理 `ts < now - 7d` 的行；已在 `startup()` 注册。
+   - `_append_log()`：追加到内存 deque 后，fire-and-forget `asyncio.get_running_loop().create_task(_persist_call_log(entry))`（RuntimeError 兜底）。
+   - `GET /admin/logs`：limit 上限从 500 升为 5000；优先从数据库查询（admin 全量 / LOW 按 discord_id 过滤）；DB 失败回退内存 deque；字段 `api_key` 在 Python 层 rename 为 `key` 保持前端兼容。
+   - `DELETE /admin/logs`：先 DELETE 数据库行，再清内存 deque（admin 全量 / LOW 按 discord_id 分隔）。
+
 - **管理员整库迁移导出/导入补齐 `low_admin_discord_id`** — `/admin/accounts/export-all` 与 `_do_bulk_import`（被 `/admin/accounts/bulk-import` 与 `/admin/accounts/import-from-source` 复用）此前只携带 `is_low_admin_key`，漏掉 `low_admin_discord_id`，导致服务器迁移后所有 LOW key 都被前端归到「未知」分组里。现在导出 SQL 增加 `COALESCE(low_admin_discord_id, '') as low_admin_discord_id`，导出 JSON 多出该字段；`_do_bulk_import` 的 INSERT SQL 增加该列与 `$9` 参数，行构造从 payload 读 `low_admin_discord_id`，ON CONFLICT 用 `COALESCE(NULLIF(EXCLUDED.low_admin_discord_id,''), jb_client_keys.low_admin_discord_id)` 保证 upsert 不会用空值覆盖已有归属。注：LOW 用户的个人 key 单独导出/导入端点（`/admin/low-user-key/export|import`）不需要改 — 导入时已强制用调用者验证过的 Discord ID 写 `low_admin_discord_id`，不依赖备份文件里的字段（更安全）。Roundtrip 验证：导出 2 把 LOW key → 重新导入 → `/admin/keys` 显示 Discord ID 完整保留（`'1382720893633171578'` 与空串均正确）。

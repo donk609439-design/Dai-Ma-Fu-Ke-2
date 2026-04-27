@@ -34,10 +34,11 @@ const queryClient = new QueryClient({
       retry: (failureCount, error: any) => {
         // 503/502 自动重试（服务启动中），其余错误最多重试 1 次
         const status = error?.status ?? error?.response?.status;
-        if (status === 503 || status === 502) return failureCount < 5;
+        if (status === 503 || status === 502) return failureCount < 3;
         return failureCount < 1;
       },
-      retryDelay: (attempt) => Math.min(1000 * 2 ** attempt, 10000),
+      retryDelay: (attempt) =>
+        Math.min(1000 * 2 ** attempt + Math.random() * 1000, 15000),
       staleTime: 30_000,        // 30s 内不重新获取
       gcTime: 5 * 60_000,      // 5min 缓存保留
       refetchOnWindowFocus: false,
