@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useMemo } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { Plus, Trash2, CheckCircle, XCircle, RefreshCw, Users, ShieldCheck, Copy, Check, RotateCcw, ListChecks, ArrowDownToLine, Eraser, AlertTriangle, ChevronDown, ChevronRight, KeyRound, Unlink, ShieldX, Search, X } from "lucide-react";
+import { Plus, Trash2, CheckCircle, XCircle, RefreshCw, Users, ShieldCheck, Copy, Check, RotateCcw, ListChecks, Eraser, AlertTriangle, ChevronDown, ChevronRight, KeyRound, Unlink, ShieldX, Search, X } from "lucide-react";
 import { adminFetch } from "@/lib/admin-auth";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -234,8 +234,6 @@ export default function Accounts() {
   const [copiedIndex, setCopiedIndex] = useState<number | null>(null);
   const [isRechecking, setIsRechecking] = useState(false);
   const [recheckProgress, setRecheckProgress] = useState<{ done: number; total: number; percent: number } | null>(null);
-  const [syncOpen, setSyncOpen] = useState(false);
-  const [syncUrl, setSyncUrl] = useState("");
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const [existingKeys, setExistingKeys] = useState<ExistingKey[]>([]);
   const [showExistingKeys, setShowExistingKeys] = useState(false);
@@ -435,32 +433,6 @@ export default function Accounts() {
     onError: () => toast({ title: "清理失败", variant: "destructive" }),
   });
 
-  const syncFromSourceMutation = useMutation({
-    mutationFn: async (sourceUrl: string) => {
-      const res = await adminFetch("/admin/accounts/import-from-source", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ source_url: sourceUrl }),
-      });
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
-        throw new Error(err.error ?? "同步失败");
-      }
-      return res.json();
-    },
-    onSuccess: (data) => {
-      toast({
-        title: "同步完成",
-        description: `导入 ${data.imported_accounts} 个账号，${data.imported_keys} 个密钥，当前共 ${data.total_accounts_now} 个账号`,
-      });
-      setSyncOpen(false);
-      setSyncUrl("");
-      qc.invalidateQueries({ queryKey: ["admin-accounts"] });
-      qc.invalidateQueries({ queryKey: ["admin-status"] });
-    },
-    onError: (e: Error) => toast({ title: "同步失败", description: e.message, variant: "destructive" }),
-  });
-
   const accounts = data?.accounts ?? [];
 
   const boundAccountIds = useMemo(() => {
@@ -602,42 +574,6 @@ export default function Accounts() {
             <Eraser className="w-4 h-4 mr-2" />
             {deleteExhaustedMutation.isPending ? "清理中…" : "删除无配额账户"}
           </Button>
-          <Dialog open={syncOpen} onOpenChange={setSyncOpen}>
-            <DialogTrigger asChild>
-              <Button variant="outline" size="sm" className="border-blue-500/40 text-blue-400 hover:text-blue-300">
-                <ArrowDownToLine className="w-4 h-4 mr-2" />
-                从源端导入
-              </Button>
-            </DialogTrigger>
-            <DialogContent className="sm:max-w-lg">
-              <DialogHeader>
-                <DialogTitle>从另一实例导入数据</DialogTitle>
-                <DialogDescription>
-                  输入源服务的地址（如开发环境 URL），本服务将主动拉取并写入所有账号和密钥。
-                </DialogDescription>
-              </DialogHeader>
-              <div className="space-y-3 py-2">
-                <Label>源服务 URL（不含末尾斜杠）</Label>
-                <Input
-                  placeholder="https://xxx.spock.replit.dev"
-                  value={syncUrl}
-                  onChange={e => setSyncUrl(e.target.value)}
-                />
-                <p className="text-xs text-muted-foreground">
-                  开发环境 URL：<code className="text-blue-400">https://{window.location.host.replace(/^workspace\.\w+\.replit\.app$/, "13b5b744-97e4-44d6-8a86-df16f1cba14e-00-2y9r0mkjjprhi.spock.replit.dev")}</code>
-                </p>
-              </div>
-              <DialogFooter>
-                <Button variant="outline" onClick={() => setSyncOpen(false)}>取消</Button>
-                <Button
-                  onClick={() => syncFromSourceMutation.mutate(syncUrl)}
-                  disabled={!syncUrl || syncFromSourceMutation.isPending}
-                >
-                  {syncFromSourceMutation.isPending ? "同步中…" : "开始同步"}
-                </Button>
-              </DialogFooter>
-            </DialogContent>
-          </Dialog>
           <Dialog open={open} onOpenChange={setOpen}>
             <DialogTrigger asChild>
               <Button size="sm">

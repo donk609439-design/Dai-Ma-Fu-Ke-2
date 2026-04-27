@@ -4970,793 +4970,6 @@ async def admin_clear_external_flags():
     return {"success": True, "cleared": len(changed)}
 
 
-async def _do_extra_import(
-    prizes: list,
-    saint_points: list,
-    saint_donations: list,
-    user_items: list,
-    pokeballs: list,
-    user_passwords: list = None,
-    donated_jb_accounts: list = None,
-) -> dict:
-    """导入奖品、抽奖积分、背包等扩展数据（供跨环境迁移使用）
-    冲突策略：源数据覆盖目标数据（ON CONFLICT DO UPDATE）。
-    - 奖品：按 name 冲突，覆盖 quantity/weight/is_active
-    - 圣人积分：按 password（DC身份 dc_{id}）冲突，源覆盖含 total_earned/dc_tag
-    - 用户密码：按 password 冲突，DO NOTHING（存在即跳过）
-    - 捐献记录：按 account_id 冲突，源覆盖 password
-    - 后备隐藏能源：按 jb_email 冲突，覆盖 jb_password/dc_password/dc_tag/status
-    - 背包物品：按 owner_key 分组，先删除目标同 owner 的全部物品再重新插入
-    - 宝可梦球：按 ball_key 冲突，覆盖所有字段，成员先清空再重建
-    """
-    import json as _json
-    if user_passwords is None:
-        user_passwords = []
-    if donated_jb_accounts is None:
-        donated_jb_accounts = []
-    imported_prizes = imported_saint_points = imported_saint_donations = 0
-    imported_user_passwords = imported_donated = imported_user_items = imported_pokeballs = 0
-    pool = await _get_db_pool()
-    async with pool.acquire() as conn:
-        # ── 奖品（按 name 唯一索引源覆盖）──
-        for p in prizes:
-            name = p.get("name", "")
-            if not name:
-                continue
-            try:
-                await conn.execute("""
-                    INSERT INTO lottery_prizes (name, quantity, weight, is_active)
-                    VALUES ($1, $2, $3, $4)
-                    ON CONFLICT (name) DO UPDATE SET
-                        quantity  = EXCLUDED.quantity,
-                        weight    = EXCLUDED.weight,
-                        is_active = EXCLUDED.is_active
-                """, name, int(p.get("quantity", -1)),
-                    int(p.get("weight", 10)), bool(p.get("is_active", True)))
-                imported_prizes += 1
-            except Exception as e:
-                print(f"[extra-import] 跳过奖品 {name!r}: {e}")
-
-        # ── 圣人积分（源覆盖，同步 updated_at）──
-        for sp in saint_points:
-            pw = sp.get("password", "")
-            if not pw:
-                continue
-            try:
-                await conn.execute("""
-                    INSERT INTO saint_points (password, points, total_earned, dc_tag)
-                    VALUES ($1, $2, $3, $4)
-                    ON CONFLICT (password) DO UPDATE SET
-                        points       = EXCLUDED.points,
-                        total_earned = EXCLUDED.total_earned,
-                        dc_tag       = CASE WHEN EXCLUDED.dc_tag <> '' THEN EXCLUDED.dc_tag ELSE saint_points.dc_tag END,
-                        updated_at   = NOW()
-                """, pw, int(sp.get("points", 0)),
-                    int(sp.get("total_earned", sp.get("points", 0))),
-                    sp.get("dc_tag", ""))
-                imported_saint_points += 1
-            except Exception as e:
-                print(f"[extra-import] 跳过圣人积分 {pw[:16]}: {e}")
-
-        # ── 捐献记录（按 account_id 源覆盖）──
-        for sd in saint_donations:
-            acc_id = sd.get("account_id", "")
-            if not acc_id:
-                continue
-            try:
-                await conn.execute("""
-                    INSERT INTO saint_donations (account_id, password)
-                    VALUES ($1, $2)
-                    ON CONFLICT (account_id) DO UPDATE SET
-                        password   = EXCLUDED.password
-                """, acc_id, sd.get("password", ""))
-                imported_saint_donations += 1
-            except Exception as e:
-                print(f"[extra-import] 跳过捐献记录 {acc_id[:12]}: {e}")
-
-        # ── 用户密码（DC绑定关键，存在即跳过）──
-        for pw_entry in user_passwords:
-            pw = (pw_entry if isinstance(pw_entry, str) else pw_entry.get("password", "")).strip()
-            if not pw:
-                continue
-            try:
-                await conn.execute(
-                    "INSERT INTO user_passwords (password) VALUES ($1) ON CONFLICT (password) DO NOTHING",
-                    pw,
-                )
-                imported_user_passwords += 1
-            except Exception as e:
-                print(f"[extra-import] 跳过用户密码 {pw[:16]}: {e}")
-
-        # ── 后备隐藏能源（按 jb_email 源覆盖）──
-        for dja in donated_jb_accounts:
-            email = (dja.get("jb_email") or "").strip()
-            if not email:
-                continue
-            try:
-                await conn.execute("""
-                    INSERT INTO donated_jb_accounts
-                        (jb_email, jb_password, dc_password, dc_tag, status, submitted_at, reviewed_at)
-                    VALUES ($1, $2, $3, $4, $5,
-                            COALESCE($6::TIMESTAMPTZ, NOW()),
-                            $7::TIMESTAMPTZ)
-                    ON CONFLICT (jb_email) DO UPDATE SET
-                        jb_password  = EXCLUDED.jb_password,
-                        dc_password  = EXCLUDED.dc_password,
-                        dc_tag       = EXCLUDED.dc_tag,
-                        status       = EXCLUDED.status,
-                        reviewed_at  = EXCLUDED.reviewed_at
-                """,
-                    email,
-                    dja.get("jb_password", ""),
-                    dja.get("dc_password", ""),
-                    dja.get("dc_tag", ""),
-                    dja.get("status", "pending"),
-                    _parse_ts(dja.get("submitted_at")),
-                    _parse_ts(dja.get("reviewed_at")),
-                )
-                imported_donated += 1
-            except Exception as e:
-                print(f"[extra-import] 跳过后备隐藏能源 {email[:24]}: {e}")
-
-        # ── 背包物品（按 owner_key 源覆盖，先删后逐条插入）──
-        owner_keys_in_source = {
-            item.get("owner_key", "") for item in user_items if item.get("owner_key")
-        }
-        if owner_keys_in_source:
-            for owner_key in owner_keys_in_source:
-                try:
-                    await conn.execute(
-                        "DELETE FROM user_items WHERE owner_key = $1", owner_key
-                    )
-                except Exception as e:
-                    print(f"[extra-import] 清理背包 {owner_key[:24]} 失败: {e}")
-            for item in user_items:
-                owner_key = item.get("owner_key", "")
-                if not owner_key:
-                    continue
-                try:
-                    meta = item.get("metadata", {})
-                    meta_str = _json.dumps(meta) if isinstance(meta, dict) else str(meta)
-                    await conn.execute("""
-                        INSERT INTO user_items (owner_key, prize_name, metadata, used, used_at, created_at)
-                        VALUES ($1, $2, $3::jsonb, $4, $5, COALESCE($6, NOW()))
-                    """, owner_key, item.get("prize_name", ""),
-                        meta_str, bool(item.get("used", False)),
-                        _parse_ts(item.get("used_at")),
-                        _parse_ts(item.get("created_at")))
-                    imported_user_items += 1
-                except Exception as e:
-                    print(f"[extra-import] 跳过背包物品 {owner_key[:24]}/{item.get('prize_name','')}: {e}")
-
-        # ── 宝可梦球（源覆盖：ball_key 冲突全量更新，成员在事务内先清空再重建）──
-        for pb in pokeballs:
-            ball_key = pb.get("ball_key", "")
-            if not ball_key:
-                continue
-            old_id = pb.get("id")   # 导出时携带的原始 ID（用于回填 user_items.metadata）
-            try:
-                async with conn.transaction():
-                    await conn.execute("""
-                        INSERT INTO pokeballs (ball_key, name, capacity, total_used, rr_index)
-                        VALUES ($1, $2, $3, $4, $5)
-                        ON CONFLICT (ball_key) DO UPDATE SET
-                            name       = EXCLUDED.name,
-                            capacity   = EXCLUDED.capacity,
-                            total_used = EXCLUDED.total_used,
-                            rr_index   = EXCLUDED.rr_index
-                    """, ball_key, pb.get("name", ""), int(pb.get("capacity", 1)),
-                        int(pb.get("total_used", 0)), int(pb.get("rr_index", 0)))
-                    pb_row = await conn.fetchrow(
-                        "SELECT id FROM pokeballs WHERE ball_key=$1", ball_key
-                    )
-                    if pb_row:
-                        await conn.execute(
-                            "DELETE FROM pokeball_members WHERE pokeball_id = $1", pb_row["id"]
-                        )
-                        for mk in pb.get("members", []):
-                            if mk:
-                                await conn.execute("""
-                                    INSERT INTO pokeball_members (pokeball_id, member_key)
-                                    VALUES ($1, $2) ON CONFLICT DO NOTHING
-                                """, pb_row["id"], mk)
-                        # 回填 ball_key 到 user_items.metadata（按旧 pokeball_id 匹配）
-                        # 解决跨环境迁移后 SERIAL id 变化导致背包归属错乱的问题
-                        if old_id is not None:
-                            await conn.execute("""
-                                UPDATE user_items
-                                SET metadata = jsonb_set(
-                                    metadata,
-                                    '{ball_key}',
-                                    to_jsonb($1::text)
-                                )
-                                WHERE (metadata->>'pokeball_id')::int = $2
-                                  AND metadata->>'ball_key' IS NULL
-                            """, ball_key, int(old_id))
-                imported_pokeballs += 1
-            except Exception as e:
-                print(f"[extra-import] 跳过宝可梦球 {ball_key}: {e}")
-
-    return {
-        "imported_prizes":              imported_prizes,
-        "imported_saint_points":        imported_saint_points,
-        "imported_saint_donations":     imported_saint_donations,
-        "imported_user_passwords":      imported_user_passwords,
-        "imported_donated_jb_accounts": imported_donated,
-        "imported_user_items":          imported_user_items,
-        "imported_pokeballs":           imported_pokeballs,
-    }
-
-
-async def _do_bulk_import(accounts_in: list, keys_in: list) -> dict:
-    """批量导入账号和密钥的核心逻辑（供多个端点复用）"""
-    imported_accounts = 0
-    imported_keys = 0
-    pool = await _get_db_pool()
-    _ACC_SQL = """
-        INSERT INTO jb_accounts
-            (id, license_id, auth_token, jwt, has_quota, last_updated, last_quota_check)
-        VALUES ($1,$2,$3,$4,$5,$6,$7)
-        ON CONFLICT (id) DO UPDATE SET
-            license_id = EXCLUDED.license_id,
-            auth_token = EXCLUDED.auth_token,
-            jwt = EXCLUDED.jwt,
-            has_quota = EXCLUDED.has_quota,
-            last_updated = EXCLUDED.last_updated,
-            last_quota_check = EXCLUDED.last_quota_check
-    """
-    _KEY_SQL = """
-        INSERT INTO jb_client_keys
-            (key, usage_limit, usage_count, account_id, banned, banned_at, is_nc_key, is_low_admin_key, low_admin_discord_id)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-        ON CONFLICT (key) DO UPDATE SET
-            usage_limit          = EXCLUDED.usage_limit,
-            usage_count          = EXCLUDED.usage_count,
-            account_id           = EXCLUDED.account_id,
-            banned               = EXCLUDED.banned,
-            banned_at            = EXCLUDED.banned_at,
-            is_nc_key            = GREATEST(jb_client_keys.is_nc_key, EXCLUDED.is_nc_key),
-            is_low_admin_key     = GREATEST(jb_client_keys.is_low_admin_key, EXCLUDED.is_low_admin_key),
-            low_admin_discord_id = COALESCE(NULLIF(EXCLUDED.low_admin_discord_id, ''), jb_client_keys.low_admin_discord_id)
-    """
-
-    acc_rows = []
-    for acc in accounts_in:
-        acc_id = acc.get("id") or acc.get("license_id") or str(uuid.uuid4())
-        license_id = acc.get("license_id") or acc.get("id")
-        auth_token = acc.get("auth_token") or acc.get("authorization")
-        jwt_val = acc.get("jwt") or ""
-        has_quota = bool(acc.get("has_quota", True))
-        last_updated = acc.get("last_updated", 0) or 0
-        last_quota_check = acc.get("last_quota_check", 0) or 0
-        acc_rows.append((acc_id, license_id, auth_token, jwt_val, has_quota, last_updated, last_quota_check))
-
-    key_rows = []
-    for key in keys_in:
-        key_val = key.get("key") or key.get("api_key")
-        if not key_val:
-            continue
-        usage_limit = int(
-            key.get("usage_limit") or key.get("daily_total") or key.get("dailyTotal") or 25
-        )
-        usage_count = int(
-            key.get("usage_count") or key.get("total_calls") or key.get("totalCalls") or 0
-        )
-        account_id      = key.get("account_id") or None
-        banned          = bool(key.get("banned", False))
-        banned_at       = key.get("banned_at") or None
-        is_nc_key       = bool(key.get("is_nc_key", False))
-        is_low_admin_key = bool(key.get("is_low_admin_key", False))
-        low_admin_discord_id = str(key.get("low_admin_discord_id") or "")
-        key_rows.append((key_val, usage_limit, usage_count, account_id, banned, banned_at,
-                         is_nc_key, is_low_admin_key, low_admin_discord_id))
-
-    async with pool.acquire() as conn:
-        # 账号批量写入
-        if acc_rows:
-            try:
-                await conn.executemany(_ACC_SQL, acc_rows)
-                imported_accounts = len(acc_rows)
-            except Exception as batch_err:
-                print(f"[bulk-import] 账号批量写入失败，降级逐行: {batch_err}")
-                for row in acc_rows:
-                    try:
-                        await conn.execute(_ACC_SQL, *row)
-                        imported_accounts += 1
-                    except Exception as e:
-                        print(f"[bulk-import] 跳过账号 {row[0]}: {e}")
-
-        # 密钥批量写入
-        if key_rows:
-            try:
-                await conn.executemany(_KEY_SQL, key_rows)
-                imported_keys = len(key_rows)
-            except Exception as batch_err:
-                print(f"[bulk-import] 密钥批量写入失败，降级逐行: {batch_err}")
-                for row in key_rows:
-                    try:
-                        await conn.execute(_KEY_SQL, *row)
-                        imported_keys += 1
-                    except Exception as e:
-                        print(f"[bulk-import] 跳过密钥 {row[0][:20]}…: {e}")
-
-    # 重新加载内存
-    await load_accounts_from_db()
-    await load_keys_from_db()
-
-    # 对本次导入的新账号（last_quota_check==0）安排后台配额检测
-    imported_acc_ids = {row[0] for row in acc_rows}
-    _schedule_quota_checks_for_ids(imported_acc_ids, label="bulk-import入池检测")
-
-    return {
-        "success": True,
-        "imported_accounts": imported_accounts,
-        "imported_keys": imported_keys,
-        "total_accounts_now": len(JETBRAINS_ACCOUNTS),
-        "total_keys_now": len(VALID_CLIENT_KEYS),
-    }
-
-
-@app.post("/admin/accounts/bulk-import")
-async def admin_bulk_import(request: Request, data: dict = Body(...)):
-    """批量导入账号和密钥（直接写库，不走 JetBrains API）"""
-    admin_key_header = request.headers.get("X-Admin-Key", "")
-    if admin_key_header != ADMIN_KEY:
-        return JSONResponse(status_code=403, content={"error": "forbidden"})
-    return await _do_bulk_import(data.get("accounts", []), data.get("keys", []))
-
-
-@app.post("/admin/extra-import")
-async def admin_extra_import(request: Request, data: dict = Body(...)):
-    """从粘贴的 JSON 直接导入奖品/抽奖/积分/密码/背包/后备能源；可选附带 accounts/keys（用于源端 export-all 崩溃时手动迁移账号）"""
-    if request.headers.get("X-Admin-Key", "") != ADMIN_KEY:
-        return JSONResponse(status_code=403, content={"error": "forbidden"})
-    extra = await _do_extra_import(
-        prizes=data.get("prizes", []),
-        saint_points=data.get("saint_points", []),
-        saint_donations=data.get("saint_donations", []),
-        user_items=data.get("user_items", []),
-        pokeballs=data.get("pokeballs", []),
-        user_passwords=data.get("user_passwords", []),
-        donated_jb_accounts=data.get("donated_jb_accounts", []),
-    )
-    # 账号 / 密钥可选导入（源端 export-all 崩溃时的手动迁移路径）
-    accounts = data.get("accounts") or []
-    keys = data.get("keys") or []
-    if accounts or keys:
-        base_result = await _do_bulk_import(accounts, keys)
-        return {**base_result, **extra}
-    return extra
-
-
-# 单字段流式导入：浏览器把巨大 JSON 文件直接作为 request body 流式上传，
-# 避免把 79MB+ 字符串塞进 React state / textarea 导致页面崩溃。
-@app.post("/admin/extra-import-stream")
-async def admin_extra_import_stream(request: Request, field: str):
-    """单字段流式导入，body 是该字段的 JSON 数组（或 {keys_with_meta:[...]} 兼容格式）。"""
-    if request.headers.get("X-Admin-Key", "") != ADMIN_KEY:
-        return JSONResponse(status_code=403, content={"error": "forbidden"})
-    valid_fields = {
-        "accounts", "keys",
-        "prizes", "saint_points", "saint_donations",
-        "user_items", "pokeballs", "user_passwords",
-        "donated_jb_accounts", "cf_proxies",
-    }
-    if field not in valid_fields:
-        return JSONResponse(
-            status_code=400,
-            content={"error": f"未知字段 {field!r}，允许：{sorted(valid_fields)}"},
-        )
-    raw = await request.body()
-    if not raw:
-        return JSONResponse(status_code=400, content={"error": "body 为空"})
-    try:
-        parsed = json.loads(raw)
-    except Exception as e:
-        return JSONResponse(
-            status_code=400,
-            content={"error": f"JSON 解析失败: {type(e).__name__}: {e}"},
-        )
-    # 兼容 /admin/keys 直接返回的对象格式
-    if field == "keys" and isinstance(parsed, dict):
-        parsed = parsed.get("keys_with_meta") or parsed.get("keys") or []
-    if not isinstance(parsed, list):
-        return JSONResponse(
-            status_code=400,
-            content={"error": f"{field} 必须是 JSON 数组（实际是 {type(parsed).__name__}）"},
-        )
-    try:
-        if field == "accounts":
-            r = await _do_bulk_import(parsed, [])
-            return {"success": True, "imported_accounts": r.get("imported_accounts", 0)}
-        if field == "keys":
-            r = await _do_bulk_import([], parsed)
-            return {"success": True, "imported_keys": r.get("imported_keys", 0)}
-        # 其他都走 _do_extra_import 的对应字段
-        kwargs = {
-            "prizes": [], "saint_points": [], "saint_donations": [],
-            "user_items": [], "pokeballs": [], "user_passwords": [],
-            "donated_jb_accounts": [], "cf_proxies": [],
-        }
-        kwargs[field] = parsed
-        r = await _do_extra_import(**kwargs)
-        # 只回包含本字段的导入数
-        out_key = f"imported_{field}"
-        return {"success": True, out_key: r.get(out_key, 0)}
-    except Exception as e:
-        return JSONResponse(
-            status_code=500,
-            content={"error": f"导入 {field} 失败: {type(e).__name__}: {e}"},
-        )
-
-
-@app.get("/admin/accounts/export-all")
-async def admin_export_all(request: Request):
-    """导出全部账号、密钥及奖品/抽奖/背包数据（供跨环境迁移使用）"""
-    admin_key_header = request.headers.get("X-Admin-Key", "")
-    if admin_key_header != ADMIN_KEY:
-        return JSONResponse(status_code=403, content={"error": "forbidden"})
-    import json as _json
-    pool = await _get_db_pool()
-    async with pool.acquire() as conn:
-        accounts = await conn.fetch("""
-            SELECT id, license_id, auth_token, jwt,
-                   COALESCE(has_quota, TRUE) as has_quota,
-                   COALESCE(last_updated, 0) as last_updated,
-                   COALESCE(last_quota_check, 0) as last_quota_check,
-                   daily_used, daily_total,
-                   COALESCE(external_usage_count, 0) as external_usage_count
-            FROM jb_accounts ORDER BY id
-        """)
-        keys = await conn.fetch("""
-            SELECT key,
-                   COALESCE(usage_limit, 0)      as usage_limit,
-                   COALESCE(usage_count, 0)      as usage_count,
-                   account_id,
-                   COALESCE(banned, FALSE)        as banned,
-                   banned_at,
-                   COALESCE(is_nc_key, FALSE)     as is_nc_key,
-                   COALESCE(is_low_admin_key, FALSE) as is_low_admin_key,
-                   COALESCE(low_admin_discord_id, '') as low_admin_discord_id
-            FROM jb_client_keys ORDER BY key
-        """)
-        prizes = await conn.fetch(
-            "SELECT id, name, quantity, weight, is_active FROM lottery_prizes ORDER BY id"
-        )
-        saint_points = await conn.fetch(
-            "SELECT password, points, total_earned, dc_tag FROM saint_points ORDER BY password"
-        )
-        saint_donations = await conn.fetch(
-            "SELECT account_id, password, donated_at FROM saint_donations ORDER BY account_id"
-        )
-        user_passwords_rows = await conn.fetch(
-            "SELECT password, created_at FROM user_passwords ORDER BY password"
-        )
-        donated_jb = await conn.fetch(
-            "SELECT jb_email, jb_password, dc_password, dc_tag, status, submitted_at, reviewed_at "
-            "FROM donated_jb_accounts ORDER BY id"
-        )
-        user_items = await conn.fetch(
-            "SELECT owner_key, prize_name, metadata::text as metadata, used, used_at, created_at "
-            "FROM user_items ORDER BY id"
-        )
-        pokeballs = await conn.fetch(
-            "SELECT ball_key, name, capacity, total_used, rr_index FROM pokeballs ORDER BY id"
-        )
-        pokeball_members_rows = await conn.fetch(
-            "SELECT p.ball_key, pm.member_key FROM pokeball_members pm "
-            "JOIN pokeballs p ON p.id = pm.pokeball_id ORDER BY pm.id"
-        )
-        cf_proxies = await conn.fetch(
-            "SELECT url, label, owner, owner_discord_id, is_active, created_at "
-            "FROM cf_proxy_pool ORDER BY owner, owner_discord_id, id"
-        )
-    keys_out = [
-        {
-            "key":                  k["key"],
-            "usage_limit":          int(k["usage_limit"] or 0),
-            "usage_count":          int(k["usage_count"] or 0),
-            "account_id":           k["account_id"],
-            "banned":               bool(k["banned"]),
-            "banned_at":            k["banned_at"],
-            "is_nc_key":            bool(k["is_nc_key"]),
-            "is_low_admin_key":     bool(k["is_low_admin_key"]),
-            "low_admin_discord_id": str(k["low_admin_discord_id"] or ""),
-        }
-        for k in keys
-    ]
-    pb_members: dict = {}
-    for row in pokeball_members_rows:
-        pb_members.setdefault(row["ball_key"], []).append(row["member_key"])
-    return {
-        "accounts": [dict(a) for a in accounts],
-        "keys":     keys_out,
-        "prizes":   [dict(p) for p in prizes],
-        "saint_points":    [dict(r) for r in saint_points],
-        "saint_donations": [dict(r) for r in saint_donations],
-        "user_passwords":  [r["password"] for r in user_passwords_rows],
-        "donated_jb_accounts": [
-            {
-                "jb_email":    r["jb_email"],
-                "jb_password": r["jb_password"],
-                "dc_password": r["dc_password"],
-                "dc_tag":      r["dc_tag"],
-                "status":      r["status"],
-                "submitted_at": r["submitted_at"].isoformat() if r["submitted_at"] else None,
-                "reviewed_at":  r["reviewed_at"].isoformat() if r["reviewed_at"] else None,
-            }
-            for r in donated_jb
-        ],
-        "user_items": [
-            {
-                "owner_key":  r["owner_key"],
-                "prize_name": r["prize_name"],
-                "metadata":   _json.loads(r["metadata"]) if r["metadata"] else {},
-                "used":       bool(r["used"]),
-                "used_at":    r["used_at"].isoformat() if r["used_at"] else None,
-                "created_at": r["created_at"].isoformat() if r["created_at"] else None,
-            }
-            for r in user_items
-        ],
-        "pokeballs": [
-            {**dict(pb), "members": pb_members.get(pb["ball_key"], [])}
-            for pb in pokeballs
-        ],
-        "cf_proxies": [
-            {
-                "url":              r["url"],
-                "label":            r["label"] or "",
-                "owner":            r["owner"],
-                "owner_discord_id": r["owner_discord_id"] or "",
-                "is_active":        bool(r["is_active"]),
-                "created_at":       r["created_at"].isoformat() if r["created_at"] else None,
-            }
-            for r in cf_proxies
-        ],
-        "exported_at": time.time(),
-    }
-
-
-@app.post("/admin/migration-probe")
-async def admin_migration_probe(request: Request, data: dict = Body(...)):
-    """诊断模式：直接调用源端 /admin/accounts/export-all 并把完整响应（status/header/body 截短）返回，用于排查迁移失败的真实原因"""
-    admin_key_header = request.headers.get("X-Admin-Key", "")
-    if admin_key_header != ADMIN_KEY:
-        return JSONResponse(status_code=403, content={"error": "forbidden"})
-
-    source_url = (data.get("source_url") or "").rstrip("/")
-    source_admin_key = data.get("source_admin_key") or ADMIN_KEY
-    if not source_url:
-        return JSONResponse(status_code=400, content={"error": "source_url required"})
-
-    target = f"{source_url}/admin/accounts/export-all"
-    hdrs = {"X-Admin-Key": source_admin_key}
-
-    try:
-        async with httpx.AsyncClient(verify=False, timeout=60, follow_redirects=True) as client:
-            resp = await client.get(target, headers=hdrs)
-    except Exception as e:
-        return {
-            "ok": False,
-            "stage": "network",
-            "url": target,
-            "error": f"{type(e).__name__}: {e}",
-        }
-
-    body_text = resp.text or ""
-    body_truncated = body_text[:8000]
-
-    # 尝试解析 JSON 顶层 schema
-    keys_summary = None
-    try:
-        body_json = resp.json()
-        if isinstance(body_json, dict):
-            keys_summary = {}
-            for k, v in body_json.items():
-                if isinstance(v, list):
-                    keys_summary[k] = f"<list len={len(v)}>"
-                elif isinstance(v, dict):
-                    keys_summary[k] = f"<dict keys={len(v)}>"
-                else:
-                    keys_summary[k] = type(v).__name__
-    except Exception:
-        keys_summary = None
-
-    return {
-        "ok": resp.status_code == 200,
-        "url": target,
-        "status_code": resp.status_code,
-        "content_type": resp.headers.get("content-type", ""),
-        "content_length_bytes": len(body_text),
-        "body_truncated_8kb": body_truncated,
-        "json_top_level_summary": keys_summary,
-        "server_header": resp.headers.get("server", ""),
-    }
-
-
-@app.post("/admin/accounts/import-from-source")
-async def admin_import_from_source(request: Request, data: dict = Body(...)):
-    """从另一个部署实例拉取全部数据（含奖品/抽奖/背包）并导入本库"""
-    admin_key_header = request.headers.get("X-Admin-Key", "")
-    if admin_key_header != ADMIN_KEY:
-        return JSONResponse(status_code=403, content={"error": "forbidden"})
-
-    source_url = data.get("source_url", "").rstrip("/")
-    source_admin_key = data.get("source_admin_key", ADMIN_KEY)
-    if not source_url:
-        return JSONResponse(status_code=400, content={"error": "source_url required"})
-
-    hdrs = {"X-Admin-Key": source_admin_key}
-
-    async def _try_get(client: httpx.AsyncClient, path: str):
-        """尝试 GET 一个端点，失败或不存在返回 None"""
-        try:
-            r = await client.get(f"{source_url}{path}", headers=hdrs)
-            if r.status_code == 200:
-                return r.json()
-        except Exception as e:
-            print(f"[import-from-source] 尝试 {path} 失败: {e}")
-        return None
-
-    async with httpx.AsyncClient(verify=False, timeout=120) as client:
-        # 1. 先拉综合导出（export-all）。若整个端点崩溃（500/超时/解析失败），
-        #    自动降级到"逐个单表端点"模式：账号无法通过单表拿到（/admin/accounts 脱敏），但
-        #    密钥/奖品/积分/捐献/密码/背包/球/CF代理/捐JB账号都能逐张表搬过来。
-        #    例外：401/403 鉴权失败 → 单表端点也会同样 401，没必要降级，直接报错。
-        export_all_failed_reason: Optional[str] = None
-        payload: dict = {}
-        try:
-            resp = await client.get(f"{source_url}/admin/accounts/export-all", headers=hdrs)
-        except Exception as e:
-            # 网络/连接/超时层失败 → 进入降级模式（单表端点可能更轻量、更易成功）
-            export_all_failed_reason = f"网络/连接/超时层失败: {type(e).__name__}: {e}"
-            resp = None  # type: ignore
-        if resp is not None:
-            if resp.status_code == 200:
-                try:
-                    payload = resp.json()
-                except Exception as e:
-                    export_all_failed_reason = f"返回的不是合法 JSON: {type(e).__name__}: {e}"
-                    payload = {}
-            else:
-                # 透传远端响应体，方便诊断（截短到 800 字，去掉 HTML 标签噪音）
-                try:
-                    body_obj = resp.json()
-                    detail = body_obj.get("error") or body_obj.get("detail") or json.dumps(body_obj, ensure_ascii=False)[:800]
-                except Exception:
-                    detail = (resp.text or "")[:800]
-                # 鉴权失败 → 单表端点也会同样失败，没必要降级，直接报错
-                if resp.status_code in (401, 403):
-                    return JSONResponse(
-                        status_code=502,
-                        content={"error": f"鉴权失败（HTTP {resp.status_code}）：{detail}（请检查 source_admin_key 是否正确）"},
-                    )
-                # 其他失败（500/404/502/...）→ 进入降级模式
-                export_all_failed_reason = f"HTTP {resp.status_code}（{detail or '响应体为空，可能源端进程崩溃或被 App Engine 前端截断'}）"
-                payload = {}
-
-        # —— 以下逐表 fallback：payload 缺字段时调用源端单表端点 ——
-        # 2. 奖品：若综合导出未包含，回退到 /admin/prizes
-        prizes = payload.get("prizes")
-        if prizes is None:
-            pr = await _try_get(client, "/admin/prizes")
-            prizes = pr if isinstance(pr, list) else (pr.get("prizes", []) if isinstance(pr, dict) else [])
-
-        # 2b. 密钥：降级时回退到 /admin/keys（返回完整密钥，含 usage_limit/account_id/banned/...）
-        keys_payload = payload.get("keys")
-        if keys_payload is None:
-            kr = await _try_get(client, "/admin/keys")
-            if isinstance(kr, dict):
-                keys_payload = kr.get("keys_with_meta") or kr.get("keys") or []
-            elif isinstance(kr, list):
-                keys_payload = kr
-            else:
-                keys_payload = []
-
-        # 3. 圣人积分：回退到 /admin/saint-points-export（新版端点）
-        saint_points = payload.get("saint_points")
-        if saint_points is None:
-            sp = await _try_get(client, "/admin/saint-points-export")
-            saint_points = sp if isinstance(sp, list) else (sp.get("saint_points", []) if isinstance(sp, dict) else [])
-
-        # 4. 捐献记录
-        saint_donations = payload.get("saint_donations")
-        if saint_donations is None:
-            sd = await _try_get(client, "/admin/saint-donations-export")
-            saint_donations = sd if isinstance(sd, list) else (sd.get("saint_donations", []) if isinstance(sd, dict) else [])
-
-        # 5. 用户密码（DC 绑定关键）：回退到 /admin/user-passwords-export
-        user_passwords = payload.get("user_passwords")
-        if user_passwords is None:
-            upw = await _try_get(client, "/admin/user-passwords-export")
-            user_passwords = upw if isinstance(upw, list) else []
-
-        # 6. 后备隐藏能源：回退到 /admin/donated-accounts-export
-        donated_jb_accounts = payload.get("donated_jb_accounts")
-        if donated_jb_accounts is None:
-            dja = await _try_get(client, "/admin/donated-accounts-export")
-            donated_jb_accounts = dja if isinstance(dja, list) else []
-
-        # 7. 背包物品
-        user_items = payload.get("user_items")
-        if user_items is None:
-            ui = await _try_get(client, "/admin/user-items-export")
-            user_items = ui if isinstance(ui, list) else (ui.get("user_items", []) if isinstance(ui, dict) else [])
-
-        # 8. 宝可梦球
-        pokeballs = payload.get("pokeballs")
-        if pokeballs is None:
-            pb = await _try_get(client, "/admin/pokeballs-export")
-            pokeballs = pb if isinstance(pb, list) else (pb.get("pokeballs", []) if isinstance(pb, dict) else [])
-
-        # 9. CF 代理池（主池 + LOW 子池）：回退到专用导出接口
-        cf_proxies = payload.get("cf_proxies")
-        if cf_proxies is None:
-            cp = await _try_get(client, "/admin/cf-proxies/export")
-            if isinstance(cp, dict):
-                cf_proxies = cp.get("proxies", [])
-            elif isinstance(cp, list):
-                cf_proxies = cp
-            else:
-                cf_proxies = []
-
-    # _do_bulk_import（账号+密钥）与 _do_extra_import（其余表）
-    # 操作完全不同的表，无 FK 依赖，并发执行缩短导入时间
-    base_result, extra = await asyncio.gather(
-        _do_bulk_import(payload.get("accounts", []), keys_payload or []),
-        _do_extra_import(
-            prizes=prizes or [],
-            saint_points=saint_points or [],
-            saint_donations=saint_donations or [],
-            user_items=user_items or [],
-            pokeballs=pokeballs or [],
-            user_passwords=user_passwords or [],
-            donated_jb_accounts=donated_jb_accounts or [],
-        ),
-    )
-    # 导入 CF 代理池（admin 主池 + LOW 子池一起导入）
-    cf_imported = 0
-    if cf_proxies:
-        pool_db = await _get_db_pool()
-        if pool_db:
-            async with pool_db.acquire() as conn:
-                for row in cf_proxies:
-                    url = (row.get("url") or "").strip().rstrip("/")
-                    if not url.startswith("https://"):
-                        continue
-                    owner = row.get("owner") or "admin"
-                    dc_id = row.get("owner_discord_id") or ""
-                    label = row.get("label") or ""
-                    is_active = bool(row.get("is_active", True))
-                    try:
-                        await conn.execute(
-                            "INSERT INTO cf_proxy_pool (url, label, owner, owner_discord_id, is_active) "
-                            "VALUES ($1, $2, $3, $4, $5) "
-                            "ON CONFLICT (url, owner, owner_discord_id) DO UPDATE SET "
-                            "label=EXCLUDED.label, is_active=EXCLUDED.is_active",
-                            url, label, owner, dc_id, is_active,
-                        )
-                        cf_imported += 1
-                    except Exception as e:
-                        print(f"[import-from-source] cf_proxy_pool 跳过 {url}: {e}")
-            await load_cf_proxies_from_db()
-
-    # 降级模式标记：让前端识别"账号未通过 export-all 拉取"
-    degraded_meta = {}
-    if export_all_failed_reason:
-        degraded_meta = {
-            "degraded": True,
-            "export_all_error": export_all_failed_reason,
-            "accounts_skipped": True,
-            "degraded_hint": (
-                "源端 /admin/accounts/export-all 失败，已降级到逐表模式：密钥/奖品/积分/捐献/密码/背包/球/CF代理/捐JB账号"
-                "已通过单表端点导入；账号数据（jb_accounts）因源端 /admin/accounts 接口脱敏，无法自动迁移，"
-                "请使用下方'JSON 粘贴导入'里的'账号 jb_accounts'输入框手动迁移。"
-            ),
-        }
-    return {**base_result, **extra, "imported_cf_proxies": cf_imported, **degraded_meta}
-
-
 @app.get("/admin/keys")
 async def admin_list_keys():
     """列出所有客户端 API 密钥（含用量和封禁状态，15s TTL 缓存）"""
@@ -11169,6 +10382,7 @@ async def admin_manually_activate_contribution(cid: str, request: Request):
 _EXPORT_TABLES = [
     "jb_accounts",
     "jb_client_keys",
+    "jb_settings",                   # ★ LOW 用户审计行 + 全局配置（关键安全表）
     "partner_client_config",
     "partner_keys",
     "partner_precheck_rejections",
@@ -11191,6 +10405,7 @@ _EXPORT_TABLES = [
 _TABLE_CONFLICT_COL: dict[str, str] = {
     "jb_accounts":                 "id",
     "jb_client_keys":              "key",
+    "jb_settings":                 "key",           # ★ 新加：LOW 用户审计行 + 全局配置
     "partner_client_config":       "key",
     "partner_keys":                "id",
     "partner_precheck_rejections": "id",
@@ -11211,145 +10426,387 @@ _TABLE_CONFLICT_MULTI: dict[str, list] = {
 }
 
 
-@app.get("/admin/db-export")
-async def admin_db_export(request: Request):
-    """导出全部表数据为 JSON（数据迁移用）。需要 X-Admin-Key（仅完整管理员可用）。"""
-    if request.headers.get("X-Admin-Key", "") != ADMIN_KEY:
-        return JSONResponse(status_code=403, content={"detail": "仅完整管理员可使用数据迁移接口"})
-    pool = await _get_db_pool()
-    if not pool:
-        raise HTTPException(status_code=503, detail="DB unavailable")
-    export: dict = {
-        "version": "2",
-        "exported_at": int(time.time()),
-        "tables": {},
-    }
-    for table in _EXPORT_TABLES:
-        try:
-            async with pool.acquire() as conn:
-                rows = await conn.fetch(f"SELECT * FROM {table}")
-            export["tables"][table] = [dict(r) for r in rows]
-        except Exception as e:
-            export["tables"][table] = []
-            export.setdefault("errors", {})[table] = str(e)
-    body = json.dumps(export, ensure_ascii=False, default=str)
-    return Response(
-        content=body,
-        media_type="application/json",
-        headers={
-            "Content-Disposition": f"attachment; filename=\"db-export-{int(time.time())}.json\""
-        },
-    )
+# ==================== 流式数据迁移（NDJSON）====================
+# 替代旧的一次性 export/import 端点，避免内存峰值和超时
+#
+# NDJSON 协议：每行一个独立 JSON 对象
+#   {"_meta":{"version":3,"exported_at":1730000000}}
+#   {"_table":"jb_accounts"}
+#   {<row1>}
+#   {<row2>}
+#   {"_table":"jb_client_keys"}
+#   {<row1>}
+#   {"_error":{"table":"xxx","error":"..."}}    可选错误行
 
+@app.get("/admin/db-export-stream")
+async def admin_db_export_stream(request: Request):
+    """流式导出全表为 NDJSON。响应体每行一个独立 JSON 对象。
 
-@app.post("/admin/db-import")
-async def admin_db_import(request: Request):
-    """从 JSON 包全量导入（upsert）。需要 X-Admin-Key（仅完整管理员可用）。
-    请求体：{ "tables": { "jb_accounts": [...], ... } }
-    返回：每个表 upserted 行数。
+    优势：服务端用 PG asyncpg cursor 边查边写，内存稳定 ~10MB（无论数据量）。
+    支持任意大数据量（GB 级也不会 OOM）。
     """
     if request.headers.get("X-Admin-Key", "") != ADMIN_KEY:
         return JSONResponse(status_code=403, content={"detail": "仅完整管理员可使用数据迁移接口"})
     pool = await _get_db_pool()
     if not pool:
         raise HTTPException(status_code=503, detail="DB unavailable")
+
+    async def stream_rows():
+        # 1. 元数据行
+        yield (json.dumps(
+            {"_meta": {"version": 3, "exported_at": int(time.time())}},
+            ensure_ascii=False,
+        ) + "\n").encode("utf-8")
+
+        # 2. 逐表流式输出
+        for table in _EXPORT_TABLES:
+            yield (json.dumps({"_table": table}, ensure_ascii=False) + "\n").encode("utf-8")
+            try:
+                # asyncpg cursor 必须在 transaction 内
+                async with pool.acquire() as conn:
+                    async with conn.transaction():
+                        async for row in conn.cursor(f'SELECT * FROM "{table}"', prefetch=1000):
+                            yield (json.dumps(
+                                dict(row),
+                                default=str,        # datetime/Decimal 自动转 str
+                                ensure_ascii=False,
+                            ) + "\n").encode("utf-8")
+            except Exception as e:
+                yield (json.dumps(
+                    {"_error": {"table": table, "error": str(e)[:300]}},
+                    ensure_ascii=False,
+                ) + "\n").encode("utf-8")
+
+    return StreamingResponse(
+        stream_rows(),
+        media_type="application/x-ndjson",
+        headers={
+            "Content-Disposition": f'attachment; filename="db-export-{int(time.time())}.ndjson"',
+            "X-Accel-Buffering":   "no",
+            "Cache-Control":       "no-cache",
+        },
+    )
+
+
+async def _upsert_one_row(conn, table: str, row: dict) -> None:
+    """单行 upsert 核心逻辑（被 db-import-stream 和 import-from-source-stream 复用）"""
+    cols = list(row.keys())
+    if not cols:
+        return
+    placeholders = ", ".join(f"${i+1}" for i in range(len(cols)))
+    col_names    = ", ".join(f'"{c}"' for c in cols)
+    values       = [row[c] for c in cols]
+
+    conflict_col   = _TABLE_CONFLICT_COL.get(table)
+    conflict_multi = _TABLE_CONFLICT_MULTI.get(table)
+
+    if conflict_multi and all(c in cols for c in conflict_multi):
+        target = "(" + ", ".join(f'"{c}"' for c in conflict_multi) + ")"
+        update_cols = [c for c in cols if c not in conflict_multi]
+        if update_cols:
+            set_clause = ", ".join(f'"{c}"=EXCLUDED."{c}"' for c in update_cols)
+            sql = (f'INSERT INTO "{table}" ({col_names}) VALUES ({placeholders}) '
+                   f'ON CONFLICT {target} DO UPDATE SET {set_clause}')
+        else:
+            sql = (f'INSERT INTO "{table}" ({col_names}) VALUES ({placeholders}) '
+                   f'ON CONFLICT {target} DO NOTHING')
+    elif conflict_col and conflict_col in cols:
+        update_cols = [c for c in cols if c != conflict_col]
+        if update_cols:
+            set_clause = ", ".join(f'"{c}"=EXCLUDED."{c}"' for c in update_cols)
+            sql = (f'INSERT INTO "{table}" ({col_names}) VALUES ({placeholders}) '
+                   f'ON CONFLICT ("{conflict_col}") DO UPDATE SET {set_clause}')
+        else:
+            sql = (f'INSERT INTO "{table}" ({col_names}) VALUES ({placeholders}) '
+                   f'ON CONFLICT ("{conflict_col}") DO NOTHING')
+    else:
+        sql = (f'INSERT INTO "{table}" ({col_names}) VALUES ({placeholders}) '
+               f'ON CONFLICT DO NOTHING')
+
+    await conn.execute(sql, *values)
+
+
+@app.post("/admin/db-import-stream")
+async def admin_db_import_stream(request: Request):
+    """从请求体（NDJSON 流）流式 upsert 到当前 DB。
+
+    用途：管理员手动下载 .ndjson 文件后通过浏览器上传，或脚本工具直接 PUT。
+    请求体格式同 /admin/db-export-stream 输出。
+    """
+    if request.headers.get("X-Admin-Key", "") != ADMIN_KEY:
+        return JSONResponse(status_code=403, content={"detail": "仅完整管理员可使用数据迁移接口"})
+    pool = await _get_db_pool()
+    if not pool:
+        raise HTTPException(status_code=503, detail="DB unavailable")
+
+    counts: Dict[str, int] = {}
+    errors: list = []
+    current_table: Optional[str] = None
+    bytes_read = 0
+    started_at = time.time()
+    BATCH_COMMIT = 500
+
+    buffer = b""
+    conn = await pool.acquire()
     try:
-        body = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="请求体必须为 JSON")
-    tables_data: dict = body.get("tables", {})
-    if not tables_data:
-        raise HTTPException(status_code=400, detail="缺少 tables 字段")
+        tx = conn.transaction()
+        await tx.start()
+        rows_in_tx = 0
 
-    results: dict = {}
-    errors: dict = {}
+        async for chunk in request.stream():
+            if not chunk:
+                continue
+            bytes_read += len(chunk)
+            buffer += chunk
+            while b"\n" in buffer:
+                line, buffer = buffer.split(b"\n", 1)
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception as e:
+                    errors.append(f"JSON parse: {type(e).__name__}: {line[:120]!r}")
+                    continue
 
-    for table, rows in tables_data.items():
-        if table not in _EXPORT_TABLES:
-            errors[table] = "未知表，跳过"
-            continue
-        if not rows:
-            results[table] = 0
-            continue
+                if "_meta" in obj:
+                    continue
+                if "_table" in obj:
+                    tbl = obj["_table"]
+                    current_table = tbl if tbl in _EXPORT_TABLES else None
+                    if current_table:
+                        counts.setdefault(current_table, 0)
+                    continue
+                if "_error" in obj:
+                    errors.append(f"source error: {obj['_error']}")
+                    continue
+                if not current_table:
+                    continue
+                try:
+                    await _upsert_one_row(conn, current_table, obj)
+                    counts[current_table] = counts.get(current_table, 0) + 1
+                    rows_in_tx += 1
+                except Exception as e:
+                    errors.append(f"{current_table} row failed: {type(e).__name__}: {e}")
 
-        conflict_col = _TABLE_CONFLICT_COL.get(table)
-        conflict_multi = _TABLE_CONFLICT_MULTI.get(table)   # 复合冲突键（如 cf_proxy_pool）
-        upserted = 0
+                if rows_in_tx >= BATCH_COMMIT:
+                    await tx.commit()
+                    tx = conn.transaction()
+                    await tx.start()
+                    rows_in_tx = 0
+
+        # 处理 buffer 残留
+        if buffer.strip():
+            try:
+                obj = json.loads(buffer.strip())
+                if "_meta" not in obj and "_error" not in obj and "_table" not in obj and current_table:
+                    await _upsert_one_row(conn, current_table, obj)
+                    counts[current_table] = counts.get(current_table, 0) + 1
+            except Exception as e:
+                errors.append(f"tail line failed: {e}")
+
+        await tx.commit()
+    except Exception as e:
+        try: await tx.rollback()
+        except: pass
+        return JSONResponse(status_code=500, content={
+            "error": f"导入失败: {type(e).__name__}: {e}",
+            "imported_so_far": counts,
+            "bytes_read": bytes_read,
+        })
+    finally:
+        await pool.release(conn)
+
+    # 重新加载内存
+    try: await load_accounts_from_db()
+    except: pass
+    try: await load_keys_from_db()
+    except: pass
+    try: await load_cf_proxies_from_db()
+    except: pass
+
+    if counts.get("jb_accounts", 0) > 0:
         try:
-            async with pool.acquire() as conn:
-                for row in rows:
-                    cols = list(row.keys())
-                    placeholders = ", ".join(f"${i+1}" for i in range(len(cols)))
-                    col_names = ", ".join(f'"{c}"' for c in cols)
-                    values = [row[c] for c in cols]
-
-                    if conflict_multi and all(c in cols for c in conflict_multi):
-                        # 多列复合冲突键（如 cf_proxy_pool）
-                        target = "(" + ", ".join(f'"{c}"' for c in conflict_multi) + ")"
-                        update_cols = [c for c in cols if c not in conflict_multi]
-                        if update_cols:
-                            set_clause = ", ".join(
-                                f'"{c}"=EXCLUDED."{c}"' for c in update_cols
-                            )
-                            sql = (
-                                f'INSERT INTO "{table}" ({col_names}) VALUES ({placeholders}) '
-                                f'ON CONFLICT {target} DO UPDATE SET {set_clause}'
-                            )
-                        else:
-                            sql = (
-                                f'INSERT INTO "{table}" ({col_names}) VALUES ({placeholders}) '
-                                f'ON CONFLICT {target} DO NOTHING'
-                            )
-                    elif conflict_col and conflict_col in cols:
-                        # 单列冲突键
-                        update_cols = [c for c in cols if c != conflict_col]
-                        if update_cols:
-                            set_clause = ", ".join(
-                                f'"{c}"=EXCLUDED."{c}"' for c in update_cols
-                            )
-                            sql = (
-                                f'INSERT INTO "{table}" ({col_names}) VALUES ({placeholders}) '
-                                f'ON CONFLICT ("{conflict_col}") DO UPDATE SET {set_clause}'
-                            )
-                        else:
-                            sql = (
-                                f'INSERT INTO "{table}" ({col_names}) VALUES ({placeholders}) '
-                                f'ON CONFLICT ("{conflict_col}") DO NOTHING'
-                            )
-                    else:
-                        sql = (
-                            f'INSERT INTO "{table}" ({col_names}) VALUES ({placeholders}) '
-                            f'ON CONFLICT DO NOTHING'
-                        )
-                    await conn.execute(sql, *values)
-                    upserted += 1
-        except Exception as e:
-            errors[table] = str(e)
-            results[table] = upserted
-            continue
-        results[table] = upserted
-
-    # 导入完成后重新加载内存状态
-    jb_acc_rows = tables_data.get("jb_accounts", [])
-    try:
-        await load_accounts_from_db()
-    except Exception:
-        pass
-    try:
-        await load_keys_from_db()
-    except Exception:
-        pass
-
-    # 对本次导入的 jb_accounts 新账号（last_quota_check==0）安排后台配额检测
-    if jb_acc_rows:
-        imported_acc_ids = {r.get("id") or r.get("license_id") for r in jb_acc_rows if r.get("id") or r.get("license_id")}
-        _schedule_quota_checks_for_ids(imported_acc_ids, label="db-import入池检测")
+            async with pool.acquire() as conn2:
+                rows = await conn2.fetch(
+                    "SELECT id FROM jb_accounts WHERE COALESCE(last_quota_check, 0) = 0 LIMIT 5000"
+                )
+                _schedule_quota_checks_for_ids({r["id"] for r in rows}, label="db-import-stream入池检测")
+        except Exception:
+            pass
 
     return {
-        "success": True,
-        "imported": results,
-        **({"errors": errors} if errors else {}),
+        "success":  True,
+        "imported": counts,
+        "errors":   errors[:50],
+        "stats": {
+            "elapsed_sec":  round(time.time() - started_at, 1),
+            "bytes_read":   bytes_read,
+            "errors_total": len(errors),
+        },
     }
+
+
+@app.post("/admin/import-from-source-stream")
+async def admin_import_from_source_stream(request: Request, data: dict = Body(...)):
+    """从源端 /admin/db-export-stream 流式拉取并导入。
+
+    请求体：{ "source_url": "https://xxx.replit.dev", "source_admin_key": "xxx" }
+
+    关键：read timeout=15 分钟、内存稳定 ~10MB、每 500 行 commit 一次。
+    """
+    if request.headers.get("X-Admin-Key", "") != ADMIN_KEY:
+        return JSONResponse(status_code=403, content={"detail": "仅完整管理员可使用数据迁移接口"})
+    source_url = (data.get("source_url") or "").rstrip("/")
+    source_key = data.get("source_admin_key") or ADMIN_KEY
+    if not source_url:
+        return JSONResponse(status_code=400, content={"error": "source_url required"})
+
+    pool = await _get_db_pool()
+    if not pool:
+        raise HTTPException(status_code=503, detail="DB unavailable")
+
+    counts: Dict[str, int] = {}
+    errors: list = []
+    current_table: Optional[str] = None
+    started_at = time.time()
+    bytes_read = 0
+    BATCH_COMMIT = 500
+
+    timeout = httpx.Timeout(connect=30.0, read=900.0, write=30.0, pool=300.0)
+    async with httpx.AsyncClient(verify=False, timeout=timeout) as client:
+        try:
+            async with client.stream(
+                "GET",
+                f"{source_url}/admin/db-export-stream",
+                headers={"X-Admin-Key": source_key},
+            ) as resp:
+                if resp.status_code != 200:
+                    body_preview = await resp.aread()
+                    return JSONResponse(status_code=502, content={
+                        "error": f"源端返回 HTTP {resp.status_code}",
+                        "body":  body_preview[:500].decode("utf-8", errors="replace"),
+                    })
+
+                conn = await pool.acquire()
+                try:
+                    tx = conn.transaction()
+                    await tx.start()
+                    rows_in_tx = 0
+
+                    async for line in resp.aiter_lines():
+                        if not line or not line.strip():
+                            continue
+                        bytes_read += len(line) + 1
+                        try:
+                            obj = json.loads(line)
+                        except Exception as e:
+                            errors.append(f"JSON parse: {type(e).__name__}: {line[:120]}")
+                            continue
+
+                        if "_meta" in obj:
+                            continue
+                        if "_table" in obj:
+                            tbl = obj["_table"]
+                            current_table = tbl if tbl in _EXPORT_TABLES else None
+                            if current_table:
+                                counts.setdefault(current_table, 0)
+                            continue
+                        if "_error" in obj:
+                            errors.append(f"source error: {obj['_error']}")
+                            continue
+                        if not current_table:
+                            continue
+                        try:
+                            await _upsert_one_row(conn, current_table, obj)
+                            counts[current_table] = counts.get(current_table, 0) + 1
+                            rows_in_tx += 1
+                        except Exception as e:
+                            errors.append(f"{current_table} row failed: {type(e).__name__}: {e}")
+
+                        if rows_in_tx >= BATCH_COMMIT:
+                            await tx.commit()
+                            tx = conn.transaction()
+                            await tx.start()
+                            rows_in_tx = 0
+
+                    await tx.commit()
+                finally:
+                    await pool.release(conn)
+
+        except httpx.ReadTimeout:
+            return JSONResponse(status_code=504, content={
+                "error": "源端响应读超时（>15 分钟），可能数据量过大或网络中断",
+                "imported_so_far": counts,
+                "bytes_read": bytes_read,
+            })
+        except Exception as e:
+            return JSONResponse(status_code=500, content={
+                "error": f"流式拉取失败: {type(e).__name__}: {e}",
+                "imported_so_far": counts,
+                "bytes_read": bytes_read,
+            })
+
+    try: await load_accounts_from_db()
+    except: pass
+    try: await load_keys_from_db()
+    except: pass
+    try: await load_cf_proxies_from_db()
+    except: pass
+
+    if counts.get("jb_accounts", 0) > 0:
+        try:
+            async with pool.acquire() as conn2:
+                rows = await conn2.fetch(
+                    "SELECT id FROM jb_accounts WHERE COALESCE(last_quota_check, 0) = 0 LIMIT 5000"
+                )
+                _schedule_quota_checks_for_ids({r["id"] for r in rows}, label="stream-import入池检测")
+        except Exception:
+            pass
+
+    return {
+        "success":  True,
+        "imported": counts,
+        "errors":   errors[:50],
+        "stats": {
+            "elapsed_sec":  round(time.time() - started_at, 1),
+            "bytes_read":   bytes_read,
+            "errors_total": len(errors),
+        },
+    }
+
+
+@app.post("/admin/migration-probe-stream")
+async def admin_migration_probe_stream(request: Request, data: dict = Body(...)):
+    """诊断模式：探测源端 /admin/db-export-stream 是否可达，仅读前 64 KB 用于排错"""
+    if request.headers.get("X-Admin-Key", "") != ADMIN_KEY:
+        return JSONResponse(status_code=403, content={"error": "forbidden"})
+    source_url = (data.get("source_url") or "").rstrip("/")
+    source_key = data.get("source_admin_key") or ADMIN_KEY
+    if not source_url:
+        return JSONResponse(status_code=400, content={"error": "source_url required"})
+
+    timeout = httpx.Timeout(connect=15.0, read=30.0, write=15.0, pool=30.0)
+    try:
+        async with httpx.AsyncClient(verify=False, timeout=timeout) as client:
+            async with client.stream(
+                "GET",
+                f"{source_url}/admin/db-export-stream",
+                headers={"X-Admin-Key": source_key},
+            ) as resp:
+                preview = b""
+                async for chunk in resp.aiter_bytes(chunk_size=8192):
+                    preview += chunk
+                    if len(preview) >= 64 * 1024:
+                        break
+                return {
+                    "status_code":   resp.status_code,
+                    "headers":       dict(resp.headers),
+                    "body_preview":  preview[:64 * 1024].decode("utf-8", errors="replace"),
+                    "bytes_sampled": len(preview),
+                }
+    except Exception as e:
+        return JSONResponse(status_code=502, content={"error": f"{type(e).__name__}: {e}"})
 
 
 # ---- Partner API: contribution endpoints ----

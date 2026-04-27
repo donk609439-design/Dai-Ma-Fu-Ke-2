@@ -1,0 +1,806 @@
+# 数据迁移功能完整重构 — Replit Agent 工单
+
+直接复制下面整段给 Replit Agent。
+
+---
+
+## 📋 任务背景
+
+当前项目的数据迁移功能存在严重问题：
+1. **大数据无法直接拉取**：源端一次性 `SELECT *` 全部表加载到内存 + FastAPI 一次性 `json.dumps` 序列化 + 接收端一次性 `r.json()` → 79MB 数据就触发 OOM
+2. **超时**：现有 httpx 客户端 `timeout=120s`，大数据传输超时
+3. **前端崩溃**：79MB 字符串塞进 React state / textarea 直接卡死
+4. **覆盖不全**：现有 `_EXPORT_TABLES` 漏掉关键的 `jb_settings` 表（含 LOW 用户审计行），导致迁移后 LOW 用户能用旧备份解封自己
+
+## 🎯 重构目标
+
+**全部替换为 NDJSON 流式协议**，源端 PG cursor 边查边写，接收端 httpx.stream() 边读边 INSERT，**整条链路 Python 内存稳定 ~10MB**（无论数据量），支持 GB 级数据。**旧端点全部删除，不保留兼容**。
+
+---
+
+## ✅ 任务 1：删除所有旧迁移端点
+
+**文件**：`jetbrainsai2api/main.py`
+
+**删除以下函数及其 `@app.xxx` 装饰器**（保留三个常量 `_EXPORT_TABLES`、`_TABLE_CONFLICT_COL`、`_TABLE_CONFLICT_MULTI`）：
+
+| 函数名 | 大致行号 | 端点 |
+|---|---|---|
+| `admin_export_all` | ~5235 | `GET /admin/accounts/export-all` |
+| `admin_db_export` | ~11033 | `GET /admin/db-export` |
+| `admin_db_import` | ~11064 | `POST /admin/db-import` |
+| `admin_bulk_import` | （搜 `@app.post("/admin/accounts/bulk-import")`） | `POST /admin/accounts/bulk-import` |
+| `admin_extra_import` | ~5146 | `POST /admin/extra-import` |
+| `admin_extra_import_stream` | ~5171 | `POST /admin/extra-import-stream` |
+| `admin_import_from_source` | ~5414 | `POST /admin/accounts/import-from-source` |
+| `admin_migration_probe` | ~5357 | `POST /admin/migration-probe` |
+| `_do_extra_import` | （搜 `async def _do_extra_import`） | （辅助函数） |
+| `_do_bulk_import` | （搜 `async def _do_bulk_import`） | （辅助函数） |
+
+---
+
+## ✅ 任务 2：扩展 `_EXPORT_TABLES`，加入关键安全表
+
+**文件**：`jetbrainsai2api/main.py`，找到 `_EXPORT_TABLES = [` 列表（约 line 10987）
+
+**改动 A**：在列表里加入 `"jb_settings"`（紧跟在 `"jb_client_keys"` 后面）：
+
+```python
+_EXPORT_TABLES = [
+    "jb_accounts",
+    "jb_client_keys",
+    "jb_settings",                   # ★ 新加：LOW 用户审计行 + 全局配置（关键安全表）
+    "partner_client_config",
+    "partner_keys",
+    "partner_precheck_rejections",
+    "partner_api_audit",
+    "partner_idempotency",
+    "self_register_jobs",
+    "account_contributions",
+    "user_passwords",
+    "saint_points",
+    "saint_donations",
+    "donated_jb_accounts",
+    "pokeball_members",
+    "pokeballs",
+    "user_items",
+    "lottery_prizes",
+    "cf_proxy_pool",
+]
+```
+
+**改动 B**：在 `_TABLE_CONFLICT_COL` 字典里加入 `jb_settings` 的冲突键：
+
+```python
+_TABLE_CONFLICT_COL: dict[str, str] = {
+    "jb_accounts":                 "id",
+    "jb_client_keys":              "key",
+    "jb_settings":                 "key",           # ★ 新加
+    "partner_client_config":       "key",
+    "partner_keys":                "id",
+    "partner_precheck_rejections": "id",
+    "self_register_jobs":          "email",
+    "account_contributions":       "id",
+    "user_passwords":              "password",
+    "saint_points":                "password",
+    "saint_donations":             "account_id",
+    "donated_jb_accounts":         "jb_email",
+    "pokeballs":                   "ball_key",
+    "lottery_prizes":              "name",
+}
+```
+
+> **不迁移 jb_settings 的后果（必须修复）**：LOW 用户的 `low_audit:{discord_id}` 行存储 `last_usage_count / banned / banned_at`，是防止「用 ban 前备份导入解封自己」「用旧备份回滚配额」的关键防御。如果迁移时丢失这些行，所有 LOW 用户能在新实例上完成解封攻击。
+
+---
+
+## ✅ 任务 3：新增流式导出端点
+
+**文件**：`jetbrainsai2api/main.py`，在 `_EXPORT_TABLES` / `_TABLE_CONFLICT_COL` / `_TABLE_CONFLICT_MULTI` 三个常量声明**之后**追加：
+
+```python
+# ==================== 流式数据迁移（NDJSON）====================
+# 替代旧的一次性 export/import 端点，避免内存峰值和超时
+#
+# NDJSON 协议：每行一个独立 JSON 对象
+#   {"_meta":{"version":3,"exported_at":1730000000}}
+#   {"_table":"jb_accounts"}
+#   {<row1>}
+#   {<row2>}
+#   {"_table":"jb_client_keys"}
+#   {<row1>}
+#   {"_error":{"table":"xxx","error":"..."}}    可选错误行
+
+@app.get("/admin/db-export-stream")
+async def admin_db_export_stream(request: Request):
+    """流式导出全表为 NDJSON。响应体每行一个独立 JSON 对象。
+    
+    优势：服务端用 PG asyncpg cursor 边查边写，内存稳定 ~10MB（无论数据量）。
+    支持任意大数据量（GB 级也不会 OOM）。
+    """
+    if request.headers.get("X-Admin-Key", "") != ADMIN_KEY:
+        return JSONResponse(status_code=403, content={"detail": "仅完整管理员可使用数据迁移接口"})
+    pool = await _get_db_pool()
+    if not pool:
+        raise HTTPException(status_code=503, detail="DB unavailable")
+
+    async def stream_rows():
+        # 1. 元数据行
+        yield (json.dumps(
+            {"_meta": {"version": 3, "exported_at": int(time.time())}},
+            ensure_ascii=False,
+        ) + "\n").encode("utf-8")
+
+        # 2. 逐表流式输出
+        for table in _EXPORT_TABLES:
+            yield (json.dumps({"_table": table}, ensure_ascii=False) + "\n").encode("utf-8")
+            try:
+                # asyncpg cursor 必须在 transaction 内
+                async with pool.acquire() as conn:
+                    async with conn.transaction():
+                        async for row in conn.cursor(f'SELECT * FROM "{table}"', prefetch=1000):
+                            yield (json.dumps(
+                                dict(row),
+                                default=str,        # datetime/Decimal 自动转 str
+                                ensure_ascii=False,
+                            ) + "\n").encode("utf-8")
+            except Exception as e:
+                yield (json.dumps(
+                    {"_error": {"table": table, "error": str(e)[:300]}},
+                    ensure_ascii=False,
+                ) + "\n").encode("utf-8")
+
+    return StreamingResponse(
+        stream_rows(),
+        media_type="application/x-ndjson",
+        headers={
+            "Content-Disposition": f'attachment; filename="db-export-{int(time.time())}.ndjson"',
+            "X-Accel-Buffering":   "no",
+            "Cache-Control":       "no-cache",
+        },
+    )
+
+
+async def _upsert_one_row(conn, table: str, row: dict) -> None:
+    """单行 upsert 核心逻辑（被 db-import-stream 和 import-from-source-stream 复用）"""
+    cols = list(row.keys())
+    if not cols:
+        return
+    placeholders = ", ".join(f"${i+1}" for i in range(len(cols)))
+    col_names    = ", ".join(f'"{c}"' for c in cols)
+    values       = [row[c] for c in cols]
+
+    conflict_col   = _TABLE_CONFLICT_COL.get(table)
+    conflict_multi = _TABLE_CONFLICT_MULTI.get(table)
+
+    if conflict_multi and all(c in cols for c in conflict_multi):
+        target = "(" + ", ".join(f'"{c}"' for c in conflict_multi) + ")"
+        update_cols = [c for c in cols if c not in conflict_multi]
+        if update_cols:
+            set_clause = ", ".join(f'"{c}"=EXCLUDED."{c}"' for c in update_cols)
+            sql = (f'INSERT INTO "{table}" ({col_names}) VALUES ({placeholders}) '
+                   f'ON CONFLICT {target} DO UPDATE SET {set_clause}')
+        else:
+            sql = (f'INSERT INTO "{table}" ({col_names}) VALUES ({placeholders}) '
+                   f'ON CONFLICT {target} DO NOTHING')
+    elif conflict_col and conflict_col in cols:
+        update_cols = [c for c in cols if c != conflict_col]
+        if update_cols:
+            set_clause = ", ".join(f'"{c}"=EXCLUDED."{c}"' for c in update_cols)
+            sql = (f'INSERT INTO "{table}" ({col_names}) VALUES ({placeholders}) '
+                   f'ON CONFLICT ("{conflict_col}") DO UPDATE SET {set_clause}')
+        else:
+            sql = (f'INSERT INTO "{table}" ({col_names}) VALUES ({placeholders}) '
+                   f'ON CONFLICT ("{conflict_col}") DO NOTHING')
+    else:
+        sql = (f'INSERT INTO "{table}" ({col_names}) VALUES ({placeholders}) '
+               f'ON CONFLICT DO NOTHING')
+
+    await conn.execute(sql, *values)
+```
+
+---
+
+## ✅ 任务 4：新增「上传 NDJSON 文件」流式导入端点
+
+**文件**：`jetbrainsai2api/main.py`，紧接任务 3 的代码追加：
+
+```python
+@app.post("/admin/db-import-stream")
+async def admin_db_import_stream(request: Request):
+    """从请求体（NDJSON 流）流式 upsert 到当前 DB。
+    
+    用途：管理员手动下载 .ndjson 文件后通过浏览器上传，或脚本工具直接 PUT。
+    请求体格式同 /admin/db-export-stream 输出。
+    """
+    if request.headers.get("X-Admin-Key", "") != ADMIN_KEY:
+        return JSONResponse(status_code=403, content={"detail": "仅完整管理员可使用数据迁移接口"})
+    pool = await _get_db_pool()
+    if not pool:
+        raise HTTPException(status_code=503, detail="DB unavailable")
+
+    counts: Dict[str, int] = {}
+    errors: list = []
+    current_table: Optional[str] = None
+    bytes_read = 0
+    started_at = time.time()
+    BATCH_COMMIT = 500
+
+    buffer = b""
+    conn = await pool.acquire()
+    try:
+        tx = conn.transaction()
+        await tx.start()
+        rows_in_tx = 0
+
+        async for chunk in request.stream():
+            if not chunk:
+                continue
+            bytes_read += len(chunk)
+            buffer += chunk
+            while b"\n" in buffer:
+                line, buffer = buffer.split(b"\n", 1)
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception as e:
+                    errors.append(f"JSON parse: {type(e).__name__}: {line[:120]!r}")
+                    continue
+
+                if "_meta" in obj:
+                    continue
+                if "_table" in obj:
+                    tbl = obj["_table"]
+                    current_table = tbl if tbl in _EXPORT_TABLES else None
+                    if current_table:
+                        counts.setdefault(current_table, 0)
+                    continue
+                if "_error" in obj:
+                    errors.append(f"source error: {obj['_error']}")
+                    continue
+                if not current_table:
+                    continue
+                try:
+                    await _upsert_one_row(conn, current_table, obj)
+                    counts[current_table] = counts.get(current_table, 0) + 1
+                    rows_in_tx += 1
+                except Exception as e:
+                    errors.append(f"{current_table} row failed: {type(e).__name__}: {e}")
+
+                if rows_in_tx >= BATCH_COMMIT:
+                    await tx.commit()
+                    tx = conn.transaction()
+                    await tx.start()
+                    rows_in_tx = 0
+
+        # 处理 buffer 残留
+        if buffer.strip():
+            try:
+                obj = json.loads(buffer.strip())
+                if "_meta" not in obj and "_error" not in obj and "_table" not in obj and current_table:
+                    await _upsert_one_row(conn, current_table, obj)
+                    counts[current_table] = counts.get(current_table, 0) + 1
+            except Exception as e:
+                errors.append(f"tail line failed: {e}")
+
+        await tx.commit()
+    except Exception as e:
+        try: await tx.rollback()
+        except: pass
+        return JSONResponse(status_code=500, content={
+            "error": f"导入失败: {type(e).__name__}: {e}",
+            "imported_so_far": counts,
+            "bytes_read": bytes_read,
+        })
+    finally:
+        await pool.release(conn)
+
+    # 重新加载内存
+    try: await load_accounts_from_db()
+    except: pass
+    try: await load_keys_from_db()
+    except: pass
+    try: await load_cf_proxies_from_db()
+    except: pass
+
+    if counts.get("jb_accounts", 0) > 0:
+        try:
+            async with pool.acquire() as conn2:
+                rows = await conn2.fetch(
+                    "SELECT id FROM jb_accounts WHERE COALESCE(last_quota_check, 0) = 0 LIMIT 5000"
+                )
+                _schedule_quota_checks_for_ids({r["id"] for r in rows}, label="db-import-stream入池检测")
+        except Exception:
+            pass
+
+    return {
+        "success":  True,
+        "imported": counts,
+        "errors":   errors[:50],
+        "stats": {
+            "elapsed_sec":  round(time.time() - started_at, 1),
+            "bytes_read":   bytes_read,
+            "errors_total": len(errors),
+        },
+    }
+```
+
+---
+
+## ✅ 任务 5：新增「从源端流式拉取」端点 + 探测器
+
+**文件**：`jetbrainsai2api/main.py`，紧接任务 4 的代码追加：
+
+```python
+@app.post("/admin/import-from-source-stream")
+async def admin_import_from_source_stream(request: Request, data: dict = Body(...)):
+    """从源端 /admin/db-export-stream 流式拉取并导入。
+    
+    请求体：{ "source_url": "https://xxx.replit.dev", "source_admin_key": "xxx" }
+    
+    关键：read timeout=15 分钟、内存稳定 ~10MB、每 500 行 commit 一次。
+    """
+    if request.headers.get("X-Admin-Key", "") != ADMIN_KEY:
+        return JSONResponse(status_code=403, content={"detail": "仅完整管理员可使用数据迁移接口"})
+    source_url = (data.get("source_url") or "").rstrip("/")
+    source_key = data.get("source_admin_key") or ADMIN_KEY
+    if not source_url:
+        return JSONResponse(status_code=400, content={"error": "source_url required"})
+
+    pool = await _get_db_pool()
+    if not pool:
+        raise HTTPException(status_code=503, detail="DB unavailable")
+
+    counts: Dict[str, int] = {}
+    errors: list = []
+    current_table: Optional[str] = None
+    started_at = time.time()
+    bytes_read = 0
+    BATCH_COMMIT = 500
+
+    timeout = httpx.Timeout(connect=30.0, read=900.0, write=30.0, pool=300.0)
+    async with httpx.AsyncClient(verify=False, timeout=timeout) as client:
+        try:
+            async with client.stream(
+                "GET",
+                f"{source_url}/admin/db-export-stream",
+                headers={"X-Admin-Key": source_key},
+            ) as resp:
+                if resp.status_code != 200:
+                    body_preview = await resp.aread()
+                    return JSONResponse(status_code=502, content={
+                        "error": f"源端返回 HTTP {resp.status_code}",
+                        "body":  body_preview[:500].decode("utf-8", errors="replace"),
+                    })
+
+                conn = await pool.acquire()
+                try:
+                    tx = conn.transaction()
+                    await tx.start()
+                    rows_in_tx = 0
+
+                    async for line in resp.aiter_lines():
+                        if not line or not line.strip():
+                            continue
+                        bytes_read += len(line) + 1
+                        try:
+                            obj = json.loads(line)
+                        except Exception as e:
+                            errors.append(f"JSON parse: {type(e).__name__}: {line[:120]}")
+                            continue
+
+                        if "_meta" in obj:
+                            continue
+                        if "_table" in obj:
+                            tbl = obj["_table"]
+                            current_table = tbl if tbl in _EXPORT_TABLES else None
+                            if current_table:
+                                counts.setdefault(current_table, 0)
+                            continue
+                        if "_error" in obj:
+                            errors.append(f"source error: {obj['_error']}")
+                            continue
+                        if not current_table:
+                            continue
+                        try:
+                            await _upsert_one_row(conn, current_table, obj)
+                            counts[current_table] = counts.get(current_table, 0) + 1
+                            rows_in_tx += 1
+                        except Exception as e:
+                            errors.append(f"{current_table} row failed: {type(e).__name__}: {e}")
+
+                        if rows_in_tx >= BATCH_COMMIT:
+                            await tx.commit()
+                            tx = conn.transaction()
+                            await tx.start()
+                            rows_in_tx = 0
+
+                    await tx.commit()
+                finally:
+                    await pool.release(conn)
+
+        except httpx.ReadTimeout:
+            return JSONResponse(status_code=504, content={
+                "error": "源端响应读超时（>15 分钟），可能数据量过大或网络中断",
+                "imported_so_far": counts,
+                "bytes_read": bytes_read,
+            })
+        except Exception as e:
+            return JSONResponse(status_code=500, content={
+                "error": f"流式拉取失败: {type(e).__name__}: {e}",
+                "imported_so_far": counts,
+                "bytes_read": bytes_read,
+            })
+
+    try: await load_accounts_from_db()
+    except: pass
+    try: await load_keys_from_db()
+    except: pass
+    try: await load_cf_proxies_from_db()
+    except: pass
+
+    if counts.get("jb_accounts", 0) > 0:
+        try:
+            async with pool.acquire() as conn2:
+                rows = await conn2.fetch(
+                    "SELECT id FROM jb_accounts WHERE COALESCE(last_quota_check, 0) = 0 LIMIT 5000"
+                )
+                _schedule_quota_checks_for_ids({r["id"] for r in rows}, label="stream-import入池检测")
+        except Exception:
+            pass
+
+    return {
+        "success":  True,
+        "imported": counts,
+        "errors":   errors[:50],
+        "stats": {
+            "elapsed_sec":  round(time.time() - started_at, 1),
+            "bytes_read":   bytes_read,
+            "errors_total": len(errors),
+        },
+    }
+
+
+@app.post("/admin/migration-probe-stream")
+async def admin_migration_probe_stream(request: Request, data: dict = Body(...)):
+    """诊断模式：探测源端 /admin/db-export-stream 是否可达，仅读前 64 KB 用于排错"""
+    if request.headers.get("X-Admin-Key", "") != ADMIN_KEY:
+        return JSONResponse(status_code=403, content={"error": "forbidden"})
+    source_url = (data.get("source_url") or "").rstrip("/")
+    source_key = data.get("source_admin_key") or ADMIN_KEY
+    if not source_url:
+        return JSONResponse(status_code=400, content={"error": "source_url required"})
+
+    timeout = httpx.Timeout(connect=15.0, read=30.0, write=15.0, pool=30.0)
+    try:
+        async with httpx.AsyncClient(verify=False, timeout=timeout) as client:
+            async with client.stream(
+                "GET",
+                f"{source_url}/admin/db-export-stream",
+                headers={"X-Admin-Key": source_key},
+            ) as resp:
+                preview = b""
+                async for chunk in resp.aiter_bytes(chunk_size=8192):
+                    preview += chunk
+                    if len(preview) >= 64 * 1024:
+                        break
+                return {
+                    "status_code":   resp.status_code,
+                    "headers":       dict(resp.headers),
+                    "body_preview":  preview[:64 * 1024].decode("utf-8", errors="replace"),
+                    "bytes_sampled": len(preview),
+                }
+    except Exception as e:
+        return JSONResponse(status_code=502, content={"error": f"{type(e).__name__}: {e}"})
+```
+
+---
+
+## ✅ 任务 6：前端迁移 UI 完整重写
+
+**文件**：找到当前迁移 UI 所在页面（应该在 `artifacts/admin-panel/src/pages/Accounts.tsx` 或类似页面），定位现有的"导出/导入/从源端拉取"区块。
+
+**删除**所有调用以下旧端点的代码：
+- `/admin/accounts/export-all`
+- `/admin/db-export`
+- `/admin/db-import`
+- `/admin/accounts/bulk-import`
+- `/admin/extra-import`
+- `/admin/extra-import-stream`
+- `/admin/accounts/import-from-source`
+- `/admin/migration-probe`
+
+**替换为以下三块 UI**（用 shadcn/ui 风格）：
+
+```tsx
+import { useState, useRef } from "react";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { useToast } from "@/hooks/use-toast";
+import { getAdminKey } from "@/lib/admin-auth";
+
+function MigrationPanel() {
+  const { toast } = useToast();
+  const [sourceUrl, setSourceUrl] = useState("");
+  const [sourceKey, setSourceKey] = useState("");
+  const [downloading, setDownloading] = useState(false);
+  const [uploading,   setUploading]   = useState(false);
+  const [pulling,     setPulling]     = useState(false);
+  const [probeResult, setProbeResult] = useState("");
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // 1. 流式下载完整数据
+  async function handleStreamExport() {
+    setDownloading(true);
+    try {
+      const r = await fetch("/admin/db-export-stream", {
+        headers: { "X-Admin-Key": getAdminKey() ?? "" },
+      });
+      if (!r.ok) throw new Error(`HTTP ${r.status}: ${await r.text()}`);
+      const blob = await r.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `db-export-${Date.now()}.ndjson`;
+      a.click();
+      URL.revokeObjectURL(url);
+      toast({ title: "下载完成", description: `${(blob.size / 1024 / 1024).toFixed(1)} MB` });
+    } catch (e: any) {
+      toast({ title: "下载失败", description: String(e), variant: "destructive" });
+    } finally {
+      setDownloading(false);
+    }
+  }
+
+  // 2. 流式上传 NDJSON 文件
+  async function handleUpload(file: File) {
+    if (!confirm(`将上传 ${(file.size / 1024 / 1024).toFixed(1)} MB 数据并 upsert 到当前实例。继续？`)) return;
+    setUploading(true);
+    try {
+      const r = await fetch("/admin/db-import-stream", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-ndjson",
+          "X-Admin-Key":  getAdminKey() ?? "",
+        },
+        body: file,
+        // @ts-expect-error: duplex 是 fetch 流式上传必须
+        duplex: "half",
+      });
+      const data = await r.json();
+      if (!r.ok || !data.success) throw new Error(data.error || `HTTP ${r.status}`);
+      const total = Object.values<number>(data.imported).reduce((a, b) => a + b, 0);
+      toast({
+        title: "导入成功",
+        description: `共 ${total} 行 / 耗时 ${data.stats.elapsed_sec}s / ${(data.stats.bytes_read / 1024 / 1024).toFixed(1)} MB`,
+      });
+    } catch (e: any) {
+      toast({ title: "导入失败", description: String(e), variant: "destructive" });
+    } finally {
+      setUploading(false);
+      if (fileInputRef.current) fileInputRef.current.value = "";
+    }
+  }
+
+  // 3. 从源端流式拉取
+  async function handleStreamPull() {
+    if (!sourceUrl || !sourceKey) {
+      toast({ title: "请填写源端 URL 和 Admin Key", variant: "destructive" });
+      return;
+    }
+    if (!confirm("将从源端拉取所有数据并 upsert 到当前实例。继续？")) return;
+    setPulling(true);
+    try {
+      const r = await fetch("/admin/import-from-source-stream", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Admin-Key": getAdminKey() ?? "" },
+        body: JSON.stringify({ source_url: sourceUrl, source_admin_key: sourceKey }),
+      });
+      const data = await r.json();
+      if (!r.ok || !data.success) throw new Error(data.error || `HTTP ${r.status}`);
+      const total = Object.values<number>(data.imported).reduce((a, b) => a + b, 0);
+      toast({
+        title: "拉取完成",
+        description: `共 ${total} 行 / 耗时 ${data.stats.elapsed_sec}s / ${(data.stats.bytes_read / 1024 / 1024).toFixed(1)} MB`,
+      });
+    } catch (e: any) {
+      toast({ title: "拉取失败", description: String(e), variant: "destructive" });
+    } finally {
+      setPulling(false);
+    }
+  }
+
+  // 4. 探测源端
+  async function handleProbe() {
+    setProbeResult("正在探测...");
+    try {
+      const r = await fetch("/admin/migration-probe-stream", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Admin-Key": getAdminKey() ?? "" },
+        body: JSON.stringify({ source_url: sourceUrl, source_admin_key: sourceKey }),
+      });
+      const data = await r.json();
+      setProbeResult(JSON.stringify(data, null, 2));
+    } catch (e: any) {
+      setProbeResult(`错误：${String(e)}`);
+    }
+  }
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>数据迁移（流式 NDJSON）</CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-6">
+        {/* 块 1：下载本实例完整数据 */}
+        <div>
+          <h3 className="font-semibold mb-2">📥 下载本实例完整数据</h3>
+          <Button onClick={handleStreamExport} disabled={downloading}>
+            {downloading ? "下载中..." : "下载 NDJSON 文件"}
+          </Button>
+          <p className="text-xs text-muted-foreground mt-2">
+            包含 19 张表全部字段（账号 / Key / LOW 审计 / CF 池 / 抽奖 / 积分 / 合作伙伴等）
+          </p>
+        </div>
+
+        {/* 块 2：上传 NDJSON 文件导入 */}
+        <div>
+          <h3 className="font-semibold mb-2">📤 上传 NDJSON 文件导入</h3>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept=".ndjson,.json"
+            onChange={(e) => e.target.files?.[0] && handleUpload(e.target.files[0])}
+            disabled={uploading}
+            className="block w-full text-sm"
+          />
+          <p className="text-xs text-muted-foreground mt-2">
+            {uploading ? "上传中（流式处理，不在浏览器内存累积）..." : "支持任意大小文件，浏览器流式提交"}
+          </p>
+        </div>
+
+        {/* 块 3：从源端流式拉取 */}
+        <div>
+          <h3 className="font-semibold mb-2">🔄 从源端流式拉取</h3>
+          <div className="space-y-2">
+            <div>
+              <Label>源端 URL</Label>
+              <Input
+                value={sourceUrl}
+                onChange={(e) => setSourceUrl(e.target.value)}
+                placeholder="https://xxx.replit.dev"
+              />
+            </div>
+            <div>
+              <Label>源端 Admin Key</Label>
+              <Input
+                type="password"
+                value={sourceKey}
+                onChange={(e) => setSourceKey(e.target.value)}
+              />
+            </div>
+            <div className="flex gap-2">
+              <Button onClick={handleStreamPull} disabled={pulling}>
+                {pulling ? "拉取中..." : "🚀 流式拉取"}
+              </Button>
+              <Button onClick={handleProbe} variant="outline">探测源端</Button>
+            </div>
+          </div>
+          {probeResult && (
+            <pre className="mt-3 p-3 bg-muted text-xs overflow-auto max-h-64 rounded">
+              {probeResult}
+            </pre>
+          )}
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+```
+
+把这个 `<MigrationPanel />` 组件挂到原来迁移 UI 的位置。
+
+---
+
+## 🎯 验证方法
+
+部署后必须用以下场景验证：
+
+```
+□ 1. 接收实例和源实例都已升级到新代码
+□ 2. 接收实例打开管理面板 → "数据迁移" → 点"探测源端"
+     → 应返回 status_code=200 + body_preview 含 {"_meta":...} 行
+□ 3. 点"流式拉取" → 等待完成
+     → 检查返回的 imported 计数 / errors 列表
+     → 检查 jb_settings 计数 > 0（关键安全表已迁移）
+□ 4. 检查 Python 进程内存：
+     - 迁移过程中峰值不超过 +50MB
+     - 迁移结束后回到稳定值
+□ 5. 用大数据量验证（建议 ≥100MB）：
+     - 下载 → 上传 → 不报错、不 OOM
+□ 6. 跨实例验证：
+     - 接收实例的账号数、Key 数与源端一致
+     - LOW 用户登录 Discord 后能看到 personal key + 余额
+     - /admin/pending-nc 排队记录可见
+     - /admin/cf-proxies 主池 + LOW 子池均可见
+```
+
+---
+
+## ⚠️ 部署纪律（必须严格执行）
+
+由于旧端点全部删除，**两端必须同版本**。建议步骤：
+
+```
+1. 先停接收实例的客户端流量（如 Cloudflare 临时维护页）
+2. 升级接收实例 → 启动 → 等 _ensure_db_tables 跑完
+3. 升级源实例 → 启动
+4. 接收实例打开管理面板 → "🚀 流式拉取" → 等待完成
+5. 验证（见上面 6 步）
+6. 把客户端流量切到接收实例
+```
+
+如果两端不同版本：旧端点已不存在 → 接收端调旧端点 404 → 迁移直接失败。
+
+---
+
+## 📊 改动后的端点完整清单
+
+```
+✅ GET  /admin/db-export-stream            # 流式导出（管理员）
+✅ POST /admin/db-import-stream            # 流式上传 NDJSON（管理员）
+✅ POST /admin/import-from-source-stream   # 流式从源端拉取（管理员）
+✅ POST /admin/migration-probe-stream      # 探测源端（管理员）
+
+❌ 已删除：8 个旧端点
+   - GET  /admin/accounts/export-all
+   - GET  /admin/db-export
+   - POST /admin/db-import
+   - POST /admin/accounts/bulk-import
+   - POST /admin/extra-import
+   - POST /admin/extra-import-stream
+   - POST /admin/accounts/import-from-source
+   - POST /admin/migration-probe
+```
+
+---
+
+## 📋 改动覆盖的数据范围（19 张表）
+
+新端点用 `SELECT *` 自动包含每张表的全部字段：
+
+```
+1.  jb_accounts                    — JetBrains 账号池（含 pending_nc_*）
+2.  jb_client_keys                 — API Key 池（含 LOW 标签 / Discord ID）
+3.  jb_settings                    — ★ LOW 用户审计行 + 全局配置（关键安全）
+4.  partner_client_config          — 合作伙伴客户端推送配置
+5.  partner_keys                   — 合作伙伴 API Key
+6.  partner_precheck_rejections    — 合作伙伴预检拒绝
+7.  partner_api_audit              — 合作伙伴 API 审计
+8.  partner_idempotency            — 合作伙伴幂等键
+9.  self_register_jobs             — 自助注册任务
+10. account_contributions          — 投稿账号
+11. user_passwords                 — 用户密码（DC 绑定）
+12. saint_points                   — 圣堂积分
+13. saint_donations                — 捐献记录
+14. donated_jb_accounts            — 捐赠的 JB 账号
+15. pokeball_members               — 精灵球成员
+16. pokeballs                      — 精灵球
+17. user_items                     — 用户背包
+18. lottery_prizes                 — 抽奖奖品池
+19. cf_proxy_pool                  — CF 代理池（主 + LOW 子池）
+```
+
+**不会迁移的内容**（设计预期）：
+- 内存数据（`_call_logs`、`_DISCORD_VERIFIED`、`_activate_tasks` 等）
+- 配置文件（`jetbrainsai.json` 等需手动 scp）
+- 环境变量（`ADMIN_KEY`、`SESSION_SECRET` 等需手动配置）
+- `dc_activate_limits`（每日激活限额，按天滚动不需要迁移）
+
+---
+
+完成。把这份完整工单复制给 Replit Agent。

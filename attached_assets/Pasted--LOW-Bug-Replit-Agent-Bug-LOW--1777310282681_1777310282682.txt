@@ -1,0 +1,342 @@
+# 工单：修复 LOW 用户激活挤占普通用户激活的 Bug
+
+直接复制下面整段给 Replit Agent。
+
+---
+
+## 📋 Bug 背景
+
+**症状**：LOW 用户启动批量激活（如 50 个账号）时，**同一时刻**普通用户/admin 调用 `/admin/activate` 单激活会卡顿、超时或 503。
+
+**根因**：虽然主激活池（`_activate_executor`，max=5）和 LOW 池（`_get_low_executor`，per-Discord）在 ThreadPoolExecutor 层面已隔离，但**两者共享同一个 DB 连接池**（`asyncpg.create_pool(max_size=20)`，main.py:674）。LOW 用户批量激活的每个 task 在 `admin_activate_stream` 中会写 5-10 次 DB（INSERT 账号、UPSERT key、UPDATE pending_nc 等），8 个并发 task 瞬时吃掉 8-24 个 DB 连接，几乎占满 20 个上限。普通用户的 DB 操作在 `pool.acquire()` 排队等待 → 卡顿/超时。
+
+**修复核心**：**拆 DB 池**，主池给普通用户/admin/后台任务/chat 路径用，独立的 LOW 池给低管理员激活流程用。两池物理隔离，互不抢占。
+
+---
+
+## ✅ 改动 1：拆分 DB 连接池
+
+**文件**：`jetbrainsai2api/main.py`
+
+**位置**：找到 `DB_POOL` 全局变量声明（约 line 670）和 `_get_db_pool` 函数（约 line 674）。
+
+**改动**：替换为：
+
+```python
+DB_POOL: Optional[asyncpg.Pool] = None       # 主池：普通用户 / admin / 后台任务 / chat
+DB_POOL_LOW: Optional[asyncpg.Pool] = None   # LOW 专用池：低管理员激活流程
+
+async def _get_db_pool() -> Optional[asyncpg.Pool]:
+    """主连接池（普通用户 + admin + 后台任务 + chat 路径使用）"""
+    global DB_POOL
+    if DB_POOL is None and DATABASE_URL:
+        try:
+            DB_POOL = await asyncpg.create_pool(
+                DATABASE_URL,
+                min_size=2,
+                max_size=15,                # ★ 从 20 降到 15，给 LOW 池让出空间
+                command_timeout=60,
+                statement_cache_size=0,
+            )
+        except Exception as e:
+            print(f"[DB] 主池初始化失败: {e}")
+            return None
+    return DB_POOL
+
+
+async def _get_low_db_pool() -> Optional[asyncpg.Pool]:
+    """LOW 专用连接池：所有 is_low_admin=True 路径必须使用此池。
+    
+    与主池物理隔离：LOW 用户大批量激活无论吃多少连接都不会影响普通用户/admin/chat。
+    """
+    global DB_POOL_LOW
+    if DB_POOL_LOW is None and DATABASE_URL:
+        try:
+            DB_POOL_LOW = await asyncpg.create_pool(
+                DATABASE_URL,
+                min_size=1,
+                max_size=8,                 # ★ LOW 路径最多吃 8 个连接
+                command_timeout=60,
+                statement_cache_size=0,
+            )
+        except Exception as e:
+            print(f"[DB] LOW 池初始化失败: {e}")
+            return None
+    return DB_POOL_LOW
+```
+
+---
+
+## ✅ 改动 2：shutdown 关闭 LOW 池
+
+**文件**：`jetbrainsai2api/main.py`，找到 `async def shutdown():` 函数。
+
+**改动**：在现有的 `if DB_POOL is not None: await DB_POOL.close()` **之后**追加：
+
+```python
+# 关闭 LOW 专用池
+if DB_POOL_LOW is not None:
+    try: await DB_POOL_LOW.close()
+    except Exception: pass
+```
+
+---
+
+## ✅ 改动 3：辅助函数加 `pool` 参数
+
+**文件**：`jetbrainsai2api/main.py`
+
+LOW 路径的写库函数当前内部直接 `await _get_db_pool()`，绕过池路由。给以下两个核心函数加可选 `pool` 参数：
+
+### 3a. `_save_account_to_db`
+
+**位置**：搜 `async def _save_account_to_db`
+
+**改动**：函数签名和开头改为：
+
+```python
+async def _save_account_to_db(account: dict, pool: Optional[asyncpg.Pool] = None):
+    if pool is None:
+        pool = await _get_db_pool()
+    if not pool:
+        return
+    # ★ 后续代码用 pool 而不是再次调用 _get_db_pool()
+    # 把函数内部所有 _get_db_pool() 删掉，统一用入参 pool
+```
+
+### 3b. `_upsert_key_to_db`
+
+**位置**：搜 `async def _upsert_key_to_db`
+
+**改动**：
+
+```python
+async def _upsert_key_to_db(key: str, meta: dict, pool: Optional[asyncpg.Pool] = None):
+    if pool is None:
+        pool = await _get_db_pool()
+    if not pool:
+        return
+    # 函数内部已有的 pool 操作不变；删掉内部的 _get_db_pool() 调用，使用入参
+```
+
+### 3c. `_delete_key_from_db`（同样处理）
+
+```python
+async def _delete_key_from_db(key: str, pool: Optional[asyncpg.Pool] = None):
+    if pool is None:
+        pool = await _get_db_pool()
+    if not pool:
+        return
+    # ...
+```
+
+> 注意：`_add_low_quota` 已经接受 pool 参数，不需改。
+
+---
+
+## ✅ 改动 4：`admin_activate_stream` 按身份路由 DB 池
+
+**文件**：`jetbrainsai2api/main.py`，找到 `async def admin_activate_stream(task_id: str):`（约 line 8677）
+
+**改动**：在 `event_generator` 函数体最开头（取 `_personal_key` 后），加池路由辅助函数：
+
+```python
+async def admin_activate_stream(task_id: str):
+    if task_id not in _activate_tasks:
+        raise HTTPException(status_code=404, detail="任务不存在")
+
+    task = _activate_tasks[task_id]
+    log_queue: queue.Queue = task["log_queue"]
+
+    async def event_generator():
+        _personal_key = task.get("personal_key", "") or ""
+        
+        # ★ 新增：LOW 用户路径的所有 DB 操作走 LOW 池
+        _is_low_task = bool(task.get("is_low_admin"))
+        async def _get_pool_for_task():
+            """LOW 任务用 LOW 池，其余用主池"""
+            return await _get_low_db_pool() if _is_low_task else await _get_db_pool()
+        
+        # ... 后续 _discard_preissued / 流式逻辑保持原样
+```
+
+**然后**在该函数内部把**所有** `await _get_db_pool()` 调用替换为 `await _get_pool_for_task()`：
+
+具体替换点（按出现顺序）：
+- `_db_pool = await _get_db_pool()` → `_db_pool = await _get_pool_for_task()`
+- `_db2 = await _get_db_pool()`（多处） → `_db2 = await _get_pool_for_task()`
+- `_db3 = await _get_db_pool()` → `_db3 = await _get_pool_for_task()`
+- `_dup_db = await _get_db_pool()` → `_dup_db = await _get_pool_for_task()`
+- `_cdb = await _get_db_pool()`（_discard_preissued 内） → `_cdb = await _get_pool_for_task()`
+
+**同时**：调用 `_save_account_to_db(new_account)` 改成 `_save_account_to_db(new_account, pool=await _get_pool_for_task())`；其他对辅助函数的调用同理传 pool。
+
+---
+
+## ✅ 改动 5：`_retry_pending_nc_lids` 后台任务按行身份分池
+
+**文件**：`jetbrainsai2api/main.py`，找到 `async def _retry_pending_nc_lids():`
+
+**改动**：现有循环内部对 jb_accounts 行做 UPDATE 时，用 `row.get("pending_nc_low_admin")` 选池：
+
+```python
+# 在循环处理每一行时：
+async def _process_one_pending_row(row):
+    is_low_row = bool(row.get("pending_nc_low_admin"))
+    pool = await _get_low_db_pool() if is_low_row else await _get_db_pool()
+    if not pool:
+        return
+    async with pool.acquire() as conn:
+        # ... 原有写库逻辑
+```
+
+把现有循环里的 `pool = await _get_db_pool()` 改成上述按行身份选池。
+
+> **如果代码现状是先批量取所有 pending 行再循环**，可以**两步**：
+> 1. 先用主池一次性 SELECT 出所有 pending 行（读操作不挤占）
+> 2. 再循环处理每一行时按 `is_low_row` 选池写库
+
+---
+
+## ✅ 改动 6：LOW 并发硬上限从 50 降到 10
+
+**文件**：`jetbrainsai2api/main.py`，找到 `admin_low_config_patch` 函数
+
+**改动**：把并发上限校验改为：
+
+```python
+@app.patch("/admin/low-config")
+async def admin_low_config_patch(req: LowConfigPatch, request: Request):
+    # 鉴权部分保持原样
+    
+    val = int(req.concurrency or 0)
+    if val < 1 or val > 10:                # ★ 从 50 降到 10
+        raise HTTPException(
+            status_code=400,
+            detail="并发数必须在 1-10 之间（防止挤占主池资源）"
+        )
+    # 其余逻辑不变
+```
+
+**同时**改 `_load_low_admin_settings` 加 clamp：
+
+```python
+async def _load_low_admin_settings():
+    global _low_admin_concurrency
+    # ... 现有的 SELECT 逻辑 ...
+    val = int(row["v"]) if row else 3
+    val = max(1, min(val, 10))                 # ★ 启动时若 DB 里残留 >10 的旧值，clamp 到 10
+    _low_admin_concurrency = val
+```
+
+---
+
+## ✅ 改动 7：`/admin/status` 加 DB 池监控
+
+**文件**：`jetbrainsai2api/main.py`，找到 `async def admin_status(request: Request):`
+
+**改动**：在返回字典里加：
+
+```python
+return {
+    # ... 现有字段 ...
+    "db_pool_main": {
+        "size":  DB_POOL.get_size() if DB_POOL else 0,
+        "free":  DB_POOL.get_idle_size() if DB_POOL else 0,
+        "max":   15,
+    } if DB_POOL else None,
+    "db_pool_low": {
+        "size":  DB_POOL_LOW.get_size() if DB_POOL_LOW else 0,
+        "free":  DB_POOL_LOW.get_idle_size() if DB_POOL_LOW else 0,
+        "max":   8,
+    } if DB_POOL_LOW else None,
+}
+```
+
+---
+
+## ✅ 改动 8（可选）：前端 Dashboard 显示池占用
+
+**文件**：`artifacts/admin-panel/src/pages/Dashboard.tsx`
+
+**改动**：在管理员视图的状态卡片区加两个进度条：
+
+```tsx
+{status?.db_pool_main && (
+  <Card>
+    <CardHeader>
+      <CardTitle className="text-sm">主 DB 连接池</CardTitle>
+    </CardHeader>
+    <CardContent>
+      <Progress value={(status.db_pool_main.size - status.db_pool_main.free) / status.db_pool_main.max * 100} />
+      <p className="text-xs text-muted-foreground mt-1">
+        {status.db_pool_main.size - status.db_pool_main.free} / {status.db_pool_main.max} 使用中
+      </p>
+    </CardContent>
+  </Card>
+)}
+
+{status?.db_pool_low && (
+  <Card>
+    <CardHeader>
+      <CardTitle className="text-sm">LOW DB 连接池</CardTitle>
+    </CardHeader>
+    <CardContent>
+      <Progress value={(status.db_pool_low.size - status.db_pool_low.free) / status.db_pool_low.max * 100} />
+      <p className="text-xs text-muted-foreground mt-1">
+        {status.db_pool_low.size - status.db_pool_low.free} / {status.db_pool_low.max} 使用中
+      </p>
+    </CardContent>
+  </Card>
+)}
+```
+
+---
+
+## 🎯 验证方法
+
+部署后必须用以下场景验证：
+
+```
+□ 1. 启动 Python，看日志确认两个 DB 池都成功创建
+□ 2. 调 /admin/status 检查返回的 db_pool_main 和 db_pool_low 字段
+     - 都应显示 size > 0 且 max 分别为 15 和 8
+
+□ 3. 挤占测试（核心验证）：
+     - LOW 用户调 /admin/low-config 把 concurrency 设为 8
+     - LOW 用户调 /admin/activate-batch 启动 50 账号批量激活
+     - **同一时刻**普通用户调 /admin/activate 启动单激活
+     - 普通用户的激活应**不卡顿**，立刻看到流式日志
+
+□ 4. 池占用观察：
+     - 批量激活进行时调 /admin/status
+     - db_pool_low.size - db_pool_low.free 应接近 8（满载）
+     - db_pool_main.size - db_pool_main.free 应远小于 15（不被 LOW 影响）
+
+□ 5. LOW 并发硬上限：
+     - 调 /admin/low-config patch concurrency=20
+     - 应返回 400 + "并发数必须在 1-10 之间"
+
+□ 6. 旧配置兼容：
+     - 在 jb_settings 表里手动写 low_admin_concurrency=30
+     - 重启 Python
+     - 加载后 _low_admin_concurrency 应被 clamp 到 10
+```
+
+---
+
+## ⚠️ 部署注意事项
+
+1. **PG 总连接数**：DB 连接从原来的 max=20 拆成 15+8=23 个，PostgreSQL 默认 `max_connections=100`，无压力。Replit 的 PG 或托管 DB 请确认上限。
+
+2. **不破坏现有数据**：本工单所有改动**不动 schema**、**不改 SQL**，只重新分配连接池。零数据风险。
+
+3. **回滚**：如出问题，所有改动可一键回滚（恢复 `_get_db_pool` 为原版、删 `_get_low_db_pool`）。
+
+4. **与其他工单的关系**：本工单**完全独立**，可与之前的 8 个 P0/P1/P2 任务、6 个数据迁移任务并行实施，互不冲突。
+
+---
+
+## 给 Replit Agent 的一句话指令
+
+> "请实施工单 8 个改动：①拆分 DB 连接池（主池 max=15，LOW 池 max=8）；②shutdown 时关闭 LOW 池；③`_save_account_to_db` / `_upsert_key_to_db` / `_delete_key_from_db` 加 `pool` 可选参数；④`admin_activate_stream` 按 `task.is_low_admin` 路由 DB 池，所有内部 `_get_db_pool()` 调用替换为 `_get_pool_for_task()`；⑤`_retry_pending_nc_lids` 按 `row.pending_nc_low_admin` 选池；⑥`/admin/low-config` 并发上限从 50 降到 10，`_load_low_admin_settings` 加启动 clamp；⑦`/admin/status` 返回 db_pool_main / db_pool_low 监控字段；⑧可选：Dashboard 前端加两个池占用进度条。完成后用 LOW 批量激活 50 + 普通用户同时单激活验证不再挤占。"

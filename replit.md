@@ -276,3 +276,45 @@ LOW_ADMIN_KEY users get a separate, isolated activation flow with their own per-
    - `DELETE /admin/logs`：先 DELETE 数据库行，再清内存 deque（admin 全量 / LOW 按 discord_id 分隔）。
 
 - **管理员整库迁移导出/导入补齐 `low_admin_discord_id`** — `/admin/accounts/export-all` 与 `_do_bulk_import`（被 `/admin/accounts/bulk-import` 与 `/admin/accounts/import-from-source` 复用）此前只携带 `is_low_admin_key`，漏掉 `low_admin_discord_id`，导致服务器迁移后所有 LOW key 都被前端归到「未知」分组里。现在导出 SQL 增加 `COALESCE(low_admin_discord_id, '') as low_admin_discord_id`，导出 JSON 多出该字段；`_do_bulk_import` 的 INSERT SQL 增加该列与 `$9` 参数，行构造从 payload 读 `low_admin_discord_id`，ON CONFLICT 用 `COALESCE(NULLIF(EXCLUDED.low_admin_discord_id,''), jb_client_keys.low_admin_discord_id)` 保证 upsert 不会用空值覆盖已有归属。注：LOW 用户的个人 key 单独导出/导入端点（`/admin/low-user-key/export|import`）不需要改 — 导入时已强制用调用者验证过的 Discord ID 写 `low_admin_discord_id`，不依赖备份文件里的字段（更安全）。Roundtrip 验证：导出 2 把 LOW key → 重新导入 → `/admin/keys` 显示 Discord ID 完整保留（`'1382720893633171578'` 与空串均正确）。
+
+## 数据迁移重构（2026-04-27，流式 NDJSON）
+
+### 后端重构（main.py）
+
+删除全部旧的一次性迁移端点（共 785 行 + 99 行残留）：
+- `_do_extra_import`、`_do_bulk_import`、`admin_bulk_import`
+- `admin_extra_import`、`admin_extra_import_stream`、`admin_export_all`
+- `admin_migration_probe`、`admin_import_from_source`
+- 旧的 `admin_db_export`、`admin_db_import`
+
+新增 5 个流式端点与辅助函数：
+1. **`GET /admin/db-export-stream`** — asyncpg cursor 边查边写 NDJSON，内存稳定 ~10MB，支持 GB 级数据
+2. **`_upsert_one_row(conn, table, row)`** — 单行 upsert 核心逻辑，被两个导入端点复用
+3. **`POST /admin/db-import-stream`** — 浏览器上传 .ndjson 文件，流式 upsert，每 500 行 commit
+4. **`POST /admin/import-from-source-stream`** — 从源端 `/admin/db-export-stream` 流式拉取并 upsert（15 分钟 read timeout，每 500 行 commit）
+5. **`POST /admin/migration-probe-stream`** — 探测源端连通性，只读前 64KB
+
+NDJSON 协议（version 3）：
+```
+{"_meta":{"version":3,"exported_at":1730000000}}
+{"_table":"jb_accounts"}
+{<row1>}
+{<row2>}
+{"_error":{"table":"xxx","error":"..."}}  # 可选错误行
+```
+
+`_EXPORT_TABLES` 新增 `jb_settings`（LOW 用户审计行 + 全局配置）。  
+`_TABLE_CONFLICT_COL` 新增 `"jb_settings": "key"`。
+
+### 前端重构（admin-panel）
+
+1. **新建 `src/pages/MigrationPanel.tsx`** — 三个功能块的独立组件：
+   - 📥 下载本实例完整 NDJSON 数据
+   - 📤 上传 NDJSON 文件导入（`fetch` 流式提交，不在浏览器内存累积）
+   - 🔄 从源端流式拉取（输入 URL + Admin Key，内置探测功能）
+
+2. **重写 `Dashboard.tsx`** — 删除旧迁移 state/handler（~200 行）、删除旧的两个迁移 Card（"数据迁移"+ "JSON 粘贴导入"），替换为 `<MigrationPanel />`。
+
+3. **修改 `Accounts.tsx`** — 删除 `syncFromSourceMutation`（调用旧端点 `/admin/accounts/import-from-source`）及其 state（`syncOpen`、`syncUrl`）和对应 Dialog UI；移除 `ArrowDownToLine` 未使用 import。
+
+架构师审查：旧函数已全部删除，新 5 个端点存在且正确，_EXPORT_TABLES/_TABLE_CONFLICT_COL 包含 jb_settings，Python 语法检查 PASS（`python3 -m py_compile`），前端热更新无编译错误，API 服务正常启动（2166 账号）。
