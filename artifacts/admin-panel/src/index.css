@@ -862,6 +862,211 @@
       0 14px 30px rgba(249, 115, 22, 0.22);
   }
 
+  @media (max-width: 640px) {
+    .premium-page-shell {
+      max-width: 100%;
+      padding-inline: 0;
+    }
+
+    .premium-page-shell::before {
+      inset: -10px;
+      border-radius: 28px;
+      opacity: 0.7;
+    }
+
+    .premium-hero-panel {
+      border-radius: 1.5rem;
+      padding: 1.1rem;
+    }
+
+    .premium-hero-panel::before {
+      right: -120px;
+      top: -120px;
+      width: 220px;
+      height: 220px;
+    }
+
+    .premium-hero-panel::after {
+      left: -140px;
+      bottom: -150px;
+      width: 230px;
+      height: 230px;
+    }
+
+    .premium-surface {
+      border-radius: 1.35rem;
+      padding: 1rem;
+    }
+
+    .premium-terminal {
+      max-height: 18rem;
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
+    }
+
+    .premium-terminal > div {
+      min-width: max-content;
+      padding-right: 0.75rem;
+    }
+
+    .backpack-item-card {
+      border-radius: 1.25rem;
+    }
+
+    .backpack-item-card:hover {
+      transform: none;
+    }
+
+    .backpack-item-card .flex.items-center.gap-3 {
+      min-width: 0;
+    }
+
+    .backpack-item-card code,
+    .backpack-item-card p {
+      overflow-wrap: anywhere;
+    }
+
+    .lottery-stage {
+      position: fixed;
+      overflow-x: hidden;
+      -webkit-overflow-scrolling: touch;
+    }
+
+    .lottery-stage .relative.z-10.flex.min-h-screen {
+      padding: 4.75rem 0.85rem 2rem;
+      min-height: 100dvh;
+    }
+
+    .lottery-stage .mx-auto.grid {
+      display: flex;
+      flex-direction: column;
+      gap: 1rem;
+      align-items: stretch;
+    }
+
+    .lottery-stage aside {
+      width: 100%;
+    }
+
+    .lottery-stage main {
+      width: 100%;
+    }
+
+    .lottery-stage h1 {
+      font-size: clamp(2.5rem, 15vw, 4.2rem);
+      line-height: 0.95;
+    }
+
+    .lottery-wheel-frame {
+      width: min(92vw, 390px) !important;
+      height: min(92vw, 390px) !important;
+      margin-inline: auto;
+    }
+
+    .lottery-wheel-frame > .relative.z-10 {
+      width: min(76vw, 310px) !important;
+      height: min(76vw, 310px) !important;
+    }
+
+    .lottery-pointer {
+      top: 0.65rem !important;
+    }
+
+    .lottery-pointer > div:first-child {
+      border-left-width: 14px !important;
+      border-right-width: 14px !important;
+      border-top-width: 34px !important;
+    }
+
+    .lottery-spin-button {
+      width: min(100%, 22rem);
+      padding: 0.95rem 1rem;
+      font-size: 1.2rem;
+      letter-spacing: 0.16em;
+      border-radius: 1.25rem;
+    }
+
+    .lottery-stage .max-h-\[360px\] {
+      max-height: 240px;
+    }
+
+    .lottery-stage .rounded-\[2rem\] {
+      border-radius: 1.35rem;
+    }
+
+    .lottery-stage .grid.grid-cols-2 {
+      grid-template-columns: 1fr;
+    }
+
+    .lottery-stage .fixed.inset-0.z-50,
+    .lottery-stage .fixed.inset-0.z-\[60\] {
+      align-items: flex-end;
+      padding: 0.75rem;
+    }
+
+    .lottery-stage .fixed.inset-0.z-50 > div,
+    .lottery-stage .fixed.inset-0.z-\[60\] > div {
+      max-height: calc(100dvh - 1.5rem);
+      overflow-y: auto;
+      border-radius: 1.5rem;
+      -webkit-overflow-scrolling: touch;
+    }
+
+    form.premium-surface .flex.flex-wrap.gap-3 > button,
+    .premium-surface.flex.items-center.gap-2.flex-wrap > button {
+      flex: 1 1 100%;
+      justify-content: center;
+    }
+
+    form.premium-surface .flex.flex-wrap.gap-3 > button[class*="border-violet"],
+    form.premium-surface .flex.flex-wrap.gap-3 > button[class*="border-amber"] {
+      flex: 1 1 calc(50% - 0.375rem);
+      min-width: 0;
+      justify-content: center;
+      padding-inline: 0.75rem;
+    }
+
+    .premium-page-shell table {
+      min-width: 720px;
+    }
+
+    .premium-page-shell [data-testid="low-batch-results"] {
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
+    }
+  }
+
+  @media (max-width: 420px) {
+    .lottery-wheel-frame {
+      width: min(94vw, 340px) !important;
+      height: min(94vw, 340px) !important;
+    }
+
+    .lottery-wheel-frame > .relative.z-10 {
+      width: min(78vw, 280px) !important;
+      height: min(78vw, 280px) !important;
+    }
+
+    .lottery-spin-button {
+      font-size: 1.05rem;
+      letter-spacing: 0.12em;
+    }
+
+    .premium-hero-panel h1,
+    .premium-page-shell h1 {
+      font-size: clamp(2rem, 12vw, 3rem);
+    }
+
+    .backpack-item-card {
+      flex-wrap: wrap;
+    }
+
+    .backpack-item-card > button {
+      width: 100%;
+      justify-content: center;
+    }
+  }
+
   @media (prefers-reduced-motion: reduce) {
     *,
     *::before,
