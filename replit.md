@@ -109,6 +109,25 @@ return winner[0] if winner else None
 
 最终生效改动总结：上述四阶段 + `_first_ready` 滑动窗口分批并发。
 
+## 排队记录入队超时自动清理（2026-04-27）
+
+新增机制：**超过 1 小时仍在排队的邮箱，自动从排队列表清除**。
+
+实现位置：`jetbrainsai2api/main.py` `_retry_pending_nc_lids` 后台任务（每 5 分钟一轮）每轮重试**之前**先执行一次清理 SQL。
+
+关键设计：
+- **专用入队时间字段** `jb_accounts.pending_nc_enqueued_at`（DOUBLE PRECISION DEFAULT 0，epoch 秒）。**仅在入队瞬间写入，重试与 JWT 刷新都不会更新**，避免了一开始用 `last_updated` 的两个语义偏差（INSERT ON CONFLICT 旧时间戳误删 + JWT 刷新刷新 `last_updated` 延后清理）。
+- schema 变更随 `init_db` ALTER TABLE IF NOT EXISTS 一并下发；同时一次性回填存量 pending 行（enqueued_at=0 → NOW()），让历史数据"从启动时刻开始计时"，不会被立即误判超时。
+- 三处入队点全部同步写入 `time.time()`：批量激活 done 路径（line 8895）、批量激活 pending 路径（line 8922）、单激活 INSERT ON CONFLICT 路径（line 9029/9039/9057，且写入 EXCLUDED 列表保证冲突更新也刷新）。
+- 阈值常量：`_PENDING_NC_MAX_AGE_SEC = 3600`（1 小时）。
+- 自动清理（`_retry_pending_nc_lids` 每轮重试前执行）与手动清除（`admin_pending_nc_delete`）使用**完全相同**的字段重置：`pending_nc_lids = pending_nc_key = pending_nc_bound_ids = NULL`，`pending_nc_enqueued_at = 0`（避免历史脏值）。
+- 自动清理通过 `RETURNING id, pending_nc_email, pending_nc_low_admin` 拿到记录，逐条写入 `_pending_nc_retry_log` / `_pending_nc_retry_log_low`，前端排队记录页（`PendingQueue.tsx`）自动可见。LOW 用户日志使用脱敏邮箱前缀 + 友好文案（"已自动取消激活"）。
+- 清理代码包在 `try/except` 内，失败仅 print 不影响主重试循环。
+
+经架构师两轮审查（第一轮指出 `last_updated` 不可靠 → 引入专用字段后第二轮 PASS）。
+
+代价：被清理的邮箱后续若想继续激活需要用户手动重新发起激活流程。
+
 ## 复刻状态（2026-04-26）
 
 源码已 1:1 复刻完成，三个工作流均正常运行：

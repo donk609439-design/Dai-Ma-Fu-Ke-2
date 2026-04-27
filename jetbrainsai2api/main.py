@@ -735,6 +735,18 @@ async def _ensure_db_tables():
         await conn.execute("ALTER TABLE jb_accounts ADD COLUMN IF NOT EXISTS pending_nc_pass TEXT DEFAULT NULL")
         await conn.execute("ALTER TABLE jb_accounts ADD COLUMN IF NOT EXISTS pending_nc_key TEXT DEFAULT NULL")
         await conn.execute("ALTER TABLE jb_accounts ADD COLUMN IF NOT EXISTS pending_nc_bound_ids TEXT DEFAULT NULL")
+        # 入队时间戳（epoch 秒）——仅在"入队瞬间"写入，重试与 JWT 刷新都不会更新它，
+        # 用于"超过 1 小时还在排队的邮箱自动清除"机制的精确入队年龄判定
+        await conn.execute("ALTER TABLE jb_accounts ADD COLUMN IF NOT EXISTS pending_nc_enqueued_at DOUBLE PRECISION DEFAULT 0")
+        # 一次性回填：历史 pending 行（已在排队但未记录入队时间）从当前时间开始计时，
+        # 避免新机制把存量数据立即误判为超时
+        await conn.execute(
+            """UPDATE jb_accounts
+               SET pending_nc_enqueued_at = EXTRACT(EPOCH FROM NOW())
+             WHERE pending_nc_lids IS NOT NULL
+               AND pending_nc_lids <> '[]'
+               AND (pending_nc_enqueued_at IS NULL OR pending_nc_enqueued_at = 0)"""
+        )
         # 该邮箱（行）是否已为 LOW 用户的 key 贡献过 +16 额度
         # —— 同一邮箱凑够 4 个信任凭证只会触发一次 +16，不会重复计入
         await conn.execute("ALTER TABLE jb_accounts ADD COLUMN IF NOT EXISTS pending_nc_quota_granted BOOLEAN DEFAULT FALSE")
@@ -2861,6 +2873,10 @@ async def _retry_pending_nc_lids():
             except Exception as e:
                 return {"lid": lid, "status": -1, "error": str(e)}
 
+    # 排队记录的最长保留时间：超过此值未被任何激活流程触碰即自动清除
+    # （last_updated 在 _retry_pending_nc_lids 内不会被刷新，因此可作为"入队时间"近似）
+    _PENDING_NC_MAX_AGE_SEC = 3600  # 1 小时
+
     while True:
         try:
             _pending_nc_last_retry_at = time.time()
@@ -2868,6 +2884,44 @@ async def _retry_pending_nc_lids():
             if not db:
                 await asyncio.sleep(600)
                 continue
+
+            # ── 入队超时清理：排队 > 1 小时仍未完成的邮箱自动从排队列表移除 ──
+            # 与手动清除接口（admin_pending_nc_delete）使用完全相同的字段重置，
+            # 通过 RETURNING 拿到被清理的邮箱列表写入日志，前端排队记录页可见。
+            # 用专用字段 pending_nc_enqueued_at 作为入队时间，仅在入队瞬间写入，
+            # 重试与 JWT 刷新都不会更新它，避免误删/延后清理的语义偏差。
+            try:
+                now_ts = time.time()
+                async with db.acquire() as conn:
+                    expired_rows = await conn.fetch(
+                        """
+                        UPDATE jb_accounts
+                           SET pending_nc_lids        = NULL,
+                               pending_nc_key         = NULL,
+                               pending_nc_bound_ids   = NULL,
+                               pending_nc_enqueued_at = 0
+                         WHERE pending_nc_lids IS NOT NULL
+                           AND pending_nc_lids <> '[]'
+                           AND pending_nc_enqueued_at > 0
+                           AND ($1 - pending_nc_enqueued_at) > $2
+                        RETURNING id, pending_nc_email,
+                                  COALESCE(pending_nc_low_admin, FALSE) AS is_low
+                        """,
+                        now_ts, _PENDING_NC_MAX_AGE_SEC,
+                    )
+                if expired_rows:
+                    age_min = _PENDING_NC_MAX_AGE_SEC // 60
+                    for er in expired_rows:
+                        em = er["pending_nc_email"] or er["id"]
+                        short_em = em[:em.index("@")] + "@..." if "@" in em else em
+                        is_low_row = bool(er["is_low"])
+                        _log(
+                            f"⏰ {short_em} 排队超过 {age_min} 分钟未完成，已自动从排队列表清除",
+                            "warn", is_low=is_low_row,
+                            low_msg=f"⏰ {short_em} 排队超过 {age_min} 分钟未完成，已自动取消激活",
+                        )
+            except Exception as _ce:
+                print(f"[pending-nc] 入队超时清理失败: {_ce}")
 
             async with db.acquire() as conn:
                 rows = await conn.fetch(
@@ -6509,7 +6563,7 @@ async def admin_pending_nc_delete(row_id: str, request: Request):
     async with db.acquire() as conn:
         await conn.execute(
             "UPDATE jb_accounts SET pending_nc_lids=NULL, pending_nc_key=NULL, "
-            "pending_nc_bound_ids=NULL WHERE id=$1",
+            "pending_nc_bound_ids=NULL, pending_nc_enqueued_at=0 WHERE id=$1",
             row_id
         )
     return {"ok": True}
@@ -8837,13 +8891,15 @@ async def admin_activate_stream(task_id: str):
                                             "UPDATE jb_accounts SET pending_nc_lids=$1, "
                                             "pending_nc_email=$2, pending_nc_pass=$3, "
                                             "pending_nc_key=$4, pending_nc_bound_ids=$5, "
-                                            "pending_nc_low_admin=$6, pending_nc_discord_id=$7 "
-                                            "WHERE id=$8",
+                                            "pending_nc_low_admin=$6, pending_nc_discord_id=$7, "
+                                            "pending_nc_enqueued_at=$8 "
+                                            "WHERE id=$9",
                                             json.dumps(pending_nc),
                                             task.get("email", ""), task.get("password", ""),
                                             generated_key, ",".join(all_bound_ids),
                                             bool(task.get("is_low_admin")),
                                             str(task.get("discord_user_id", "") or ""),
+                                            time.time(),
                                             new_acc_id
                                         )
                             except Exception as _e:
@@ -8862,13 +8918,15 @@ async def admin_activate_stream(task_id: str):
                                         "UPDATE jb_accounts SET pending_nc_lids=$1, "
                                         "pending_nc_email=$2, pending_nc_pass=$3, "
                                         "pending_nc_key=$4, pending_nc_bound_ids=$5, "
-                                        "pending_nc_low_admin=$6, pending_nc_discord_id=$7 "
-                                        "WHERE id=$8",
+                                        "pending_nc_low_admin=$6, pending_nc_discord_id=$7, "
+                                        "pending_nc_enqueued_at=$8 "
+                                        "WHERE id=$9",
                                         json.dumps(pending_nc),
                                         task.get("email", ""), task.get("password", ""),
                                         generated_key, ",".join(all_bound_ids),
                                         bool(task.get("is_low_admin")),
                                         str(task.get("discord_user_id", "") or ""),
+                                        time.time(),
                                         new_acc_id
                                     )
                             yield f"data: {json.dumps({'type': 'log', 'msg': f'⏳ NC 许可证已创建并记录，约30-60分钟后后台自动入池'})}\n\n"
@@ -8968,8 +9026,8 @@ async def admin_activate_stream(task_id: str):
                                  last_quota_check, has_quota, daily_total, daily_used,
                                  pending_nc_lids, pending_nc_email, pending_nc_pass,
                                  pending_nc_key, pending_nc_bound_ids, pending_nc_low_admin,
-                                 pending_nc_discord_id)
-                            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+                                 pending_nc_discord_id, pending_nc_enqueued_at)
+                            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
                             ON CONFLICT (id) DO UPDATE SET
                                 pending_nc_lids       = EXCLUDED.pending_nc_lids,
                                 pending_nc_email      = EXCLUDED.pending_nc_email,
@@ -8977,7 +9035,8 @@ async def admin_activate_stream(task_id: str):
                                 pending_nc_key        = EXCLUDED.pending_nc_key,
                                 pending_nc_bound_ids  = EXCLUDED.pending_nc_bound_ids,
                                 pending_nc_low_admin  = EXCLUDED.pending_nc_low_admin,
-                                pending_nc_discord_id = EXCLUDED.pending_nc_discord_id
+                                pending_nc_discord_id = EXCLUDED.pending_nc_discord_id,
+                                pending_nc_enqueued_at = EXCLUDED.pending_nc_enqueued_at
                             """,
                             placeholder_id,
                             placeholder_id,
@@ -8995,6 +9054,7 @@ async def admin_activate_stream(task_id: str):
                             "",            # bound_ids 为空（全部待激活）
                             bool(task.get("is_low_admin")),
                             str(task.get("discord_user_id", "") or ""),
+                            time.time(),   # pending_nc_enqueued_at：入队瞬间记录
                         )
                 _q_show = _LOW_USER_KEY_QUOTA if task.get("is_low_admin") else _NORMAL_KEY_QUOTA
                 yield f"data: {json.dumps({'type': 'log', 'msg': f'⏳ NC 许可证已创建并记录（共 {len(pending_nc)} 个），全部凭证到位后自动激活密钥（额度 {_q_show}）'})}\n\n"
