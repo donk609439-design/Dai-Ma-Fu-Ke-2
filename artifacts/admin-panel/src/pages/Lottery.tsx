@@ -189,6 +189,10 @@ function shortenPrize(name: string) {
   return name.length > 7 ? `${name.slice(0, 6)}…` : name;
 }
 
+function getApiErrorMessage(data: any, fallback: string) {
+  return data?.detail || data?.error?.message || data?.message || fallback;
+}
+
 function ModalShell({
   children,
   onClose,
@@ -251,7 +255,7 @@ function ClaimModal({
       } else {
         const d = await res.json().catch(() => ({}));
         setStatus("error");
-        setMsg(d.detail || "领取失败");
+        setMsg(getApiErrorMessage(d, "领取失败"));
       }
     } catch {
       setStatus("error");
@@ -388,7 +392,7 @@ function SaintModal({
         }
       } else {
         setStatus("error");
-        setMsg(d.detail || "捐献失败");
+        setMsg(getApiErrorMessage(d, "捐献失败"));
       }
     } catch {
       setStatus("error");
@@ -659,14 +663,18 @@ export default function Lottery() {
         body: JSON.stringify({ discord_token: dcToken }),
       });
       if (!res.ok) {
-        const d = await res.json();
-        if (res.status === 402) {
+        const d = await res.json().catch(() => ({}));
+        const message = getApiErrorMessage(d, `抽奖失败（HTTP ${res.status}）`);
+        if (res.status === 401) {
+          alert(`${message}，请重新登录 Discord`);
+          dcLogin();
+        } else if (res.status === 402) {
           // 点数不足 → 引导捐 Key
-          alert(d.detail || "圣人点数不足");
+          alert(message || "圣人点数不足");
           setShowSaint(true);
         } else {
-          // 503=暂无奖品，或其他错误 → 只提示，不弹捐Key框
-          alert(d.detail || "抽奖失败，请稍后重试");
+          // 503=暂无奖品，409=库存并发不足，或其他错误：展示后端真实原因
+          alert(message || "抽奖失败，请稍后重试");
         }
         return;
       }
