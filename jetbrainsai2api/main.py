@@ -84,7 +84,8 @@ MODEL_COSTS: Dict[str, float] = {}       # model_id -> 单次调用消耗的 key
 _key_fractional_usage: Dict[str, float] = {}  # key -> 累计小数部分
 _pending_key_increments: Dict[str, int] = {}  # key -> 待刷新到 DB 的累计增量（批量写入，减少连接）
 http_client: Optional[httpx.AsyncClient] = None
-DB_POOL: Optional[Any] = None
+DB_POOL: Optional[Any] = None       # 主池：普通用户 / admin / chat / 主后台任务
+DB_POOL_LOW: Optional[Any] = None   # LOW 专用池：LOW 激活 / LOW pending retry
 
 # ==================== 用量统计 ====================
 service_start_time: float = time.time()
@@ -672,7 +673,7 @@ def load_models():
 
 
 async def _get_db_pool():
-    """获取或初始化数据库连接池"""
+    """主 DB 连接池：普通用户、admin、chat、主后台任务使用。"""
     global DB_POOL
     if DB_POOL is not None:
         return DB_POOL
@@ -680,13 +681,35 @@ async def _get_db_pool():
     if not database_url:
         return None
     try:
-        DB_POOL = await asyncpg.create_pool(database_url, min_size=2, max_size=20,
-                                             command_timeout=30)
+        DB_POOL = await asyncpg.create_pool(database_url, min_size=2, max_size=15,
+                                             command_timeout=60, statement_cache_size=0)
         print("数据库连接池已初始化")
     except Exception as e:
         print(f"数据库连接失败，将使用文件存储作为回退: {e}")
         DB_POOL = None
     return DB_POOL
+
+
+async def _get_low_db_pool():
+    """LOW 专用 DB 连接池：LOW 激活与 LOW pending retry 使用。
+
+    不限制 LOW 激活速度，只把 LOW 写库压力隔离到独立 DB pool，
+    避免 LOW 批量激活占满普通用户/admin 的主 DB pool。
+    """
+    global DB_POOL_LOW
+    if DB_POOL_LOW is not None:
+        return DB_POOL_LOW
+    database_url = os.environ.get("DATABASE_URL")
+    if not database_url:
+        return None
+    try:
+        DB_POOL_LOW = await asyncpg.create_pool(database_url, min_size=1, max_size=20,
+                                                 command_timeout=60, statement_cache_size=0)
+        print("[DB] LOW 专用连接池已初始化")
+    except Exception as e:
+        print(f"[DB] LOW 池初始化失败: {e}")
+        DB_POOL_LOW = None
+    return DB_POOL_LOW
 
 
 async def _ensure_db_tables():
@@ -1383,12 +1406,13 @@ async def _flush_key_increments_loop():
             print(f"[批量] key 用量定时刷新异常: {e}")
 
 
-async def _save_account_to_db(account: dict):
-    """精准更新单个账户到数据库（避免全量重写）"""
+async def _save_account_to_db(account: dict, pool=None):
+    """精准更新单个账户到数据库（避免全量重写）。pool 为 None 时使用主 DB 池。"""
     # 账号已被标记删除，跳过写入，防止 fire-and-forget 任务在删除后重新写回
     if account.get("_deleted"):
         return
-    pool = await _get_db_pool()
+    if pool is None:
+        pool = await _get_db_pool()
     if not pool:
         # 无 DB 时回退到全量文件写入
         await _save_accounts_to_db()
@@ -1435,9 +1459,10 @@ async def _save_account_to_db(account: dict):
         print(f"保存单个账户到数据库时出错: {e}")
 
 
-async def _upsert_key_to_db(key: str, meta: dict):
-    """精准插入或更新单个 API 密钥到数据库（避免全量重写）"""
-    pool = await _get_db_pool()
+async def _upsert_key_to_db(key: str, meta: dict, pool=None):
+    """精准插入或更新单个 API 密钥到数据库（避免全量重写）。pool 为 None 时使用主 DB 池。"""
+    if pool is None:
+        pool = await _get_db_pool()
     if not pool:
         await _save_keys_to_db()
         return
@@ -1469,9 +1494,10 @@ async def _upsert_key_to_db(key: str, meta: dict):
         print(f"精准写入密钥到数据库时出错: {e}")
 
 
-async def _delete_key_from_db(key: str):
-    """精准删除单个 API 密钥（避免全量重写）"""
-    pool = await _get_db_pool()
+async def _delete_key_from_db(key: str, pool=None):
+    """精准删除单个 API 密钥（避免全量重写）。pool 为 None 时使用主 DB 池。"""
+    if pool is None:
+        pool = await _get_db_pool()
     if not pool:
         await _save_keys_to_db()
         return
@@ -3162,7 +3188,8 @@ async def _retry_pending_nc_lids():
                                 if not already:
                                     async with account_rotation_lock:
                                         JETBRAINS_ACCOUNTS.append(new_acc)
-                                    await _save_account_to_db(new_acc)
+                                    _save_pool = await _get_low_db_pool() if row_is_low else await _get_db_pool()
+                                    await _save_account_to_db(new_acc, pool=_save_pool)
                                     _log(
                                         f"✅ {lid} → trusted，已入池", "success", is_low=row_is_low,
                                         low_msg=f"✓ {_se} 账号激活成功，已入池",
@@ -3220,8 +3247,13 @@ async def _retry_pending_nc_lids():
                 pending_nc_key = meta["pending_nc_key"]
                 pending_nc_bound_ids_str = meta["pending_nc_bound_ids_str"]
                 row_is_low = meta.get("is_low", False)
+                # LOW 行写库走 LOW 专用池；普通行继续使用主池（db）
+                _row_pool = await _get_low_db_pool() if row_is_low else db
+                if not _row_pool:
+                    _log(f"⚠ {meta.get('short_email','?')} DB pool 不可用，跳过本行写库", "warn")
+                    continue
 
-                async with db.acquire() as conn:
+                async with _row_pool.acquire() as conn:
                     await conn.execute(
                         "UPDATE jb_accounts SET pending_nc_lids=$1 WHERE id=$2",
                         json.dumps(still_pending), row_id
@@ -3254,7 +3286,7 @@ async def _retry_pending_nc_lids():
                         and len(all_ids) >= NC_QUOTA_THRESHOLD
                         and not row_already_granted
                     ):
-                        _upg_db = await _get_db_pool()
+                        _upg_db = _row_pool
                         if _upg_db:
                             new_quota = await _add_low_quota(pending_nc_key, all_ids, _upg_db)
                             _log(
@@ -3268,7 +3300,7 @@ async def _retry_pending_nc_lids():
                                 ),
                             )
                             # 同时持久化：bound_ids 累积、本行 granted 置 TRUE
-                            async with db.acquire() as _ub:
+                            async with _row_pool.acquire() as _ub:
                                 await _ub.execute(
                                     "UPDATE jb_accounts "
                                     "SET pending_nc_bound_ids=$1, pending_nc_quota_granted=TRUE "
@@ -3277,7 +3309,7 @@ async def _retry_pending_nc_lids():
                                 )
                     elif row_already_granted and newly_trusted_ids:
                         # 已贡献过额度的邮箱：仅累积 bound_ids（用于审计/账号去重），不再加额度
-                        async with db.acquire() as _ub:
+                        async with _row_pool.acquire() as _ub:
                             await _ub.execute(
                                 "UPDATE jb_accounts SET pending_nc_bound_ids=$1 WHERE id=$2",
                                 ",".join(all_ids), row_id,
@@ -3293,7 +3325,7 @@ async def _retry_pending_nc_lids():
                         )
                     elif newly_trusted_ids:
                         # 未达阈值：仅累积 bound_ids，等待下轮
-                        async with db.acquire() as _ub:
+                        async with _row_pool.acquire() as _ub:
                             await _ub.execute(
                                 "UPDATE jb_accounts SET pending_nc_bound_ids=$1 WHERE id=$2",
                                 ",".join(all_ids), row_id,
@@ -3314,7 +3346,7 @@ async def _retry_pending_nc_lids():
                         if pending_nc_key else False
                     )
                     if pending_nc_key and len(all_ids) >= NC_QUOTA_THRESHOLD and not key_already_upgraded:
-                        _upg_db = await _get_db_pool()
+                        _upg_db = _row_pool
                         if _upg_db:
                             await _activate_key_quota(pending_nc_key, all_ids, _upg_db)
                             _log(
@@ -3322,14 +3354,14 @@ async def _retry_pending_nc_lids():
                                 f"密钥升级为额度 {_NORMAL_KEY_QUOTA}（共 {len(all_ids)} 个）",
                                 "success", is_low=False,
                             )
-                        async with db.acquire() as _ub:
+                        async with _row_pool.acquire() as _ub:
                             await _ub.execute(
                                 "UPDATE jb_accounts SET pending_nc_bound_ids=$1 WHERE id=$2",
                                 ",".join(all_ids), row_id,
                             )
                     elif len(still_pending) == 0 and pending_nc_key and not key_already_upgraded:
                         if all_ids:
-                            _upg_db = await _get_db_pool()
+                            _upg_db = _row_pool
                             if _upg_db:
                                 await _activate_key_quota(pending_nc_key, all_ids, _upg_db)
                                 _log(f"🎉 {short_email} 全部 trusted（共 {len(all_ids)} 个），密钥已升级", "success", is_low=False)
@@ -3666,7 +3698,7 @@ async def _migrate_key_limits():
 
 @app.on_event("shutdown")
 async def shutdown():
-    global http_client
+    global http_client, DB_POOL, DB_POOL_LOW
     # 关机前主动刷新剩余的 key 用量，避免因 5s 周期未到而丢失数据
     try:
         await _flush_key_increments_to_db()
@@ -3674,6 +3706,16 @@ async def shutdown():
         pass
     if http_client:
         await http_client.aclose()
+    if DB_POOL is not None:
+        try:
+            await DB_POOL.close()
+        except Exception:
+            pass
+    if DB_POOL_LOW is not None:
+        try:
+            await DB_POOL_LOW.close()
+        except Exception:
+            pass
 
 
 # API 端点
@@ -5010,6 +5052,16 @@ async def admin_status(request: Request):
         "keys_count": len(VALID_CLIENT_KEYS),
         "models_count": len(models_data.get("data", [])),
         "current_account_index": current_account_index,
+        "db_pool_main": {
+            "size": DB_POOL.get_size() if DB_POOL else 0,
+            "free": DB_POOL.get_idle_size() if DB_POOL else 0,
+            "max": 15,
+        } if DB_POOL else None,
+        "db_pool_low": {
+            "size": DB_POOL_LOW.get_size() if DB_POOL_LOW else 0,
+            "free": DB_POOL_LOW.get_idle_size() if DB_POOL_LOW else 0,
+            "max": 20,
+        } if DB_POOL_LOW else None,
     }
     _admin_cache_set("status", json.dumps(base, ensure_ascii=False).encode())
     base["role"] = role
@@ -8413,6 +8465,13 @@ async def admin_activate_stream(task_id: str):
         # 取出个人 key（有则复用，无则沿用 preissued_key 机制）
         _personal_key = task.get("personal_key", "") or ""
 
+        # ── LOW 任务身份：使用 LOW 专用 DB Pool，普通任务使用主 DB Pool ──
+        _is_low_task = bool(task.get("is_low_admin"))
+
+        async def _get_pool_for_task():
+            """LOW 任务使用 LOW DB 池；普通/admin 任务使用主 DB 池。"""
+            return await _get_low_db_pool() if _is_low_task else await _get_db_pool()
+
         # ── 失败时删除零额度预签 key，避免僵尸积压 ──
         # 使用个人 key 时无需删除（个人 key 长期存在）
         async def _discard_preissued():
@@ -8422,7 +8481,7 @@ async def admin_activate_stream(task_id: str):
             if _bk and VALID_CLIENT_KEYS.get(_bk, {}).get("usage_limit", 0) == 0:
                 VALID_CLIENT_KEYS.pop(_bk, None)
                 try:
-                    _cdb = await _get_db_pool()
+                    _cdb = await _get_pool_for_task()
                     if _cdb:
                         async with _cdb.acquire() as _cc:
                             await _cc.execute(
@@ -8483,7 +8542,7 @@ async def admin_activate_stream(task_id: str):
 
                 # ── 捐献账号封锁：曾捐献过 Key 的账号不允许重新激活 ──
                 if result.get("license_id"):
-                    _db_pool = await _get_db_pool()
+                    _db_pool = await _get_pool_for_task()
                     if _db_pool:
                         async with _db_pool.acquire() as _conn:
                             _donated = await _conn.fetchrow(
@@ -8561,7 +8620,7 @@ async def admin_activate_stream(task_id: str):
 
                     async with account_rotation_lock:
                         JETBRAINS_ACCOUNTS.append(new_account)
-                    await _save_account_to_db(new_account)
+                    await _save_account_to_db(new_account, pool=await _get_pool_for_task())
                     yield f"data: {json.dumps({'type': 'log', 'msg': '✓ 账号已自动添加到系统'})}\n\n"
 
                     # ★ 个人 key 模式复用已有 key；否则使用预签 key
@@ -8594,7 +8653,7 @@ async def admin_activate_stream(task_id: str):
                         await _check_quota(extra_account_obj)
                         async with account_rotation_lock:
                             JETBRAINS_ACCOUNTS.append(extra_account_obj)
-                        await _save_account_to_db(extra_account_obj)
+                        await _save_account_to_db(extra_account_obj, pool=await _get_pool_for_task())
                         all_bound_ids.append(extra_lid)
                         extra_added += 1
 
@@ -8603,7 +8662,7 @@ async def admin_activate_stream(task_id: str):
                     pending_nc = result.get("pending_nc_lids", [])
                     if len(all_bound_ids) >= NC_QUOTA_THRESHOLD:
                         # 已绑定账号达到阈值，立即升级，剩余 pending 继续后台入池
-                        _db3 = await _get_db_pool()
+                        _db3 = await _get_pool_for_task()
                         if _db3 and generated_key:
                             if _personal_key:
                                 await _add_low_quota(_personal_key, all_bound_ids, _db3)
@@ -8611,7 +8670,7 @@ async def admin_activate_stream(task_id: str):
                                 await _activate_key_quota(generated_key, all_bound_ids, _db3)
                         if pending_nc:
                             try:
-                                _db2 = await _get_db_pool()
+                                _db2 = await _get_pool_for_task()
                                 if _db2:
                                     async with _db2.acquire() as _c:
                                         await _c.execute(
@@ -8638,7 +8697,7 @@ async def admin_activate_stream(task_id: str):
                     elif pending_nc:
                         # 当前绑定不足阈值，保存 pending，等重试任务凑够后升级
                         try:
-                            _db2 = await _get_db_pool()
+                            _db2 = await _get_pool_for_task()
                             if _db2:
                                 async with _db2.acquire() as _c:
                                     await _c.execute(
@@ -8666,7 +8725,7 @@ async def admin_activate_stream(task_id: str):
                             yield f"data: {json.dumps({'type': 'log', 'msg': f'[WARN] 保存 pending NC 失败: {_e}'})}\n\n"
                     else:
                         # 无 pending 且未达阈值（极少见）：直接升级
-                        _db3 = await _get_db_pool()
+                        _db3 = await _get_pool_for_task()
                         if _db3 and generated_key:
                             if _personal_key:
                                 await _add_low_quota(_personal_key, all_bound_ids, _db3)
@@ -8689,7 +8748,7 @@ async def admin_activate_stream(task_id: str):
                         if _preissued_dup and VALID_CLIENT_KEYS.get(_preissued_dup, {}).get("usage_limit", 1) == 0:
                             VALID_CLIENT_KEYS.pop(_preissued_dup, None)
                             try:
-                                _dup_db = await _get_db_pool()
+                                _dup_db = await _get_pool_for_task()
                                 if _dup_db:
                                     async with _dup_db.acquire() as _dc:
                                         await _dc.execute("DELETE FROM jb_client_keys WHERE key=$1", _preissued_dup)
@@ -8724,7 +8783,7 @@ async def admin_activate_stream(task_id: str):
                                 else:
                                     yield f"data: {json.dumps({'type': 'log', 'msg': '✓ 无限制套餐，允许入池'})}\n\n"
                                 generated_key = task.get("preissued_key", "")
-                                _dup_db2 = await _get_db_pool()
+                                _dup_db2 = await _get_pool_for_task()
                                 if _dup_db2 and generated_key:
                                     await _activate_key_quota(generated_key, [acc_id], _dup_db2)
                                 _q_show = _LOW_USER_KEY_QUOTA if task.get("is_low_admin") else _NORMAL_KEY_QUOTA
@@ -8741,7 +8800,7 @@ async def admin_activate_stream(task_id: str):
             generated_key = _personal_key or task.get("preissued_key", "")
             try:
                 pending_nc = result["pending_nc_lids"]
-                _db_p = await _get_db_pool()
+                _db_p = await _get_pool_for_task()
                 if _db_p and pending_nc:
                     # 以第一个 pending lid 作为占位 id 存入 DB，供后台重试任务使用
                     placeholder_id = pending_nc[0]

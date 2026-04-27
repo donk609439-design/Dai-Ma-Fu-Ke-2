@@ -109,6 +109,65 @@ return winner[0] if winner else None
 
 最终生效改动总结：上述四阶段 + `_first_ready` 滑动窗口分批并发。
 
+## LOW 专用 DB Pool 资源隔离（2026-04-27）
+
+工单目标：**资源隔离，不限速**。LOW 批量激活写库走独立 DB Pool，防止挤占普通用户/admin 的主 DB Pool。
+
+### 改动清单
+
+**改动1：新增 `DB_POOL_LOW` 和 `_get_low_db_pool()`**
+- 全局变量 line ~90：`DB_POOL_LOW: Optional[Any] = None`
+- `_get_db_pool()`：max_size 从 20 → **15**（主池），command_timeout 30 → 60，statement_cache_size=0
+- 新增 `_get_low_db_pool()`：min_size=1，max_size=**20**（LOW 专用），懒加载，失败返回 None
+
+**改动2：shutdown 关闭 LOW Pool**
+- `shutdown()` 追加 `if DB_POOL_LOW: await DB_POOL_LOW.close()`
+
+**改动3：三个写库 helper 支持显式 pool 参数**
+- `_save_account_to_db(account, pool=None)` — pool=None 时走 `_get_db_pool()`
+- `_upsert_key_to_db(key, meta, pool=None)` — 同上
+- `_delete_key_from_db(key, pool=None)` — 同上
+
+**改动4：`admin_activate_stream` event_generator**
+- 添加 `_is_low_task = bool(task.get("is_low_admin"))` 和嵌套 `async def _get_pool_for_task()`
+- event_generator 内所有 `_get_db_pool()` 调用（`_cdb`、`_db_pool`、`_db2`、`_db3`、`_dup_db`、`_dup_db2`、`_db_p`）→ `_get_pool_for_task()`
+- `_save_account_to_db(new/extra_account_obj, pool=await _get_pool_for_task())`
+
+**改动5：`_retry_pending_nc_lids` Phase 3 按行选 pool**
+- Phase 2（trusted 入池）：`_save_account_to_db(new_acc, pool=await _get_low_db_pool() if row_is_low else await _get_db_pool())`
+- Phase 3 循环顶部：`_row_pool = await _get_low_db_pool() if row_is_low else db`
+- Phase 3 内所有 `db.acquire()` / `await _get_db_pool()` → `_row_pool.acquire()` / `_row_pool`
+
+**改动6：`/admin/status` 增加两个 pool 状态字段**
+- `db_pool_main: {size, free, max=15}`（DB_POOL not None 时）
+- `db_pool_low: {size, free, max=20}`（DB_POOL_LOW not None 时）
+- LOW 池首次使用前为 null（懒加载），触发一次 LOW 激活后初始化
+
+### 资源模型（修改后）
+
+```text
+普通用户 / admin / chat / 主后台任务 → DB_POOL_MAIN (max=15)
+LOW 激活 / LOW pending retry        → DB_POOL_LOW  (max=20)
+总连接数：约 35（原 20）
+```
+
+### 未改动
+- `_get_low_executor()` LOW Worker 池不变
+- 无 LOW 全局限速
+- `_add_low_quota(api_key, ids, pool)` 已支持显式 pool，不需改
+
+### 架构师审查结论
+
+审查发现两个 Bug 已同步修复：
+
+**Bug 1（严重）**：`shutdown()` 仅关闭了 LOW pool，丢失了主池 `DB_POOL` 的关闭逻辑 → 已补全 `if DB_POOL: await DB_POOL.close()`。
+
+**Bug 2（崩溃风险）**：`_retry_pending_nc_lids` Phase 3 中 `_row_pool = await _get_low_db_pool() if row_is_low else db`，如果 LOW pool 初始化失败返回 None，后续 `_row_pool.acquire()` 会崩溃 → 已在 `_row_pool` 赋值后加 `if not _row_pool: continue` 保护。
+
+**低优先级（未改，可接受）**：
+- `_get_db_pool()` / `_get_low_db_pool()` 懒加载存在多协程竞争初始化，极低概率创建多余连接池（GC 最终回收）；startup 初始化可彻底消除此问题，但超出本工单最简改动原则。
+- `/admin/status` pool 状态字段在 5s 缓存 TTL 内可能显示 null（LOW 池懒加载），可接受。
+
 ## LOW 用户 AI 响应缓存（2026-04-27）
 
 工单级别：LOW。仅对 `is_low_admin_key=true` 的 key 生效。
