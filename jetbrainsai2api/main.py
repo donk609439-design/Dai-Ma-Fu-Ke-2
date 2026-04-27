@@ -4250,28 +4250,29 @@ async def chat_completions(
     _ai_cacheable, _cache_reason = _is_low_cacheable_request(client_key, _req_body)
     _ai_cache_key: Optional[str] = None
     _ai_cache_req_hash: Optional[str] = None
-    _ai_cache_owner: str = ""
+    _meta = VALID_CLIENT_KEYS.get(client_key, {})
+    _is_low_key = bool(_meta.get("is_low_admin_key"))
+    _ai_cache_owner: str = str(_meta.get("low_admin_discord_id") or "") or client_key
+
+    # Idempotency-Key 是防重复提交/网络重试机制：
+    # 只要是 LOW key + 非流式请求就生效，不受 exact-cache 的 temperature/tools 限制影响。
+    _idem_header = http_request.headers.get("Idempotency-Key") if (_is_low_key and not request.stream) else None
+    _idem_body_hash = hashlib.sha256(_canonical_json(_req_body).encode()).hexdigest() if _idem_header else ""
+    if _idem_header:
+        _idem_status, _idem_resp = await _ai_idem_get(_ai_cache_owner, _idem_header, _idem_body_hash)
+        if _idem_status == "hit" and _idem_resp:
+            _idem_resp["cached"] = True
+            _idem_resp["cache_hit"] = True
+            _append_log(request.model, client_key, 0, 0, 0, "ok", exempt=True)
+            return JSONResponse(_idem_resp)
+        elif _idem_status == "conflict":
+            return JSONResponse(
+                {"error": {"message": "Idempotency-Key conflict: body changed", "type": "conflict", "code": "409"}},
+                status_code=409,
+            )
 
     if _ai_cacheable:
         _ai_cache_key, _ai_cache_req_hash = _build_ai_cache_key("/v1/chat/completions", client_key, _req_body)
-        _meta = VALID_CLIENT_KEYS.get(client_key, {})
-        _ai_cache_owner = str(_meta.get("low_admin_discord_id") or "") or client_key
-
-        # Idempotency-Key 检查（优先）
-        _idem_header = http_request.headers.get("Idempotency-Key")
-        if _idem_header:
-            _body_hash = hashlib.sha256(_canonical_json(_req_body).encode()).hexdigest()
-            _idem_status, _idem_resp = await _ai_idem_get(_ai_cache_owner, _idem_header, _body_hash)
-            if _idem_status == "hit" and _idem_resp:
-                _idem_resp["cached"] = True
-                _idem_resp["cache_hit"] = True
-                _append_log(request.model, client_key, 0, 0, 0, "ok", exempt=True)
-                return JSONResponse(_idem_resp)
-            elif _idem_status == "conflict":
-                return JSONResponse(
-                    {"error": {"message": "Idempotency-Key conflict: body changed", "type": "conflict", "code": "409"}},
-                    status_code=409,
-                )
 
         # Exact match 缓存
         _cached_resp = await _ai_cache_get(_ai_cache_key)
@@ -4390,12 +4391,16 @@ async def chat_completions(
                     completion_tokens=actual_completion,
                     ttl_sec=_ttl,
                 ))
-                # Idempotency-Key 写入（如果有且本次未命中）
-                _idem_hdr = http_request.headers.get("Idempotency-Key")
-                if _idem_hdr:
-                    _bh = hashlib.sha256(_canonical_json(_req_body).encode()).hexdigest()
+            # Idempotency-Key 写入（如果有且本次未命中）：比 exact cache 更宽松，
+            # 只要求 LOW key + 非流式，并缓存本次成功响应，避免客户端 retry 重复消耗。
+            if _idem_header:
+                try:
+                    _idem_resp_dict = resp.model_dump()
+                except Exception:
+                    _idem_resp_dict = None
+                if _idem_resp_dict:
                     asyncio.get_running_loop().create_task(
-                        _ai_idem_set(_ai_cache_owner, _idem_hdr, client_key, _bh, _resp_dict)
+                        _ai_idem_set(_ai_cache_owner, _idem_header, client_key, _idem_body_hash, _idem_resp_dict)
                     )
             # ────────────────────────────────────────────────────────────────
             return resp
@@ -4713,27 +4718,29 @@ async def messages_completions(
     _msg_cacheable, _ = _is_low_cacheable_request(client_key, _msg_body)
     _msg_cache_key: Optional[str] = None
     _msg_cache_req_hash: Optional[str] = None
-    _msg_cache_owner: str = ""
+    _msg_meta = VALID_CLIENT_KEYS.get(client_key, {})
+    _msg_is_low_key = bool(_msg_meta.get("is_low_admin_key"))
+    _msg_cache_owner: str = str(_msg_meta.get("low_admin_discord_id") or "") or client_key
+
+    # Idempotency-Key 是防重复提交/网络重试机制：
+    # 只要是 LOW key + 非流式请求就生效，不受 exact-cache 的 temperature/tools 限制影响。
+    _idem_hdr_msg = http_request.headers.get("Idempotency-Key") if (_msg_is_low_key and not request.stream) else None
+    _idem_body_hash_msg = hashlib.sha256(_canonical_json(_msg_body).encode()).hexdigest() if _idem_hdr_msg else ""
+    if _idem_hdr_msg:
+        _is_msg, _ir_msg = await _ai_idem_get(_msg_cache_owner, _idem_hdr_msg, _idem_body_hash_msg)
+        if _is_msg == "hit" and _ir_msg:
+            _ir_msg["cached"] = True
+            _ir_msg["cache_hit"] = True
+            _append_log(openai_request.model, client_key, 0, 0, 0, "ok", exempt=True)
+            return JSONResponse(_ir_msg)
+        elif _is_msg == "conflict":
+            return JSONResponse(
+                {"error": {"type": "invalid_request_error", "message": "Idempotency-Key conflict: body changed"}},
+                status_code=409,
+            )
 
     if _msg_cacheable:
         _msg_cache_key, _msg_cache_req_hash = _build_ai_cache_key("/v1/messages", client_key, _msg_body)
-        _msg_meta = VALID_CLIENT_KEYS.get(client_key, {})
-        _msg_cache_owner = str(_msg_meta.get("low_admin_discord_id") or "") or client_key
-
-        _idem_hdr_msg = http_request.headers.get("Idempotency-Key")
-        if _idem_hdr_msg:
-            _bh_msg = hashlib.sha256(_canonical_json(_msg_body).encode()).hexdigest()
-            _is_msg, _ir_msg = await _ai_idem_get(_msg_cache_owner, _idem_hdr_msg, _bh_msg)
-            if _is_msg == "hit" and _ir_msg:
-                _ir_msg["cached"] = True
-                _ir_msg["cache_hit"] = True
-                _append_log(openai_request.model, client_key, 0, 0, 0, "ok", exempt=True)
-                return JSONResponse(_ir_msg)
-            elif _is_msg == "conflict":
-                return JSONResponse(
-                    {"error": {"type": "invalid_request_error", "message": "Idempotency-Key conflict: body changed"}},
-                    status_code=409,
-                )
 
         _cached_msg = await _ai_cache_get(_msg_cache_key)
         if _cached_msg:
@@ -4865,12 +4872,17 @@ async def messages_completions(
                         completion_tokens=actual_completion,
                         ttl_sec=_ttl_msg,
                     ))
-                    _idem_hdr2 = http_request.headers.get("Idempotency-Key")
-                    if _idem_hdr2:
-                        _bh2 = hashlib.sha256(_canonical_json(_msg_body).encode()).hexdigest()
-                        asyncio.get_running_loop().create_task(
-                            _ai_idem_set(_msg_cache_owner, _idem_hdr2, client_key, _bh2, _resp_dict_msg)
-                        )
+            # Idempotency-Key 写入（如果有且本次未命中）：比 exact cache 更宽松，
+            # 只要求 LOW key + 非流式，并缓存本次成功响应，避免客户端 retry 重复消耗。
+            if _idem_hdr_msg:
+                try:
+                    _idem_resp_dict_msg = anthropic_response.model_dump()
+                except Exception:
+                    _idem_resp_dict_msg = None
+                if _idem_resp_dict_msg:
+                    asyncio.get_running_loop().create_task(
+                        _ai_idem_set(_msg_cache_owner, _idem_hdr_msg, client_key, _idem_body_hash_msg, _idem_resp_dict_msg)
+                    )
             # ─────────────────────────────────────────────────────────────────
             return anthropic_response
         except Exception:

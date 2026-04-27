@@ -54,7 +54,7 @@ export function MigrationPanel() {
       });
       const data = await r.json();
       if (!r.ok || !data.success) throw new Error(data.error || `HTTP ${r.status}`);
-      const total = Object.values<number>(data.imported).reduce((a, b) => a + b, 0);
+      const total = Object.values(data.imported as Record<string, number>).reduce((a, b) => a + b, 0);
       toast({
         title: "导入成功",
         description: `共 ${total} 行 / 耗时 ${data.stats.elapsed_sec}s / ${(data.stats.bytes_read / 1024 / 1024).toFixed(1)} MB`,
@@ -82,7 +82,7 @@ export function MigrationPanel() {
       });
       const data = await r.json();
       if (!r.ok || !data.success) throw new Error(data.error || `HTTP ${r.status}`);
-      const total = Object.values<number>(data.imported).reduce((a, b) => a + b, 0);
+      const total = Object.values(data.imported as Record<string, number>).reduce((a, b) => a + b, 0);
       toast({
         title: "拉取完成",
         description: `共 ${total} 行 / 耗时 ${data.stats.elapsed_sec}s / ${(data.stats.bytes_read / 1024 / 1024).toFixed(1)} MB`,
