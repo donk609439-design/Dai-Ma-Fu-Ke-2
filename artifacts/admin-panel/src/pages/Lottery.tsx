@@ -1,6 +1,19 @@
-import { useState, useRef, useCallback, useEffect } from "react";
+import { type ReactNode, useState, useRef, useCallback, useEffect } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { X, Gift, Check, Sparkles, KeyRound, LogIn, LogOut, Trophy } from "lucide-react";
+import {
+  X,
+  Gift,
+  Check,
+  Sparkles,
+  KeyRound,
+  LogIn,
+  LogOut,
+  Trophy,
+  ShieldCheck,
+  Star,
+  ArrowRight,
+  Loader2,
+} from "lucide-react";
 import { useDiscordAuth } from "@/hooks/useDiscordAuth";
 
 interface Prize {
@@ -22,13 +35,23 @@ const FALLBACK_SEGMENTS = [
 ];
 
 const SEG_COLORS = [
-  "#ef4444","#f97316","#eab308","#22c55e",
-  "#06b6d4","#6366f1","#8b5cf6","#ec4899",
+  "#ef4444",
+  "#f97316",
+  "#eab308",
+  "#22c55e",
+  "#06b6d4",
+  "#6366f1",
+  "#8b5cf6",
+  "#ec4899",
 ];
 
-const CX = 160, CY = 160, R = 148;
+const CX = 160;
+const CY = 160;
+const R = 148;
 
-function toRad(deg: number) { return (deg * Math.PI) / 180; }
+function toRad(deg: number) {
+  return (deg * Math.PI) / 180;
+}
 
 function sectorPath(startDeg: number, endDeg: number) {
   const sx = CX + R * Math.cos(toRad(startDeg));
@@ -56,6 +79,7 @@ function isPokeball(name: string) {
 function getAudioCtx(): AudioContext {
   return new (window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext)();
 }
+
 function playTick(ctx: AudioContext, when: number, vol = 0.08) {
   const osc = ctx.createOscillator();
   const g = ctx.createGain();
@@ -65,54 +89,131 @@ function playTick(ctx: AudioContext, when: number, vol = 0.08) {
   g.gain.setValueAtTime(vol, when);
   g.gain.exponentialRampToValueAtTime(0.0001, when + 0.08);
   osc.connect(g).connect(ctx.destination);
-  osc.start(when); osc.stop(when + 0.09);
+  osc.start(when);
+  osc.stop(when + 0.09);
 }
+
 function playSpinSound(duration: number): () => void {
   try {
     const ctx = getAudioCtx();
     for (let i = 0; i < 80; i++) {
       const t = i / 80;
-      const time = duration * (1 - Math.exp(-4 * t)) / (1 - Math.exp(-4));
+      const time = (duration * (1 - Math.exp(-4 * t))) / (1 - Math.exp(-4));
       playTick(ctx, ctx.currentTime + time, 0.07 * (1 - (time / duration) * 0.5));
     }
-    return () => { try { ctx.close(); } catch { /* ignore */ } };
+    return () => {
+      try {
+        ctx.close();
+      } catch {
+        /* ignore */
+      }
+    };
   } catch {
-    return () => {}; // 音频不可用时返回空函数
+    return () => {};
   }
 }
+
 function playWinSound() {
   try {
     const ctx = getAudioCtx();
     [523.25, 659.25, 783.99, 1046.5].forEach((freq, i) => {
-      const osc = ctx.createOscillator(); const g = ctx.createGain();
-      osc.type = "sine"; osc.frequency.value = freq;
+      const osc = ctx.createOscillator();
+      const g = ctx.createGain();
+      osc.type = "sine";
+      osc.frequency.value = freq;
       const start = ctx.currentTime + i * 0.12;
-      g.gain.setValueAtTime(0, start); g.gain.linearRampToValueAtTime(0.13, start + 0.04);
+      g.gain.setValueAtTime(0, start);
+      g.gain.linearRampToValueAtTime(0.13, start + 0.04);
       g.gain.exponentialRampToValueAtTime(0.0001, start + 0.5);
-      osc.connect(g).connect(ctx.destination); osc.start(start); osc.stop(start + 0.55);
+      osc.connect(g).connect(ctx.destination);
+      osc.start(start);
+      osc.stop(start + 0.55);
     });
-    setTimeout(() => { try { ctx.close(); } catch { /* ignore */ } }, 1500);
-  } catch { /* 音频不可用时静默忽略，不影响弹窗逻辑 */ }
+    setTimeout(() => {
+      try {
+        ctx.close();
+      } catch {
+        /* ignore */
+      }
+    }, 1500);
+  } catch {
+    /* 音频不可用时静默忽略，不影响弹窗逻辑 */
+  }
 }
+
 function playNoWinSound() {
   try {
     const ctx = getAudioCtx();
     [330, 247].forEach((freq, i) => {
-      const osc = ctx.createOscillator(); const g = ctx.createGain();
-      osc.type = "sine"; osc.frequency.value = freq;
+      const osc = ctx.createOscillator();
+      const g = ctx.createGain();
+      osc.type = "sine";
+      osc.frequency.value = freq;
       const start = ctx.currentTime + i * 0.18;
-      g.gain.setValueAtTime(0, start); g.gain.linearRampToValueAtTime(0.1, start + 0.03);
+      g.gain.setValueAtTime(0, start);
+      g.gain.linearRampToValueAtTime(0.1, start + 0.03);
       g.gain.exponentialRampToValueAtTime(0.0001, start + 0.4);
-      osc.connect(g).connect(ctx.destination); osc.start(start); osc.stop(start + 0.45);
+      osc.connect(g).connect(ctx.destination);
+      osc.start(start);
+      osc.stop(start + 0.45);
     });
-    setTimeout(() => { try { ctx.close(); } catch { /* ignore */ } }, 800);
-  } catch { /* 音频不可用时静默忽略 */ }
+    setTimeout(() => {
+      try {
+        ctx.close();
+      } catch {
+        /* ignore */
+      }
+    }, 800);
+  } catch {
+    /* 音频不可用时静默忽略 */
+  }
 }
 
-function isQuota(name: string) { return /额度/.test(name); }
+function isQuota(name: string) {
+  return /额度/.test(name);
+}
+
 function parseQuotaAmount(name: string): number | null {
   const m = name.match(/(\d+)/);
   return m ? parseInt(m[1], 10) : null;
+}
+
+function prizeEmoji(name: string) {
+  if (isPokeball(name)) return "⚡";
+  if (isQuota(name)) return "💎";
+  if (/谢谢|未中|再来/.test(name)) return "🍃";
+  return "🍊";
+}
+
+function shortenPrize(name: string) {
+  return name.length > 7 ? `${name.slice(0, 6)}…` : name;
+}
+
+function ModalShell({
+  children,
+  onClose,
+  maxWidth = "max-w-sm",
+}: {
+  children: ReactNode;
+  onClose: () => void;
+  maxWidth?: string;
+}) {
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-stone-950/55 p-4 backdrop-blur-md">
+      <div className={`relative w-full ${maxWidth} overflow-hidden rounded-[2rem] border border-white/70 bg-white/82 p-5 shadow-2xl shadow-orange-950/20 backdrop-blur-2xl`}>
+        <div className="pointer-events-none absolute -right-16 -top-16 h-40 w-40 rounded-full bg-orange-300/30 blur-2xl" />
+        <div className="pointer-events-none absolute -bottom-20 -left-16 h-44 w-44 rounded-full bg-cyan-300/20 blur-2xl" />
+        <button
+          onClick={onClose}
+          className="absolute right-4 top-4 z-10 rounded-2xl bg-white/70 p-2 text-stone-500 shadow-sm ring-1 ring-orange-900/10 transition hover:bg-white hover:text-stone-800"
+          aria-label="关闭"
+        >
+          <X className="h-4 w-4" />
+        </button>
+        <div className="relative z-10">{children}</div>
+      </div>
+    </div>
+  );
 }
 
 /* ── Claim modal（仅 Discord 模式）── */
@@ -158,78 +259,82 @@ function ClaimModal({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm">
-      <div className="bg-white rounded-2xl shadow-2xl p-6 w-full max-w-sm mx-4 relative">
-        <button onClick={onClose} className="absolute top-3 right-3 p-1 text-gray-400 hover:text-gray-600">
-          <X className="w-5 h-5" />
-        </button>
-        <div className="flex flex-col items-center gap-3 mb-5">
-          <div className="text-4xl">🎊</div>
-          <h2 className="text-lg font-bold text-gray-800">恭喜获得</h2>
-          <p className="text-base font-semibold text-amber-700 text-center">{prize}</p>
-          <p className="text-xs text-indigo-600 text-center">将领取到您的 Discord 背包（{userTag}）</p>
+    <ModalShell onClose={onClose}>
+      <div className="flex flex-col items-center text-center">
+        <div className="mb-3 grid h-16 w-16 place-items-center rounded-[1.4rem] bg-gradient-to-br from-amber-300 to-orange-500 text-3xl shadow-xl shadow-orange-500/25">
+          🎊
         </div>
+        <p className="text-xs font-black uppercase tracking-[0.24em] text-orange-600">Prize Unlocked</p>
+        <h2 className="mt-2 text-xl font-black text-stone-900">恭喜获得</h2>
+        <p className="mt-2 rounded-2xl bg-orange-50 px-4 py-2 text-base font-black text-orange-700 ring-1 ring-orange-200/70">
+          {prize}
+        </p>
+        <p className="mt-3 text-xs leading-5 text-indigo-600">将领取到您的 Discord 背包（{userTag}）</p>
 
         {status === "ok" ? (
-          <div className="flex flex-col items-center gap-3">
-            <div className="flex items-center gap-2 text-green-600 font-medium">
-              <Check className="w-5 h-5" /> {msg}
+          <div className="mt-5 w-full space-y-4">
+            <div className="flex items-center justify-center gap-2 rounded-2xl bg-cyan-50 px-4 py-3 text-sm font-bold text-cyan-700 ring-1 ring-cyan-200">
+              <Check className="h-5 w-5" />
+              {msg}
             </div>
-            <p className="text-xs text-gray-400">前往「我的背包」用 Discord 登录查看并激活</p>
-            <button onClick={onClose} className="mt-2 px-6 py-2 rounded-lg bg-amber-500 text-white text-sm font-medium hover:bg-amber-600">
+            <p className="text-xs text-muted-foreground">前往「我的背包」用 Discord 登录查看并激活</p>
+            <button
+              onClick={onClose}
+              className="w-full rounded-2xl bg-gradient-to-r from-orange-400 to-orange-600 px-6 py-3 text-sm font-black text-white shadow-lg shadow-orange-500/20 transition hover:-translate-y-0.5"
+            >
               关闭
             </button>
           </div>
         ) : (
-          <>
-            {status === "error" && <p className="text-xs text-red-500 mb-2 text-center">{msg}</p>}
-            <div className="flex gap-2">
-              <button onClick={onClose} className="flex-1 py-2.5 rounded-lg border border-gray-200 text-sm text-gray-600 hover:bg-gray-50">
+          <div className="mt-5 w-full">
+            {status === "error" && <p className="mb-3 text-center text-xs font-semibold text-red-500">{msg}</p>}
+            <div className="grid grid-cols-2 gap-2">
+              <button
+                onClick={onClose}
+                className="rounded-2xl border border-stone-200 bg-white/72 py-3 text-sm font-bold text-stone-600 transition hover:bg-white"
+              >
                 跳过
               </button>
               <button
                 onClick={doClaim}
                 disabled={status === "loading"}
-                className="flex-1 py-2.5 rounded-lg bg-indigo-600 text-white text-sm font-semibold hover:bg-indigo-700 disabled:opacity-50 flex items-center justify-center gap-1.5"
+                className="flex items-center justify-center gap-1.5 rounded-2xl bg-indigo-600 py-3 text-sm font-black text-white shadow-lg shadow-indigo-500/20 transition hover:bg-indigo-700 disabled:opacity-50"
               >
-                <Gift className="w-4 h-4" />
-                {status === "loading" ? "领取中…" : "领取到 DC 背包"}
+                {status === "loading" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Gift className="h-4 w-4" />}
+                {status === "loading" ? "领取中…" : "领取"}
               </button>
             </div>
-          </>
+          </div>
         )}
       </div>
-    </div>
+    </ModalShell>
   );
 }
 
 /* ── 首次捐献宝可梦球奖励弹窗 ── */
 function PokeballAwardModal({ itemId, onClose }: { itemId: number; onClose: () => void }) {
   return (
-    <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4">
-      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-sm p-6 relative overflow-hidden">
-        {/* 彩带背景 */}
-        <div className="absolute inset-0 pointer-events-none opacity-10"
-          style={{ background: "radial-gradient(circle at 50% 0%, #fbbf24 0%, transparent 70%), radial-gradient(circle at 80% 80%, #818cf8 0%, transparent 60%)" }} />
-
-        <div className="relative flex flex-col items-center gap-3 text-center">
-          <div className="text-5xl animate-bounce">🎁</div>
-          <div className="space-y-0.5">
-            <p className="text-xs font-semibold text-indigo-500 tracking-wide uppercase">首次捐献礼</p>
-            <h2 className="text-xl font-black text-gray-900">恭喜获得</h2>
-            <p className="text-base font-bold text-amber-700">宝可梦球【容量10000】</p>
+    <div className="fixed inset-0 z-[60] flex items-center justify-center bg-stone-950/60 p-4 backdrop-blur-md">
+      <div className="relative w-full max-w-sm overflow-hidden rounded-[2rem] border border-white/70 bg-white/86 p-6 text-center shadow-2xl shadow-orange-950/20 backdrop-blur-2xl">
+        <div className="pointer-events-none absolute inset-0 opacity-60 [background:radial-gradient(circle_at_50%_0%,rgba(251,191,36,.35),transparent_55%),radial-gradient(circle_at_85%_85%,rgba(99,102,241,.20),transparent_48%)]" />
+        <div className="relative flex flex-col items-center gap-3">
+          <div className="animate-bounce text-6xl">🎁</div>
+          <div>
+            <p className="text-xs font-black uppercase tracking-[0.24em] text-indigo-500">首次捐献礼</p>
+            <h2 className="mt-1 text-2xl font-black text-stone-950">恭喜获得</h2>
+            <p className="mt-2 text-base font-black text-orange-700">宝可梦球【容量10000】</p>
           </div>
 
-          <div className="w-full rounded-xl bg-amber-50 border border-amber-200 px-4 py-3 space-y-1">
-            <p className="text-xs text-gray-600">道具已存入您的 Discord 背包</p>
-            <p className="text-xs text-gray-400">道具编号 #{itemId}</p>
+          <div className="w-full rounded-3xl border border-orange-200 bg-orange-50/80 px-4 py-3">
+            <p className="text-xs font-semibold text-stone-600">道具已存入您的 Discord 背包</p>
+            <p className="mt-1 text-xs text-stone-400">道具编号 #{itemId}</p>
           </div>
 
-          <p className="text-xs text-gray-500">前往「我的背包」用 Discord 登录，激活后即可获得专属聚合 Key</p>
+          <p className="text-xs leading-5 text-stone-500">前往「我的背包」用 Discord 登录，激活后即可获得专属聚合 Key</p>
 
           <button
             onClick={onClose}
-            className="w-full py-2.5 rounded-xl bg-gradient-to-r from-amber-400 to-orange-400 text-white font-bold text-sm hover:from-amber-500 hover:to-orange-500 shadow-md"
+            className="w-full rounded-2xl bg-gradient-to-r from-amber-400 to-orange-500 py-3 text-sm font-black text-white shadow-lg shadow-orange-500/20 transition hover:-translate-y-0.5"
           >
             好的，知道了！
           </button>
@@ -261,7 +366,11 @@ function SaintModal({
 
   const doDonate = async () => {
     if (!dcToken) return;
-    if (!apiKey.trim()) { setStatus("error"); setMsg("请填入 Key"); return; }
+    if (!apiKey.trim()) {
+      setStatus("error");
+      setMsg("请填入 Key");
+      return;
+    }
     setStatus("loading");
     try {
       const res = await fetch("/key/dc-saint-donate", {
@@ -281,106 +390,127 @@ function SaintModal({
         setMsg(d.detail || "捐献失败");
       }
     } catch {
-      setStatus("error"); setMsg("网络错误");
+      setStatus("error");
+      setMsg("网络错误");
     }
   };
 
   return (
     <>
-      <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm p-4">
-        <div className="bg-white rounded-2xl shadow-2xl w-full max-w-sm p-6 relative">
-          <button onClick={onClose} className="absolute right-4 top-4 text-gray-400 hover:text-gray-600">
-            <X className="w-4 h-4" />
-          </button>
-
-          <div className="flex items-center gap-2 mb-1">
-            <span className="text-2xl">✨</span>
-            <h2 className="text-lg font-black text-amber-800">我要当圣人</h2>
+      <ModalShell onClose={onClose}>
+        <div>
+          <div className="mb-4 flex items-center gap-3">
+            <div className="grid h-12 w-12 place-items-center rounded-2xl bg-gradient-to-br from-amber-300 to-orange-500 text-white shadow-lg shadow-orange-500/20">
+              <Sparkles className="h-5 w-5" />
+            </div>
+            <div>
+              <p className="text-xs font-black uppercase tracking-[0.22em] text-orange-600">Saint Program</p>
+              <h2 className="text-xl font-black text-stone-950">我要当圣人</h2>
+            </div>
           </div>
-          <p className="text-xs text-gray-500 mb-3">捐献一个 JB Key → 获得 1 圣人点数 → 可抽 1 次奖</p>
+          <p className="mb-4 rounded-2xl bg-orange-50/80 px-3 py-2 text-xs font-semibold leading-5 text-stone-600 ring-1 ring-orange-200/60">
+            捐献一个 JB Key → 获得 1 圣人点数 → 可抽 1 次奖
+          </p>
 
           {!dcToken ? (
             <div className="space-y-3 text-center">
-              <p className="text-sm text-gray-600">需要先用 Discord 登录才能参与圣人活动</p>
+              <p className="text-sm text-stone-600">需要先用 Discord 登录才能参与圣人活动</p>
               <button
-                onClick={() => { onClose(); onLogin(); }}
-                className="w-full py-2.5 rounded-xl bg-indigo-600 text-white text-sm font-bold hover:bg-indigo-700 flex items-center justify-center gap-2"
+                onClick={() => {
+                  onClose();
+                  onLogin();
+                }}
+                className="flex w-full items-center justify-center gap-2 rounded-2xl bg-indigo-600 py-3 text-sm font-black text-white shadow-lg shadow-indigo-500/20 transition hover:bg-indigo-700"
               >
-                <LogIn className="w-4 h-4" />
+                <LogIn className="h-4 w-4" />
                 Discord 登录
               </button>
-              <button onClick={onClose} className="w-full py-2 rounded-xl border border-gray-200 text-sm text-gray-500 hover:bg-gray-50">
+              <button
+                onClick={onClose}
+                className="w-full rounded-2xl border border-stone-200 bg-white/70 py-3 text-sm font-bold text-stone-500 transition hover:bg-white"
+              >
                 取消
               </button>
             </div>
           ) : status === "ok" ? (
-            <div className="space-y-3 text-center">
-              <div className="text-4xl">🎖️</div>
-              <p className="text-base font-bold text-amber-700">捐献成功！</p>
-              <p className="text-sm text-gray-600">您当前共有 <span className="font-black text-amber-600 text-lg">{newPoints}</span> 个圣人点数</p>
+            <div className="space-y-4 text-center">
+              <div className="text-5xl">🎖️</div>
+              <p className="text-lg font-black text-orange-700">捐献成功！</p>
+              <p className="text-sm text-stone-600">
+                您当前共有 <span className="text-2xl font-black text-orange-600">{newPoints}</span> 个圣人点数
+              </p>
               {pokeballAward && (
-                <div className="rounded-xl bg-gradient-to-r from-amber-50 to-orange-50 border border-amber-200 px-3 py-2 flex items-center gap-2">
-                  <span className="text-xl">🎁</span>
-                  <p className="text-xs text-amber-800 font-semibold text-left">首次捐献奖励已发放！<br/>
-                    <span className="font-normal text-amber-600">查看下方弹窗了解详情</span>
+                <div className="flex items-center gap-3 rounded-2xl border border-orange-200 bg-gradient-to-r from-orange-50 to-amber-50 px-3 py-3">
+                  <span className="text-2xl">🎁</span>
+                  <p className="text-left text-xs font-bold leading-5 text-orange-800">
+                    首次捐献奖励已发放！<br />
+                    <span className="font-medium text-orange-600">查看下方弹窗了解详情</span>
                   </p>
                 </div>
               )}
               <button
-                onClick={() => { onDone(newPoints); onClose(); }}
-                className="w-full py-2.5 rounded-xl bg-amber-500 text-white font-bold hover:bg-amber-600"
+                onClick={() => {
+                  onDone(newPoints);
+                  onClose();
+                }}
+                className="w-full rounded-2xl bg-gradient-to-r from-orange-400 to-orange-600 py-3 font-black text-white shadow-lg shadow-orange-500/20 transition hover:-translate-y-0.5"
               >
                 好的，去抽奖！
               </button>
             </div>
           ) : (
             <div className="space-y-3">
-              <p className="text-xs text-indigo-600 flex items-center gap-1">
-                <span className="font-semibold">Discord：</span>{userTag}
+              <p className="flex items-center gap-1 rounded-2xl bg-indigo-50 px-3 py-2 text-xs font-bold text-indigo-600 ring-1 ring-indigo-100">
+                <ShieldCheck className="h-3.5 w-3.5" />
+                Discord：{userTag}
               </p>
               <div>
-                <label className="text-xs font-semibold text-gray-500 mb-1 block">要捐献的 JB Key</label>
+                <label className="mb-1.5 block text-xs font-black uppercase tracking-[0.16em] text-stone-500">要捐献的 JB Key</label>
                 <input
                   type="text"
                   value={apiKey}
-                  onChange={e => { setApiKey(e.target.value); setStatus("idle"); }}
+                  onChange={(e) => {
+                    setApiKey(e.target.value);
+                    setStatus("idle");
+                  }}
                   placeholder="粘贴 Key（捐献后自动从数据库删除）"
-                  className="w-full px-3 py-2.5 rounded-lg border border-gray-200 text-sm focus:outline-none focus:ring-2 focus:ring-amber-300 font-mono"
-                  onKeyDown={e => e.key === "Enter" && doDonate()}
+                  className="w-full rounded-2xl border border-orange-200 bg-white/78 px-3 py-3 font-mono text-sm shadow-inner outline-none transition focus:border-orange-400 focus:ring-4 focus:ring-orange-200/60"
+                  onKeyDown={(e) => e.key === "Enter" && doDonate()}
                 />
               </div>
-              {status === "error" && <p className="text-xs text-red-500 text-center">{msg}</p>}
-              <div className="flex gap-2 pt-1">
-                <button onClick={onClose} className="flex-1 py-2.5 rounded-xl border border-gray-200 text-sm text-gray-600 hover:bg-gray-50">
+              {status === "error" && <p className="text-center text-xs font-semibold text-red-500">{msg}</p>}
+              <div className="grid grid-cols-2 gap-2 pt-1">
+                <button
+                  onClick={onClose}
+                  className="rounded-2xl border border-stone-200 bg-white/70 py-3 text-sm font-bold text-stone-600 transition hover:bg-white"
+                >
                   取消
                 </button>
                 <button
                   onClick={doDonate}
                   disabled={status === "loading"}
-                  className="flex-1 py-2.5 rounded-xl bg-amber-500 text-white text-sm font-bold hover:bg-amber-600 disabled:opacity-50 flex items-center justify-center gap-1.5"
+                  className="flex items-center justify-center gap-1.5 rounded-2xl bg-orange-500 py-3 text-sm font-black text-white shadow-lg shadow-orange-500/20 transition hover:bg-orange-600 disabled:opacity-50"
                 >
-                  <KeyRound className="w-4 h-4" />
+                  {status === "loading" ? <Loader2 className="h-4 w-4 animate-spin" /> : <KeyRound className="h-4 w-4" />}
                   {status === "loading" ? "处理中…" : "捐献 Key"}
                 </button>
               </div>
             </div>
           )}
         </div>
-      </div>
+      </ModalShell>
 
-      {/* 宝可梦球奖励弹窗（叠在圣人弹窗上方） */}
-      {pokeballAward && (
-        <PokeballAwardModal
-          itemId={pokeballAward.itemId}
-          onClose={() => setPokeballAward(null)}
-        />
-      )}
+      {pokeballAward && <PokeballAwardModal itemId={pokeballAward.itemId} onClose={() => setPokeballAward(null)} />}
     </>
   );
 }
 
 /* ── 圣人点数排行榜 弹窗 ── */
-interface LeaderEntry { rank: number; name: string; total_earned: number; }
+interface LeaderEntry {
+  rank: number;
+  name: string;
+  total_earned: number;
+}
 
 function LeaderboardModal({ onClose }: { onClose: () => void }) {
   const [entries, setEntries] = useState<LeaderEntry[]>([]);
@@ -388,59 +518,58 @@ function LeaderboardModal({ onClose }: { onClose: () => void }) {
 
   useEffect(() => {
     fetch("/key/saint-leaderboard")
-      .then(r => r.json())
-      .then(d => { setEntries(d.entries ?? []); setLoading(false); })
+      .then((r) => r.json())
+      .then((d) => {
+        setEntries(d.entries ?? []);
+        setLoading(false);
+      })
       .catch(() => setLoading(false));
   }, []);
 
   const medals = ["🥇", "🥈", "🥉"];
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm p-4">
-      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-sm mx-auto relative flex flex-col"
-           style={{ maxHeight: "80vh" }}>
-        <div className="flex items-center justify-between px-5 pt-5 pb-3 border-b border-amber-100 flex-shrink-0">
-          <div className="flex items-center gap-2">
-            <Trophy className="w-5 h-5 text-amber-500" />
-            <h2 className="text-base font-black text-amber-900">圣人点数排行榜</h2>
+    <ModalShell onClose={onClose} maxWidth="max-w-md">
+      <div className="flex max-h-[78vh] flex-col">
+        <div className="mb-4 flex items-center gap-3 pr-10">
+          <div className="grid h-12 w-12 place-items-center rounded-2xl bg-gradient-to-br from-amber-300 to-orange-500 text-white shadow-lg shadow-orange-500/20">
+            <Trophy className="h-5 w-5" />
           </div>
-          <button onClick={onClose} className="p-1 text-gray-400 hover:text-gray-600">
-            <X className="w-4 h-4" />
-          </button>
+          <div>
+            <p className="text-xs font-black uppercase tracking-[0.22em] text-orange-600">Leaderboard</p>
+            <h2 className="text-xl font-black text-stone-950">圣人点数排行榜</h2>
+          </div>
         </div>
-        <p className="text-xs text-gray-400 px-5 py-1.5 flex-shrink-0">按累计获得点数排名（不计消耗）</p>
+        <p className="mb-3 rounded-2xl bg-orange-50/70 px-3 py-2 text-xs text-stone-500 ring-1 ring-orange-100">按累计获得点数排名（不计消耗）</p>
 
-        <div className="overflow-y-auto flex-1 px-4 pb-4">
+        <div className="min-h-0 flex-1 overflow-y-auto pr-1">
           {loading ? (
-            <div className="py-10 text-center text-sm text-gray-400">加载中…</div>
+            <div className="py-12 text-center text-sm text-stone-400">加载中…</div>
           ) : entries.length === 0 ? (
-            <div className="py-10 text-center text-sm text-gray-400">暂无数据</div>
+            <div className="py-12 text-center text-sm text-stone-400">暂无数据</div>
           ) : (
-            <ol className="space-y-2 mt-2">
+            <ol className="space-y-2">
               {entries.map((e) => (
                 <li
                   key={e.rank}
-                  className="flex items-center gap-3 px-3 py-2 rounded-xl border"
-                  style={{
-                    background: e.rank === 1 ? "linear-gradient(90deg,#fef9c3,#fef3c7)" : e.rank === 2 ? "linear-gradient(90deg,#f3f4f6,#e5e7eb)" : e.rank === 3 ? "linear-gradient(90deg,#fff7ed,#fde8c7)" : "transparent",
-                    borderColor: e.rank <= 3 ? "#fcd34d" : "#f3f4f6",
-                  }}
+                  className="flex items-center gap-3 rounded-2xl border border-white/70 bg-white/58 px-3 py-3 shadow-sm backdrop-blur"
                 >
-                  <span className="text-lg w-6 text-center flex-shrink-0">
-                    {e.rank <= 3 ? medals[e.rank - 1] : `${e.rank}`}
+                  <span className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-orange-50 text-center text-lg font-black text-orange-700 ring-1 ring-orange-100">
+                    {e.rank <= 3 ? medals[e.rank - 1] : e.rank}
                   </span>
-                  <span className="flex-1 text-xs font-medium text-gray-700">{e.name}</span>
-                  <span className="text-sm font-black text-amber-600 flex-shrink-0">{e.total_earned} pt</span>
+                  <span className="min-w-0 flex-1 truncate text-sm font-bold text-stone-700">{e.name}</span>
+                  <span className="shrink-0 rounded-full bg-orange-100 px-2.5 py-1 text-xs font-black text-orange-700">
+                    {e.total_earned} pt
+                  </span>
                 </li>
               ))}
             </ol>
           )}
         </div>
       </div>
-    </div>
+    </ModalShell>
   );
 }
-
 
 export default function Lottery() {
   const [rotation, setRotation] = useState(0);
@@ -471,11 +600,15 @@ export default function Lottery() {
   // 刷新圣人点数（仅 DC 模式）
   // authed=false 表示 token 在后端已失效（如服务器重启），与 0 点区分
   useEffect(() => {
-    if (!dcToken) { setSaintPoints(null); setSaintAuthed(null); return; }
+    if (!dcToken) {
+      setSaintPoints(null);
+      setSaintAuthed(null);
+      return;
+    }
     const ctrl = new AbortController();
     fetch(`/key/dc-saint-points?discord_token=${encodeURIComponent(dcToken)}`, { signal: ctrl.signal })
-      .then(r => r.json())
-      .then(d => {
+      .then((r) => r.json())
+      .then((d) => {
         if (ctrl.signal.aborted) return;
         setSaintPoints(d.points ?? 0);
         setSaintAuthed(d.authed !== false);
@@ -484,9 +617,10 @@ export default function Lottery() {
     return () => ctrl.abort();
   }, [dcToken]);
 
-  const segments = prizes && prizes.length > 0
-    ? prizes.map((p, i) => ({ prize: p.name, bg: SEG_COLORS[i % SEG_COLORS.length], weight: p.weight }))
-    : FALLBACK_SEGMENTS.map(s => ({ ...s, weight: 10 }));
+  const segments =
+    prizes && prizes.length > 0
+      ? prizes.map((p, i) => ({ prize: p.name, bg: SEG_COLORS[i % SEG_COLORS.length], weight: p.weight }))
+      : FALLBACK_SEGMENTS.map((s) => ({ ...s, weight: 10 }));
 
   const N = segments.length;
   const SEG_ANGLE = 360 / N;
@@ -495,10 +629,16 @@ export default function Lottery() {
     if (spinning) return;
 
     // 未登录
-    if (!dcToken) { setShowSaint(true); return; }
+    if (!dcToken) {
+      setShowSaint(true);
+      return;
+    }
 
     // 已有 dcToken 但后端不认（服务器重启/会话过期）→ 提示重新登录
-    if (saintAuthed === false) { dcLogin(); return; }
+    if (saintAuthed === false) {
+      dcLogin();
+      return;
+    }
 
     // 等待点数加载完毕
     if (saintPoints === null) return;
@@ -539,7 +679,7 @@ export default function Lottery() {
     }
 
     // 根据后端返回的奖品名找段落索引
-    const idx = segments.findIndex(s => s.prize === backendPrize);
+    const idx = segments.findIndex((s) => s.prize === backendPrize);
     const target = idx >= 0 ? idx : weightedRandom(segments);
 
     setResult(null);
@@ -576,6 +716,23 @@ export default function Lottery() {
     }, 3300);
   }, [spinning, rotation, segments, SEG_ANGLE, saintPoints, saintAuthed, dcToken, dcLogin]);
 
+  const sessionExpired = !!dcToken && saintAuthed === false;
+  const noPoints = !dcToken || (!sessionExpired && (saintPoints ?? 0) < 1);
+  const spinLabel = spinning ? "旋 转 中…" : sessionExpired ? "重 新 登 录" : noPoints ? "去 当 圣 人" : "抽　　奖";
+  const spinHint = result
+    ? result.win
+      ? "奖品已锁定，记得及时领取可入库奖励"
+      : "本次未中奖，补充圣人点数后可以继续挑战"
+    : spinning
+      ? "能量加速中，大奖正在靠近指针"
+      : !dcToken
+        ? "Discord 登录后捐献 Key 获得圣人点数，方可抽奖"
+        : sessionExpired
+          ? "Discord 会话已过期 · 点击按钮重新登录"
+          : (saintPoints ?? 0) < 1
+            ? "圣人点数不足 · 点击捐献 Key 获得抽奖次数"
+            : "圣人点数就绪，按下按钮开启好运";
+
   return (
     <>
       {showClaim && result && dcToken && (
@@ -599,227 +756,301 @@ export default function Lottery() {
         />
       )}
 
-      {showLeaderboard && (
-        <LeaderboardModal onClose={() => setShowLeaderboard(false)} />
-      )}
+      {showLeaderboard && <LeaderboardModal onClose={() => setShowLeaderboard(false)} />}
 
-      {/* 我要当圣人 悬浮按钮 & DC 登录 & 点数显示 */}
-      <div className="fixed left-4 z-40 flex flex-col items-start gap-2" style={{ top: 64 }}>
-        <button
-          onClick={() => setShowSaint(true)}
-          className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-bold shadow-md border transition-colors"
-          style={{
-            background: "linear-gradient(135deg, #fef3c7, #fde68a)",
-            borderColor: "#f59e0b",
-            color: "#92400e",
-          }}
-        >
-          <Sparkles className="w-3.5 h-3.5 text-amber-500" />
-          我要当圣人
-        </button>
+      <div className="lottery-stage fixed inset-0 overflow-hidden">
+        <div className="lottery-grid" />
+        <div className="lottery-aurora lottery-aurora-one" />
+        <div className="lottery-aurora lottery-aurora-two" />
+        <div className="lottery-aurora lottery-aurora-three" />
 
-        <button
-          onClick={() => setShowLeaderboard(true)}
-          className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-bold shadow-md border transition-colors"
-          style={{
-            background: "linear-gradient(135deg, #ecfdf5, #d1fae5)",
-            borderColor: "#34d399",
-            color: "#065f46",
-          }}
-        >
-          <Trophy className="w-3.5 h-3.5 text-emerald-500" />
-          排行榜
-        </button>
+        <div className="relative z-10 flex min-h-screen flex-col px-4 py-20 sm:px-6 lg:px-10">
+          <div className="mx-auto grid w-full max-w-7xl flex-1 items-center gap-6 lg:grid-cols-[320px_minmax(420px,1fr)_320px]">
+            {/* Left control deck */}
+            <aside className="order-2 space-y-3 lg:order-1">
+              <div className="rounded-[2rem] border border-white/65 bg-white/58 p-4 shadow-2xl shadow-orange-950/10 backdrop-blur-2xl">
+                <div className="mb-4 flex items-center gap-3">
+                  <div className="grid h-11 w-11 place-items-center rounded-2xl bg-gradient-to-br from-orange-300 to-orange-600 text-white shadow-lg shadow-orange-500/20">
+                    <Sparkles className="h-5 w-5" />
+                  </div>
+                  <div>
+                    <p className="text-xs font-black uppercase tracking-[0.2em] text-orange-600">Action Deck</p>
+                    <h2 className="text-lg font-black text-stone-950">圣人控制台</h2>
+                  </div>
+                </div>
 
-        {/* DC 登录状态 */}
-        {dcLoggedIn ? (
-          <button
-            onClick={dcLogout}
-            className="flex items-center gap-1 px-3 py-1.5 rounded-xl text-xs font-semibold shadow-md border transition-colors"
-            style={{ background: "rgba(99,102,241,0.12)", borderColor: "#818cf8", color: "#4338ca" }}
-            title="点击退出 Discord 登录"
-          >
-            <LogOut className="w-3 h-3" />
-            {userTag}
-          </button>
-        ) : (
-          <button
-            onClick={dcLogin}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-bold shadow-md border transition-colors"
-            style={{ background: "rgba(99,102,241,0.1)", borderColor: "#818cf8", color: "#4338ca" }}
-          >
-            <LogIn className="w-3.5 h-3.5" />
-            Discord 登录
-          </button>
-        )}
+                <div className="grid gap-2">
+                  <button
+                    onClick={() => setShowSaint(true)}
+                    className="group flex items-center justify-between rounded-2xl border border-orange-200 bg-gradient-to-r from-orange-50 to-amber-50 px-3.5 py-3 text-left shadow-sm transition hover:-translate-y-0.5 hover:shadow-lg hover:shadow-orange-500/10"
+                  >
+                    <span className="flex items-center gap-2 text-sm font-black text-orange-800">
+                      <Sparkles className="h-4 w-4 text-orange-500" />
+                      我要当圣人
+                    </span>
+                    <ArrowRight className="h-4 w-4 text-orange-500 transition group-hover:translate-x-0.5" />
+                  </button>
 
-        {/* 圣人点数显示 */}
-        {dcToken && saintAuthed === false ? (
-          <div
-            className="flex items-center gap-1 px-3 py-1 rounded-xl text-xs font-semibold shadow border cursor-pointer"
-            style={{ background: "rgba(255,255,255,0.85)", borderColor: "#fda4af", color: "#be123c" }}
-            onClick={dcLogin}
-            title="点击重新登录 Discord"
-          >
-            <span>⚠️</span>
-            <span>会话过期，点此重登</span>
-          </div>
-        ) : dcToken && saintPoints !== null ? (
-          <div
-            className="flex items-center gap-1 px-3 py-1 rounded-xl text-xs font-semibold shadow border"
-            style={{ background: "rgba(255,255,255,0.85)", borderColor: "#fcd34d", color: "#78350f" }}
-          >
-            <span>✨</span>
-            <span>圣人点数 <span className="font-black text-amber-600">{saintPoints}</span></span>
-          </div>
-        ) : null}
-      </div>
+                  <button
+                    onClick={() => setShowLeaderboard(true)}
+                    className="group flex items-center justify-between rounded-2xl border border-cyan-200 bg-gradient-to-r from-cyan-50 to-emerald-50 px-3.5 py-3 text-left shadow-sm transition hover:-translate-y-0.5 hover:shadow-lg hover:shadow-cyan-500/10"
+                  >
+                    <span className="flex items-center gap-2 text-sm font-black text-cyan-800">
+                      <Trophy className="h-4 w-4 text-cyan-600" />
+                      圣人排行榜
+                    </span>
+                    <ArrowRight className="h-4 w-4 text-cyan-600 transition group-hover:translate-x-0.5" />
+                  </button>
 
-      <div
-        className="fixed inset-0 flex flex-col items-center justify-center gap-6"
-        style={{ background: "linear-gradient(135deg, #fff7ed 0%, #fef3c7 55%, #fde68a 100%)" }}
-      >
-        <h1 className="text-3xl font-black tracking-widest" style={{ color: "#92400e", textShadow: "0 2px 0 rgba(0,0,0,0.08)" }}>
-          橘子机
-        </h1>
+                  {dcLoggedIn ? (
+                    <button
+                      onClick={dcLogout}
+                      className="flex items-center justify-between rounded-2xl border border-indigo-200 bg-indigo-50/80 px-3.5 py-3 text-left shadow-sm transition hover:bg-indigo-50"
+                      title="点击退出 Discord 登录"
+                    >
+                      <span className="min-w-0 flex items-center gap-2 text-sm font-black text-indigo-700">
+                        <LogOut className="h-4 w-4 shrink-0" />
+                        <span className="truncate">{userTag}</span>
+                      </span>
+                      <span className="text-[10px] font-black uppercase tracking-wider text-indigo-400">Logout</span>
+                    </button>
+                  ) : (
+                    <button
+                      onClick={dcLogin}
+                      className="flex items-center justify-center gap-2 rounded-2xl border border-indigo-200 bg-indigo-600 px-3.5 py-3 text-sm font-black text-white shadow-lg shadow-indigo-500/20 transition hover:bg-indigo-700"
+                    >
+                      <LogIn className="h-4 w-4" />
+                      Discord 登录
+                    </button>
+                  )}
+                </div>
+              </div>
 
-        <div className="relative flex items-center justify-center" style={{ width: 360, height: 360 }}>
-          {/* Soft rainbow glow behind the wheel */}
-          <div className="absolute rounded-full" style={{
-            width: 340, height: 340,
-            background: "conic-gradient(from -90deg, hsl(0,80%,80%), hsl(60,80%,80%), hsl(120,80%,80%), hsl(180,80%,80%), hsl(240,80%,80%), hsl(300,80%,80%), hsl(360,80%,80%))",
-            filter: "blur(22px)", opacity: 0.4,
-          }} />
+              <div className="rounded-[2rem] border border-white/65 bg-white/50 p-4 shadow-xl shadow-orange-950/5 backdrop-blur-2xl">
+                <p className="mb-3 text-xs font-black uppercase tracking-[0.22em] text-stone-400">Wallet</p>
+                {dcToken && saintAuthed === false ? (
+                  <button
+                    className="flex w-full items-center gap-2 rounded-2xl border border-rose-200 bg-rose-50 px-3 py-3 text-left text-sm font-bold text-rose-700"
+                    onClick={dcLogin}
+                    title="点击重新登录 Discord"
+                  >
+                    <span>⚠️</span>
+                    会话过期，点此重登
+                  </button>
+                ) : dcToken && saintPoints !== null ? (
+                  <div className="rounded-2xl border border-orange-200 bg-orange-50/80 px-4 py-4">
+                    <p className="text-xs font-bold text-orange-700">圣人点数</p>
+                    <p className="mt-1 text-4xl font-black tracking-tight text-stone-950">{saintPoints}</p>
+                    <p className="mt-2 text-xs leading-5 text-stone-500">每 1 点可启动一次橘子机</p>
+                  </div>
+                ) : (
+                  <div className="rounded-2xl border border-stone-200 bg-white/60 px-4 py-4 text-sm font-semibold text-stone-500">
+                    登录后显示点数
+                  </div>
+                )}
+              </div>
+            </aside>
 
-          {/* Rotating wheel container (both gradient + SVG rotate together) */}
-          <div style={{
-            position: "relative", width: 320, height: 320, zIndex: 1,
-            transform: `rotate(${rotation}deg)`,
-            transition: transitionOn ? "transform 3.2s cubic-bezier(0.05, 0.9, 0.1, 1)" : "none",
-            filter: "drop-shadow(0 6px 24px rgba(0,0,0,0.15))",
-          }}>
-            {/* Rainbow conic-gradient wheel background */}
-            <div style={{
-              position: "absolute", inset: 0, borderRadius: "50%",
-              background: "conic-gradient(from -90deg, hsl(0,60%,84%), hsl(51,65%,84%), hsl(102,60%,84%), hsl(153,60%,84%), hsl(204,65%,84%), hsl(255,60%,84%), hsl(306,60%,84%), hsl(357,60%,84%))",
-              border: "4.5px solid white",
-              boxSizing: "border-box",
-            }} />
+            {/* Center stage */}
+            <main className="order-1 flex flex-col items-center lg:order-2">
+              <div className="mb-5 text-center">
+                <div className="mx-auto mb-3 inline-flex items-center gap-2 rounded-full border border-white/70 bg-white/58 px-4 py-2 text-xs font-black uppercase tracking-[0.22em] text-orange-700 shadow-sm backdrop-blur">
+                  <Star className="h-3.5 w-3.5 fill-orange-400 text-orange-500" />
+                  Orange Arcade
+                </div>
+                <h1 className="text-5xl font-black tracking-tight text-stone-950 sm:text-6xl lg:text-7xl">
+                  橘子<span className="citrus-text">机</span>
+                </h1>
+                <p className="mt-3 text-sm font-semibold text-stone-500">圣人点数驱动的高级抽奖转盘</p>
+              </div>
 
-            {/* SVG overlay: white dividers + emoji labels + center hub */}
-            <svg viewBox="0 0 320 320" style={{ position: "absolute", inset: 0, width: "100%", height: "100%" }}>
-              {/* White radial divider lines */}
-              {segments.map((_, i) => {
-                const angleDeg = -90 + i * SEG_ANGLE;
-                const x2 = CX + R * Math.cos(toRad(angleDeg));
-                const y2 = CY + R * Math.sin(toRad(angleDeg));
-                return <line key={i} x1={CX} y1={CY} x2={x2} y2={y2} stroke="white" strokeWidth="3" strokeLinecap="round" />;
-              })}
+              <div className="lottery-wheel-frame relative grid h-[min(86vw,520px)] w-[min(86vw,520px)] place-items-center rounded-full">
+                <div className="lottery-wheel-halo" />
 
-              {/* Prize label in each segment */}
-              {segments.map((seg, i) => {
-                const midDeg = -90 + (i + 0.5) * SEG_ANGLE;
-                const textR = R * 0.62;
-                const tx = CX + textR * Math.cos(toRad(midDeg));
-                const ty = CY + textR * Math.sin(toRad(midDeg));
-                const label = seg.prize.length > 5 ? seg.prize.slice(0, 4) + "…" : seg.prize;
-                return (
-                  <g key={i}>
-                    <text x={tx} y={ty - 8} textAnchor="middle" dominantBaseline="middle"
-                      fontSize={20} style={{ userSelect: "none" }}>🍊</text>
-                    <text x={tx} y={ty + 14} textAnchor="middle" dominantBaseline="middle"
-                      fontSize={9} fill="rgba(0,0,0,0.55)" fontWeight="600" style={{ userSelect: "none" }}>
-                      {label}
-                    </text>
-                  </g>
-                );
-              })}
-
-              {/* Outer circle border */}
-              <circle cx={CX} cy={CY} r={R} fill="none" stroke="white" strokeWidth="5" />
-
-              {/* Center hub: white > amber > white dot */}
-              <circle cx={CX} cy={CY} r={28} fill="white" />
-              <circle cx={CX} cy={CY} r={28} fill="none" stroke="#f59e0b" strokeWidth="5" />
-              <circle cx={CX} cy={CY} r={16} fill="#f59e0b" />
-              <circle cx={CX} cy={CY} r={8}  fill="white" />
-              <circle cx={CX} cy={CY} r={3}  fill="#f59e0b" />
-            </svg>
-          </div>
-
-          {/* Red triangle pointer (non-rotating) */}
-          <div className="absolute z-10" style={{
-            top: 6, left: "50%", transform: "translateX(-50%)",
-            width: 0, height: 0,
-            borderLeft: "14px solid transparent", borderRight: "14px solid transparent",
-            borderTop: "32px solid #dc2626",
-            filter: "drop-shadow(0 3px 5px rgba(0,0,0,0.35))",
-          }} />
-        </div>
-
-        <div className="h-10 flex items-center justify-center">
-          {result ? (
-            <div className="flex items-center gap-2">
-              <p className="text-xl font-black tracking-wide animate-bounce" style={{ color: result.win ? "#065f46" : "#78350f" }}>
-                🍊&nbsp;{result.prize}
-              </p>
-              {result.win && (isPokeball(result.prize) || isQuota(result.prize)) && !claimed && (
-                <button
-                  onClick={() => setShowClaim(true)}
-                  className="text-xs px-2 py-1 rounded-md bg-amber-100 text-amber-700 border border-amber-300 hover:bg-amber-200 font-medium"
+                <div
+                  className="relative z-10 h-[min(72vw,420px)] w-[min(72vw,420px)]"
+                  style={{
+                    transform: `rotate(${rotation}deg)`,
+                    transition: transitionOn ? "transform 3.2s cubic-bezier(0.05, 0.9, 0.1, 1)" : "none",
+                    filter: "drop-shadow(0 28px 52px rgba(124,45,18,0.24))",
+                  }}
                 >
-                  领取
-                </button>
-              )}
-              {result.win && (isPokeball(result.prize) || isQuota(result.prize)) && claimed && (
-                <span className="text-xs text-green-600 font-medium flex items-center gap-1">
-                  <Check className="w-3 h-3" />已领取
-                </span>
-              )}
-            </div>
-          ) : spinning ? (
-            <p className="text-sm text-amber-700 opacity-60 font-medium">正在抽奖…</p>
-          ) : !dcToken ? (
-            <p className="text-xs text-amber-700/70 font-medium">↖ Discord 登录后捐献 Key 获得圣人点数，方可抽奖</p>
-          ) : saintAuthed === false ? (
-            <p className="text-xs text-rose-500 font-medium">Discord 会话已过期 · 点击按钮重新登录</p>
-          ) : (saintPoints ?? 0) < 1 ? (
-            <p className="text-xs text-amber-700/70 font-medium">圣人点数不足 · 点击左上角捐献 Key</p>
-          ) : null}
-        </div>
+                  <svg viewBox="0 0 320 320" className="h-full w-full overflow-visible">
+                    <defs>
+                      <filter id="lotteryInnerShadow" x="-20%" y="-20%" width="140%" height="140%">
+                        <feDropShadow dx="0" dy="8" stdDeviation="6" floodColor="#7c2d12" floodOpacity="0.18" />
+                      </filter>
+                    </defs>
 
-        {(() => {
-          const sessionExpired = !!dcToken && saintAuthed === false;
-          const noPoints = !dcToken || (!sessionExpired && (saintPoints ?? 0) < 1);
-          return (
-            <button
-              onClick={doSpin}
-              disabled={spinning}
-              className="px-16 py-4 text-white font-black text-2xl rounded-2xl select-none tracking-widest transition-all duration-75"
-              style={{
-                background: spinning
-                  ? "#9ca3af"
-                  : sessionExpired
-                  ? "linear-gradient(180deg, #f43f5e 0%, #e11d48 100%)"
-                  : noPoints
-                  ? "linear-gradient(180deg, #fbbf24 0%, #f59e0b 100%)"
-                  : "linear-gradient(180deg, #f87171 0%, #ef4444 100%)",
-                boxShadow: spinning
-                  ? "0 2px 0 #6b7280"
-                  : sessionExpired
-                  ? "0 6px 0 #9f1239"
-                  : noPoints
-                  ? "0 6px 0 #d97706"
-                  : "0 6px 0 #991b1b",
-                transform: spinning ? "translateY(4px)" : "translateY(0)",
-                cursor: spinning ? "not-allowed" : "pointer",
-                letterSpacing: "0.2em",
-              }}
-            >
-              {spinning ? "旋 转 中…" : sessionExpired ? "重 新 登 录" : noPoints ? "去 当 圣 人" : "抽　　奖"}
-            </button>
-          );
-        })()}
+                    {segments.map((seg, i) => {
+                      const startDeg = -90 + i * SEG_ANGLE;
+                      const endDeg = -90 + (i + 1) * SEG_ANGLE;
+                      const midDeg = startDeg + SEG_ANGLE / 2;
+                      const textR = R * 0.6;
+                      const tx = CX + textR * Math.cos(toRad(midDeg));
+                      const ty = CY + textR * Math.sin(toRad(midDeg));
+                      return (
+                        <g key={`${seg.prize}-${i}`}>
+                          <path
+                            d={sectorPath(startDeg, endDeg)}
+                            fill={seg.bg}
+                            opacity={0.9}
+                            stroke="rgba(255,255,255,0.82)"
+                            strokeWidth="2.2"
+                            filter="url(#lotteryInnerShadow)"
+                          />
+                          <path d={sectorPath(startDeg + 1.6, endDeg - 1.6)} fill="rgba(255,255,255,0.14)" />
+                          <text
+                            x={tx}
+                            y={ty - 10}
+                            textAnchor="middle"
+                            dominantBaseline="middle"
+                            fontSize={20}
+                            style={{ userSelect: "none" }}
+                          >
+                            {prizeEmoji(seg.prize)}
+                          </text>
+                          <text
+                            x={tx}
+                            y={ty + 13}
+                            textAnchor="middle"
+                            dominantBaseline="middle"
+                            fontSize={9}
+                            fill="rgba(255,255,255,0.92)"
+                            fontWeight="900"
+                            style={{
+                              userSelect: "none",
+                              paintOrder: "stroke",
+                              stroke: "rgba(0,0,0,0.20)",
+                              strokeWidth: 2,
+                            }}
+                          >
+                            {shortenPrize(seg.prize)}
+                          </text>
+                        </g>
+                      );
+                    })}
+
+                    <circle cx={CX} cy={CY} r={R + 4} fill="none" stroke="rgba(255,255,255,0.92)" strokeWidth="8" />
+                    <circle cx={CX} cy={CY} r={R + 12} fill="none" stroke="rgba(251,146,60,0.36)" strokeWidth="8" />
+                    {Array.from({ length: 24 }).map((_, i) => {
+                      const deg = (360 / 24) * i;
+                      const x = CX + (R + 17) * Math.cos(toRad(deg));
+                      const y = CY + (R + 17) * Math.sin(toRad(deg));
+                      return <circle key={i} cx={x} cy={y} r={2.8} fill={i % 2 ? "#fed7aa" : "#fff7ed"} />;
+                    })}
+
+                    <circle cx={CX} cy={CY} r={34} fill="rgba(255,255,255,0.95)" />
+                    <circle cx={CX} cy={CY} r={28} fill="url(#hubGradient)" />
+                    <defs>
+                      <radialGradient id="hubGradient" cx="35%" cy="28%">
+                        <stop offset="0%" stopColor="#fff7ed" />
+                        <stop offset="42%" stopColor="#fb923c" />
+                        <stop offset="100%" stopColor="#c2410c" />
+                      </radialGradient>
+                    </defs>
+                    <circle cx={CX} cy={CY} r={13} fill="rgba(255,255,255,0.94)" />
+                    <text x={CX} y={CY + 4} textAnchor="middle" fontSize={16} style={{ userSelect: "none" }}>
+                      🍊
+                    </text>
+                  </svg>
+                </div>
+
+                <div className="lottery-pointer absolute left-1/2 top-4 z-20 -translate-x-1/2">
+                  <div className="h-0 w-0 border-l-[20px] border-r-[20px] border-t-[48px] border-l-transparent border-r-transparent border-t-orange-600 drop-shadow-[0_10px_12px_rgba(124,45,18,0.35)]" />
+                  <div className="absolute left-1/2 top-[-13px] grid h-8 w-8 -translate-x-1/2 place-items-center rounded-full bg-white text-sm shadow-lg ring-4 ring-orange-200">
+                    🍊
+                  </div>
+                </div>
+              </div>
+
+              <div className="mt-5 flex min-h-16 w-full max-w-2xl items-center justify-center">
+                {result ? (
+                  <div className="rounded-[1.75rem] border border-white/70 bg-white/62 px-5 py-3 text-center shadow-xl shadow-orange-950/8 backdrop-blur-xl">
+                    <p className={`text-xs font-black uppercase tracking-[0.2em] ${result.win ? "text-cyan-700" : "text-orange-700"}`}>
+                      {result.win ? "Prize Result" : "Try Again"}
+                    </p>
+                    <div className="mt-1 flex flex-wrap items-center justify-center gap-2">
+                      <p className={`text-2xl font-black tracking-wide ${result.win ? "text-cyan-800" : "text-orange-800"}`}>
+                        {prizeEmoji(result.prize)} {result.prize}
+                      </p>
+                      {result.win && (isPokeball(result.prize) || isQuota(result.prize)) && !claimed && (
+                        <button
+                          onClick={() => setShowClaim(true)}
+                          className="rounded-xl border border-orange-300 bg-orange-100 px-3 py-1.5 text-xs font-black text-orange-700 transition hover:bg-orange-200"
+                        >
+                          领取
+                        </button>
+                      )}
+                      {result.win && (isPokeball(result.prize) || isQuota(result.prize)) && claimed && (
+                        <span className="flex items-center gap-1 rounded-xl bg-cyan-100 px-3 py-1.5 text-xs font-black text-cyan-700">
+                          <Check className="h-3.5 w-3.5" />
+                          已领取
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                ) : (
+                  <p className="rounded-full border border-white/70 bg-white/52 px-4 py-2 text-center text-sm font-bold text-stone-600 shadow-sm backdrop-blur">
+                    {spinning ? "正在抽奖…" : spinHint}
+                  </p>
+                )}
+              </div>
+
+              <button
+                onClick={doSpin}
+                disabled={spinning}
+                className="lottery-spin-button mt-2 select-none rounded-[1.65rem] px-12 py-4 text-2xl font-black tracking-[0.24em] text-white transition disabled:cursor-not-allowed sm:px-16"
+                data-state={spinning ? "spinning" : sessionExpired ? "expired" : noPoints ? "empty" : "ready"}
+              >
+                {spinLabel}
+              </button>
+            </main>
+
+            {/* Right prize deck */}
+            <aside className="order-3 space-y-3">
+              <div className="rounded-[2rem] border border-white/65 bg-white/50 p-4 shadow-2xl shadow-orange-950/10 backdrop-blur-2xl">
+                <div className="mb-4 flex items-center justify-between">
+                  <div>
+                    <p className="text-xs font-black uppercase tracking-[0.22em] text-orange-600">Prize Pool</p>
+                    <h2 className="text-lg font-black text-stone-950">奖品池</h2>
+                  </div>
+                  <span className="rounded-full bg-orange-100 px-2.5 py-1 text-xs font-black text-orange-700">
+                    {segments.length} 项
+                  </span>
+                </div>
+                <div className="max-h-[360px] space-y-2 overflow-y-auto pr-1">
+                  {segments.map((seg, i) => (
+                    <div
+                      key={`${seg.prize}-deck-${i}`}
+                      className="flex items-center gap-3 rounded-2xl border border-white/70 bg-white/54 px-3 py-2.5 shadow-sm backdrop-blur"
+                    >
+                      <span
+                        className="grid h-9 w-9 shrink-0 place-items-center rounded-xl text-sm shadow-sm"
+                        style={{ background: seg.bg, color: "white" }}
+                      >
+                        {prizeEmoji(seg.prize)}
+                      </span>
+                      <div className="min-w-0 flex-1">
+                        <p className="truncate text-sm font-black text-stone-800">{seg.prize}</p>
+                        <p className="text-[11px] font-semibold text-stone-400">权重 {seg.weight}</p>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              <div className="rounded-[2rem] border border-white/65 bg-white/50 p-4 shadow-xl shadow-orange-950/5 backdrop-blur-2xl">
+                <p className="mb-2 text-xs font-black uppercase tracking-[0.22em] text-stone-400">Tips</p>
+                <div className="space-y-2 text-xs font-semibold leading-5 text-stone-500">
+                  <p className="rounded-2xl bg-white/52 px-3 py-2 ring-1 ring-white/70">捐献 Key 可获得圣人点数。</p>
+                  <p className="rounded-2xl bg-white/52 px-3 py-2 ring-1 ring-white/70">宝可梦球与额度类奖品可领取到 Discord 背包。</p>
+                  <p className="rounded-2xl bg-white/52 px-3 py-2 ring-1 ring-white/70">转盘结果由服务端抽取，前端只负责展示动画。</p>
+                </div>
+              </div>
+            </aside>
+          </div>
+        </div>
       </div>
     </>
   );

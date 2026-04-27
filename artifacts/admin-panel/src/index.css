@@ -528,6 +528,219 @@
     color: rgb(14 116 144);
   }
 
+  .lottery-stage {
+    isolation: isolate;
+    background:
+      radial-gradient(circle at 50% 10%, rgba(255, 255, 255, 0.7), transparent 22%),
+      radial-gradient(circle at 16% 18%, rgba(251, 146, 60, 0.24), transparent 28%),
+      radial-gradient(circle at 84% 22%, rgba(14, 165, 233, 0.16), transparent 28%),
+      radial-gradient(circle at 72% 86%, rgba(236, 72, 153, 0.12), transparent 30%),
+      linear-gradient(135deg, #fff7ed 0%, #fef3c7 44%, #ffedd5 100%);
+  }
+
+  .lottery-stage::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    opacity: 0.42;
+    background-image:
+      radial-gradient(circle, rgba(124, 45, 18, 0.14) 1px, transparent 1.5px),
+      radial-gradient(circle, rgba(255, 255, 255, 0.9) 1px, transparent 1.5px);
+    background-position:
+      0 0,
+      18px 18px;
+    background-size: 36px 36px;
+    mask-image: radial-gradient(circle at 50% 50%, black 0%, transparent 74%);
+  }
+
+  .lottery-grid {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    opacity: 0.34;
+    background-image:
+      linear-gradient(rgba(124, 45, 18, 0.08) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(124, 45, 18, 0.08) 1px, transparent 1px);
+    background-size: 54px 54px;
+    transform: perspective(900px) rotateX(58deg) translateY(26%);
+    transform-origin: bottom;
+    mask-image: linear-gradient(to top, black 0%, transparent 70%);
+  }
+
+  .lottery-aurora {
+    position: absolute;
+    pointer-events: none;
+    border-radius: 999px;
+    filter: blur(18px);
+    mix-blend-mode: multiply;
+  }
+
+  .lottery-aurora-one {
+    left: -110px;
+    top: 10%;
+    width: 380px;
+    height: 380px;
+    background: radial-gradient(circle, rgba(251, 146, 60, 0.36), transparent 66%);
+    animation: lottery-float 9s ease-in-out infinite;
+  }
+
+  .lottery-aurora-two {
+    right: -110px;
+    top: 8%;
+    width: 420px;
+    height: 420px;
+    background: radial-gradient(circle, rgba(14, 165, 233, 0.18), transparent 66%);
+    animation: lottery-float 11s ease-in-out infinite reverse;
+  }
+
+  .lottery-aurora-three {
+    left: 50%;
+    bottom: -210px;
+    width: 620px;
+    height: 420px;
+    background: radial-gradient(circle, rgba(245, 158, 11, 0.22), transparent 70%);
+    transform: translateX(-50%);
+  }
+
+  .lottery-wheel-frame {
+    background:
+      radial-gradient(circle at 50% 50%, rgba(255, 255, 255, 0.55), transparent 42%),
+      conic-gradient(from 180deg, rgba(251, 146, 60, 0.16), rgba(255, 255, 255, 0.4), rgba(14, 165, 233, 0.12), rgba(251, 146, 60, 0.16));
+    box-shadow:
+      inset 0 0 0 1px rgba(255, 255, 255, 0.62),
+      inset 0 0 70px rgba(255, 255, 255, 0.48),
+      0 34px 90px rgba(124, 45, 18, 0.16);
+    backdrop-filter: blur(22px) saturate(1.18);
+  }
+
+  .lottery-wheel-frame::before,
+  .lottery-wheel-frame::after {
+    content: "";
+    position: absolute;
+    border-radius: inherit;
+    pointer-events: none;
+  }
+
+  .lottery-wheel-frame::before {
+    inset: 7%;
+    border: 1px dashed rgba(255, 255, 255, 0.75);
+    animation: lottery-slow-spin 28s linear infinite;
+  }
+
+  .lottery-wheel-frame::after {
+    inset: 1.8%;
+    border: 1px solid rgba(251, 146, 60, 0.18);
+    box-shadow: 0 0 42px rgba(251, 146, 60, 0.18);
+  }
+
+  .lottery-wheel-halo {
+    position: absolute;
+    inset: 7%;
+    border-radius: inherit;
+    background:
+      conic-gradient(from 0deg, #fb7185, #fb923c, #facc15, #22c55e, #06b6d4, #6366f1, #a855f7, #fb7185);
+    filter: blur(30px);
+    opacity: 0.44;
+    animation: lottery-slow-spin 18s linear infinite;
+  }
+
+  .lottery-pointer {
+    animation: lottery-pointer-bob 1.9s ease-in-out infinite;
+  }
+
+  .lottery-spin-button {
+    position: relative;
+    overflow: hidden;
+    text-shadow: 0 1px 0 rgba(124, 45, 18, 0.25);
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.35),
+      0 8px 0 rgba(124, 45, 18, 0.42),
+      0 24px 54px rgba(234, 88, 12, 0.24);
+  }
+
+  .lottery-spin-button::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(120deg, transparent 0%, rgba(255, 255, 255, 0.38) 35%, transparent 58%);
+    transform: translateX(-130%);
+    animation: lottery-button-shine 2.8s ease-in-out infinite;
+  }
+
+  .lottery-spin-button[data-state="ready"] {
+    background: linear-gradient(180deg, #fb7185 0%, #ef4444 46%, #dc2626 100%);
+  }
+
+  .lottery-spin-button[data-state="empty"] {
+    background: linear-gradient(180deg, #fbbf24 0%, #f59e0b 52%, #d97706 100%);
+  }
+
+  .lottery-spin-button[data-state="expired"] {
+    background: linear-gradient(180deg, #fb7185 0%, #f43f5e 52%, #be123c 100%);
+  }
+
+  .lottery-spin-button[data-state="spinning"] {
+    background: linear-gradient(180deg, #a8a29e 0%, #78716c 100%);
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.28),
+      0 3px 0 rgba(68, 64, 60, 0.55),
+      0 14px 34px rgba(68, 64, 60, 0.18);
+    transform: translateY(5px);
+  }
+
+  .lottery-spin-button:not(:disabled):hover {
+    transform: translateY(-2px);
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.38),
+      0 10px 0 rgba(124, 45, 18, 0.42),
+      0 30px 66px rgba(234, 88, 12, 0.3);
+  }
+
+  .lottery-spin-button:not(:disabled):active {
+    transform: translateY(5px);
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.28),
+      0 3px 0 rgba(124, 45, 18, 0.42),
+      0 16px 38px rgba(234, 88, 12, 0.22);
+  }
+
+  @keyframes lottery-slow-spin {
+    to {
+      transform: rotate(360deg);
+    }
+  }
+
+  @keyframes lottery-float {
+    0%,
+    100% {
+      transform: translate3d(0, 0, 0) scale(1);
+    }
+    50% {
+      transform: translate3d(24px, -18px, 0) scale(1.04);
+    }
+  }
+
+  @keyframes lottery-pointer-bob {
+    0%,
+    100% {
+      transform: translateX(-50%) translateY(0);
+    }
+    50% {
+      transform: translateX(-50%) translateY(5px);
+    }
+  }
+
+  @keyframes lottery-button-shine {
+    0%,
+    55% {
+      transform: translateX(-130%);
+    }
+    100% {
+      transform: translateX(130%);
+    }
+  }
+
   @media (prefers-reduced-motion: reduce) {
     *,
     *::before,
