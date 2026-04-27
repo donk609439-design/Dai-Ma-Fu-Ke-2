@@ -8,18 +8,25 @@ pnpm workspace monorepo 1:1 复刻自 https://github.com/zzz609439-stack/Code-Re
 
 ## 生产稳定性修复（2026-04-27）
 
+### 一阶段修复：PoolTimeout 风暴
+
 修复生产环境 `httpcore.PoolTimeout` 风暴（症状：`/admin/pending-nc` 卡 120s、`/key/discord-callback` 500、所有走全局 `http_client` 的接口逐步 500）。
 
 根因：全局 `http_client = httpx.AsyncClient(timeout(read=None), max_connections=200)` + 长流式 SSE（如 claude opus thinking 模型）— 客户端断开 ASGI 连接后，`async for response.aiter_lines()` 在没有上游下一行字节前不会被取消，僵尸连接长时间占用池槽位，逐步耗尽 200 个连接。
 
-修复（`jetbrainsai2api/main.py`，4 处改动）：
+修复（`jetbrainsai2api/main.py`）：
 1. **3186 行 `http_client` 配置升级**：`read=None → 900.0`、`pool=5.0 → 30.0`、`max_connections=200 → 500`、`max_keepalive=50 → 100`；给僵尸连接一个最终回收兜底 + 池等待 30s 缓冲突发流量。
 2. **457 行 `generic_exception_handler` 加 PoolTimeout 兜底**：识别 `httpx.PoolTimeout` / `httpcore.PoolTimeout` → 转 503 + `Retry-After: 5`（语义正确，便于客户端退避重试，不再 500 风暴）。
-3. **3285 行 `_sse_with_keepalive` 加 ASGI 断连检测**：新增 `request: Optional[Request] = None` 参数。每 25s keepalive 心跳触发 `await request.is_disconnected()` 检测，断了主动 `return` 让上游 `async with http_client.stream(...)` 退出归还连接。
-4. **3285 行 `_sse_with_keepalive` 加 `try/finally` 显式 `aclose`**：确保任何路径（正常/断连/异常）退出时显式 `await it.aclose()` 关闭下游生成器链，不依赖 GC 即可立刻归还连接池连接。
-5. **3765 行 `chat_completions`、4142 行 `messages_completions` 加 `http_request: Request` 形参**：调用 `_sse_with_keepalive(..., request=http_request)` 传入。第三处调用（`/admin/activate`，8945 行）保持原签名向后兼容。
+3. **3285 行 `_sse_with_keepalive` 加 `try/finally` 显式 `aclose`**：确保任何路径（正常/断连/异常）退出时显式 `await it.aclose()` 关闭下游生成器链；客户端断开时 starlette cancel stream task → GeneratorExit → finally → aclose → 上游 `async with http_client.stream(...)` 立刻退出释放连接。
+4. **3765 行 `chat_completions`、4142 行 `messages_completions` 加 `http_request: Request` 形参**：传给 `_sse_with_keepalive(..., request=http_request)`。第三处调用（`/admin/activate`，8945 行）保持原签名向后兼容。
 
-经架构师审查通过（`evaluate_task` + `includeGitDiff`），从"缓解"升级为"彻底堵漏"。
+### 二阶段修复：撤销 ASGI 协议违规（关键回归）
+
+第一次部署后用户报"能拉取到模型但是不出字"。根因：之前在 `_sse_with_keepalive` 的 25s 心跳分支里加了 `await request.is_disconnected()` —— 这会引入第二个并发的 ASGI `await receive()`，与 starlette `StreamingResponse` 内部的 `listen_for_disconnect` 协程抢消息，违反 ASGI 规范，导致整个 streaming task 在第一次心跳后被异常 cancel，于是流式响应"开了流不出字"。
+
+修复：从 `_sse_with_keepalive` 移除 `is_disconnected()` 主动检测；保留 `request` 形参（兼容调用方）但不使用；保留 `try/finally + aclose`（无副作用，断连时 starlette 自己 cancel 仍会触发 GeneratorExit 走 finally，效果与主动检测等价但合规）。
+
+经架构师审查通过（`evaluate_task` + `includeGitDiff`）。最终生效改动总结：连接池配置升级 + PoolTimeout 转 503 + `_sse_with_keepalive` 的 finally aclose。
 
 ## 复刻状态（2026-04-26）
 

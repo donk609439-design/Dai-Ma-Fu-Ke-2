@@ -3282,18 +3282,21 @@ async def list_models(_: str = Depends(authenticate_any_client)):
 async def _sse_with_keepalive(
     gen: AsyncGenerator[str, None],
     interval: float = 25.0,
-    request: Optional[Request] = None,
+    request: Optional[Request] = None,  # 保留形参以兼容调用方，当前不使用（见下方注释）
 ) -> AsyncGenerator[str, None]:
     """SSE 心跳包装器：超过 interval 秒无数据时注入 SSE 注释行 ': ping'，
     防止 Replit 反向代理的 idle timeout（默认 300s）截断长流式响应。
     SSE 注释行以冒号开头，OpenAI/Anthropic 兼容客户端会将其忽略。
 
-    若传入 request：每个 interval 周期会检查 ASGI 客户端是否断连。一旦断连立即 return，
-    生成器链上的 ``async with http_client.stream(...)`` 会随之退出并归还连接池连接，
-    避免僵尸 SSE 连接长时间占用 httpx 全局池导致后续请求 PoolTimeout。
+    断连处理由 starlette ``StreamingResponse`` 内部的 ``listen_for_disconnect`` 协程负责
+    （它在 ASGI ``receive`` 上监听 ``http.disconnect``）。我们 **不能** 在这里再调用
+    ``request.is_disconnected()``：那会引入第二个并发的 ``await receive()``，违反 ASGI
+    规范，导致消息被错误派发、整个流式响应被异常 cancel（症状：开了流不出字）。
 
-    无论是正常结束、客户端断连还是异常，finally 都会显式 aclose 下游生成器链，
-    确保 ``async with`` 上下文立即退出（不依赖 GC），连接立刻归还池。
+    客户端断连时，starlette 会 cancel 包裹我们的 stream task，从而抛出
+    ``GeneratorExit`` 进入下方 ``finally`` —— 显式 ``await it.aclose()`` 会沿生成器链
+    向上传播，让 ``async with http_client.stream(...)`` 立即退出并归还连接池连接，
+    不依赖 GC，避免僵尸 SSE 连接耗尽全局池。
     """
     it = gen.__aiter__()
     try:
@@ -3302,14 +3305,6 @@ async def _sse_with_keepalive(
                 chunk = await asyncio.wait_for(it.__anext__(), timeout=interval)
                 yield chunk
             except asyncio.TimeoutError:
-                # 客户端断连 → 主动结束生成器（让上游 async with 块退出释放连接）
-                if request is not None:
-                    try:
-                        if await request.is_disconnected():
-                            print(f"[SSE] 客户端已断连，提前结束流式响应以释放上游连接")
-                            return
-                    except Exception:
-                        pass
                 yield ": ping\n\n"
             except StopAsyncIteration:
                 break
