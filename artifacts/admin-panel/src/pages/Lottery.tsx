@@ -205,8 +205,9 @@ function ModalShell({
         <div className="pointer-events-none absolute -bottom-20 -left-16 h-44 w-44 rounded-full bg-cyan-300/20 blur-2xl" />
         <button
           onClick={onClose}
-          className="absolute right-4 top-4 z-10 rounded-2xl bg-white/70 p-2 text-stone-500 shadow-sm ring-1 ring-orange-900/10 transition hover:bg-white hover:text-stone-800"
+          className="absolute right-4 top-4 z-30 rounded-2xl bg-white/70 p-2 text-stone-500 shadow-sm ring-1 ring-orange-900/10 transition hover:bg-white hover:text-stone-800"
           aria-label="关闭"
+          type="button"
         >
           <X className="h-4 w-4" />
         </button>
@@ -758,7 +759,7 @@ export default function Lottery() {
 
       {showLeaderboard && <LeaderboardModal onClose={() => setShowLeaderboard(false)} />}
 
-      <div className="lottery-stage fixed inset-0 overflow-hidden">
+      <div className="lottery-stage fixed inset-0 overflow-x-hidden overflow-y-auto">
         <div className="lottery-grid" />
         <div className="lottery-aurora lottery-aurora-one" />
         <div className="lottery-aurora lottery-aurora-two" />
@@ -1033,7 +1034,6 @@ export default function Lottery() {
                       </span>
                       <div className="min-w-0 flex-1">
                         <p className="truncate text-sm font-black text-stone-800">{seg.prize}</p>
-                        <p className="text-[11px] font-semibold text-stone-400">权重 {seg.weight}</p>
                       </div>
                     </div>
                   ))}
