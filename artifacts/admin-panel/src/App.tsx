@@ -24,9 +24,35 @@ import DonatedAccounts from "@/pages/DonatedAccounts";
 import PendingQueue from "@/pages/PendingQueue";
 import AdminGate from "@/components/AdminGate";
 import { getAdminKey, useAdminRole } from "@/lib/admin-auth";
-import { LayoutDashboard, Users, Key, Cpu, BookOpen, Zap, BarChart3, UserPlus, Menu, X, Search, ScrollText, Ticket, Package, Gift, Handshake, CreditCard, HeartHandshake, ShieldCheck, Globe, Hourglass } from "lucide-react";
+import {
+  LayoutDashboard,
+  Users,
+  Key,
+  Cpu,
+  BookOpen,
+  Zap,
+  BarChart3,
+  UserPlus,
+  Menu,
+  X,
+  Search,
+  ScrollText,
+  Ticket,
+  Package,
+  Gift,
+  Handshake,
+  CreditCard,
+  HeartHandshake,
+  ShieldCheck,
+  Globe,
+  Hourglass,
+  Sparkles,
+  Command,
+  ChevronRight,
+  Shield,
+} from "lucide-react";
 import { cn } from "@/lib/utils";
-import { useState, useEffect } from "react";
+import { type ReactNode, useState, useEffect } from "react";
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -39,8 +65,8 @@ const queryClient = new QueryClient({
       },
       retryDelay: (attempt) =>
         Math.min(1000 * 2 ** attempt + Math.random() * 1000, 15000),
-      staleTime: 30_000,        // 30s 内不重新获取
-      gcTime: 5 * 60_000,      // 5min 缓存保留
+      staleTime: 30_000, // 30s 内不重新获取
+      gcTime: 5 * 60_000, // 5min 缓存保留
       refetchOnWindowFocus: false,
       refetchOnReconnect: true,
     },
@@ -94,73 +120,184 @@ const lowAdminNavItems = [
 
 type NavMode = "admin" | "guest" | "low_admin";
 
+function getModeMeta(mode: NavMode) {
+  if (mode === "admin") {
+    return {
+      title: "JetBrains AI",
+      subtitle: "Citrus Admin Console",
+      badge: "ADMIN",
+      description: "账户、模型、密钥与流量调度中心",
+    };
+  }
+
+  if (mode === "low_admin") {
+    return {
+      title: "JetBrains AI",
+      subtitle: "LOW Control Room",
+      badge: "LOW",
+      description: "专属池与个人用量管理入口",
+    };
+  }
+
+  return {
+    title: "Orange AI",
+    subtitle: "Citrus User Portal",
+    badge: "GUEST",
+    description: "激活、查询、抽奖与账号助力",
+  };
+}
+
 function NavLinks({ onNavigate, mode }: { onNavigate?: () => void; mode: NavMode }) {
   const [location] = useLocation();
   const items =
-    mode === "admin" ? adminNavItems
-    : mode === "low_admin" ? lowAdminNavItems
-    : guestNavItems;
+    mode === "admin"
+      ? adminNavItems
+      : mode === "low_admin"
+        ? lowAdminNavItems
+        : guestNavItems;
+
   return (
-    <nav className="flex-1 px-3 py-4 space-y-1">
-      {items.map(({ path, label, icon: Icon }) => {
-        const active = location === path;
-        return (
-          <Link key={path} href={path}>
-            <span
-              onClick={onNavigate}
-              className={cn(
-                "group flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-medium transition-all duration-200 cursor-pointer",
-                active
-                  ? "bg-primary text-primary-foreground shadow-sm shadow-orange-200/70"
-                  : "text-sidebar-foreground hover:bg-sidebar-accent hover:text-sidebar-accent-foreground hover:translate-x-0.5"
-              )}
-            >
-              <Icon className={cn("w-4 h-4 shrink-0 transition-transform", active ? "scale-105" : "group-hover:scale-105")} />
-              {label}
-            </span>
-          </Link>
-        );
-      })}
+    <nav className="flex-1 overflow-y-auto px-3 py-4">
+      <div className="mb-3 flex items-center justify-between px-3">
+        <span className="text-[11px] font-bold uppercase tracking-[0.24em] text-sidebar-foreground/45">
+          Navigation
+        </span>
+        <Command className="h-3.5 w-3.5 text-sidebar-foreground/35" />
+      </div>
+
+      <div className="space-y-1.5">
+        {items.map(({ path, label, icon: Icon }) => {
+          const active = location === path;
+          const nested = label.trim().startsWith("└");
+          return (
+            <Link key={path} href={path}>
+              <span
+                onClick={onNavigate}
+                className={cn(
+                  "premium-nav-link group relative flex items-center gap-3 rounded-2xl px-3 py-2.5 text-sm font-semibold transition-all duration-300 cursor-pointer",
+                  nested && "ml-4 text-xs",
+                  active
+                    ? "premium-nav-link-active text-white shadow-lg shadow-orange-500/20"
+                    : "text-sidebar-foreground/72 hover:bg-white/55 hover:text-sidebar-foreground hover:shadow-sm hover:shadow-orange-900/5"
+                )}
+              >
+                <span
+                  className={cn(
+                    "grid h-8 w-8 shrink-0 place-items-center rounded-xl transition-all duration-300",
+                    active
+                      ? "bg-white/20 text-white ring-1 ring-white/20"
+                      : "bg-white/55 text-orange-700/75 ring-1 ring-orange-900/5 group-hover:scale-105 group-hover:bg-orange-50"
+                  )}
+                >
+                  <Icon className="h-4 w-4" />
+                </span>
+                <span className="min-w-0 flex-1 truncate">{label}</span>
+                <ChevronRight
+                  className={cn(
+                    "h-3.5 w-3.5 shrink-0 opacity-0 transition-all duration-300",
+                    active ? "translate-x-0 opacity-80" : "-translate-x-1 group-hover:translate-x-0 group-hover:opacity-50"
+                  )}
+                />
+              </span>
+            </Link>
+          );
+        })}
+      </div>
     </nav>
   );
 }
 
-function Sidebar({ mode }: { mode: NavMode }) {
-  const subtitle = mode === "admin" ? "管理控制台" : "用户中心";
+function SidebarBrand({ mode }: { mode: NavMode }) {
+  const meta = getModeMeta(mode);
+
   return (
-    <aside className="hidden md:flex flex-col w-60 h-full bg-sidebar/85 backdrop-blur-xl border-r border-sidebar-border shrink-0 overflow-y-auto">
-      <div className="flex items-center gap-3 px-5 py-5 border-b border-sidebar-border">
-        <div className="citrus-gradient flex items-center justify-center w-9 h-9 rounded-2xl shadow-lg shadow-orange-200/70">
-          <Zap className="w-4.5 h-4.5 text-white" />
+    <div className="px-4 pb-4 pt-5">
+      <div className="premium-brand-card relative overflow-hidden rounded-[1.65rem] p-4">
+        <div className="relative z-10 flex items-start gap-3">
+          <div className="citrus-orb grid h-12 w-12 shrink-0 place-items-center rounded-2xl">
+            <Zap className="h-5 w-5 text-white drop-shadow" />
+          </div>
+          <div className="min-w-0 flex-1">
+            <div className="mb-1 flex items-center gap-2">
+              <p className="truncate text-base font-black tracking-tight text-sidebar-foreground">
+                {meta.title}
+              </p>
+              <span className="rounded-full bg-white/60 px-2 py-0.5 text-[10px] font-black tracking-wider text-orange-700 ring-1 ring-white/55">
+                {meta.badge}
+              </span>
+            </div>
+            <p className="text-xs font-semibold text-orange-700/80">{meta.subtitle}</p>
+            <p className="mt-2 text-xs leading-relaxed text-sidebar-foreground/55">
+              {meta.description}
+            </p>
+          </div>
         </div>
-        <div>
-          <p className="text-sm font-bold text-sidebar-foreground leading-tight tracking-tight">JetBrains AI</p>
-          <p className="text-xs text-muted-foreground leading-tight">{subtitle}</p>
+
+        <div className="relative z-10 mt-4 grid grid-cols-3 gap-2 text-center">
+          {[
+            ["AI", "Core"],
+            ["99", "Uptime"],
+            ["CN", "Edge"],
+          ].map(([value, label]) => (
+            <div key={label} className="rounded-2xl bg-white/48 px-2 py-2 ring-1 ring-white/50 backdrop-blur">
+              <p className="text-xs font-black text-sidebar-foreground">{value}</p>
+              <p className="mt-0.5 text-[10px] font-medium text-sidebar-foreground/45">{label}</p>
+            </div>
+          ))}
         </div>
       </div>
+    </div>
+  );
+}
+
+function SidebarFooter({ mode }: { mode: NavMode }) {
+  return (
+    <div className="px-4 pb-4 pt-3">
+      <div className="rounded-3xl border border-white/55 bg-white/48 p-3 shadow-sm shadow-orange-950/5 backdrop-blur-xl">
+        <div className="flex items-center gap-3">
+          <div className="grid h-9 w-9 place-items-center rounded-2xl bg-orange-100 text-orange-700 ring-1 ring-orange-200/70">
+            {mode === "admin" ? <Shield className="h-4 w-4" /> : <Sparkles className="h-4 w-4" />}
+          </div>
+          <div className="min-w-0">
+            <p className="truncate text-xs font-bold text-sidebar-foreground">Citrus UI 4.0</p>
+            <p className="truncate text-[11px] text-sidebar-foreground/48">Premium glass edition</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function Sidebar({ mode }: { mode: NavMode }) {
+  return (
+    <aside className="premium-sidebar hidden h-full w-[18rem] shrink-0 flex-col overflow-hidden md:flex">
+      <SidebarBrand mode={mode} />
       <NavLinks mode={mode} />
-      <div className="px-4 py-3 border-t border-sidebar-border">
-        <p className="text-xs text-muted-foreground">🍊 v3.0.0 · Citrus UI</p>
-      </div>
+      <SidebarFooter mode={mode} />
     </aside>
   );
 }
 
-function MobileHeader({ onMenuOpen }: { onMenuOpen: () => void }) {
+function MobileHeader({ onMenuOpen, mode }: { onMenuOpen: () => void; mode: NavMode }) {
+  const meta = getModeMeta(mode);
+
   return (
-    <header className="md:hidden fixed top-0 left-0 right-0 z-30 flex items-center justify-between px-4 h-14 bg-sidebar/90 backdrop-blur-xl border-b border-sidebar-border">
-      <div className="flex items-center gap-2.5">
-        <div className="citrus-gradient flex items-center justify-center w-7 h-7 rounded-xl shadow-md shadow-orange-200/70">
-          <Zap className="w-3.5 h-3.5 text-white" />
+    <header className="mobile-glass-header fixed left-0 right-0 top-0 z-30 flex h-16 items-center justify-between px-4 md:hidden">
+      <div className="flex min-w-0 items-center gap-3">
+        <div className="citrus-orb grid h-9 w-9 shrink-0 place-items-center rounded-2xl">
+          <Zap className="h-4 w-4 text-white" />
         </div>
-        <p className="text-sm font-semibold text-sidebar-foreground">JetBrains AI 管理控制台</p>
+        <div className="min-w-0">
+          <p className="truncate text-sm font-black tracking-tight text-sidebar-foreground">{meta.title}</p>
+          <p className="truncate text-[11px] font-medium text-sidebar-foreground/52">{meta.subtitle}</p>
+        </div>
       </div>
       <button
         onClick={onMenuOpen}
-        className="p-2 rounded-md text-sidebar-foreground hover:bg-sidebar-accent transition-colors"
+        className="rounded-2xl bg-white/65 p-2.5 text-sidebar-foreground shadow-sm ring-1 ring-orange-900/10 transition hover:bg-white"
         aria-label="打开菜单"
       >
-        <Menu className="w-5 h-5" />
+        <Menu className="h-5 w-5" />
       </button>
     </header>
   );
@@ -173,119 +310,134 @@ function MobileDrawer({ open, onClose, mode }: { open: boolean; onClose: () => v
     } else {
       document.body.style.overflow = "";
     }
-    return () => { document.body.style.overflow = ""; };
+    return () => {
+      document.body.style.overflow = "";
+    };
   }, [open]);
 
   return (
     <>
       {open && (
         <div
-          className="md:hidden fixed inset-0 z-40 bg-black/50"
+          className="fixed inset-0 z-40 bg-stone-950/45 backdrop-blur-sm md:hidden"
           onClick={onClose}
         />
       )}
       <div
         className={cn(
-          "md:hidden fixed top-0 left-0 bottom-0 z-50 w-64 bg-sidebar/95 backdrop-blur-xl border-r border-sidebar-border flex flex-col transition-transform duration-300",
+          "premium-sidebar fixed bottom-0 left-0 top-0 z-50 flex w-[18rem] max-w-[82vw] flex-col overflow-hidden transition-transform duration-300 md:hidden",
           open ? "translate-x-0" : "-translate-x-full"
         )}
       >
-        <div className="flex items-center justify-between px-5 py-4 border-b border-sidebar-border">
+        <div className="flex items-center justify-between px-5 py-4">
           <div className="flex items-center gap-2.5">
-            <div className="citrus-gradient flex items-center justify-center w-7 h-7 rounded-xl shadow-md shadow-orange-200/70">
-              <Zap className="w-3.5 h-3.5 text-white" />
+            <div className="citrus-orb grid h-8 w-8 place-items-center rounded-xl">
+              <Zap className="h-3.5 w-3.5 text-white" />
             </div>
-            <p className="text-sm font-semibold text-sidebar-foreground">JetBrains AI</p>
+            <p className="text-sm font-black text-sidebar-foreground">JetBrains AI</p>
           </div>
           <button
             onClick={onClose}
-            className="p-1.5 rounded-md text-sidebar-foreground hover:bg-sidebar-accent transition-colors"
+            className="rounded-xl bg-white/60 p-2 text-sidebar-foreground shadow-sm ring-1 ring-orange-900/10 transition hover:bg-white"
+            aria-label="关闭菜单"
           >
-            <X className="w-4 h-4" />
+            <X className="h-4 w-4" />
           </button>
         </div>
+        <SidebarBrand mode={mode} />
         <NavLinks onNavigate={onClose} mode={mode} />
-        <div className="px-4 py-3 border-t border-sidebar-border">
-          <p className="text-xs text-muted-foreground">v3.0.0 · MIT License</p>
-        </div>
+        <SidebarFooter mode={mode} />
       </div>
     </>
   );
 }
 
-function Layout({ children, mode }: { children: React.ReactNode; mode: NavMode }) {
+function Layout({ children, mode }: { children: ReactNode; mode: NavMode }) {
   const [mobileOpen, setMobileOpen] = useState(false);
+
   return (
-    <div className="app-shell h-screen flex overflow-hidden">
+    <div className="app-shell relative flex h-screen overflow-hidden">
+      <div className="shell-ambient shell-ambient-one" />
+      <div className="shell-ambient shell-ambient-two" />
+      <div className="shell-grid" />
+
       <Sidebar mode={mode} />
       <MobileDrawer open={mobileOpen} onClose={() => setMobileOpen(false)} mode={mode} />
-      <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
-        <MobileHeader onMenuOpen={() => setMobileOpen(true)} />
-        <main className="flex-1 overflow-y-auto p-4 md:p-7 pt-16 md:pt-7">
-          {children}
+
+      <div className="relative z-10 flex min-w-0 flex-1 flex-col overflow-hidden">
+        <MobileHeader onMenuOpen={() => setMobileOpen(true)} mode={mode} />
+        <main className="premium-main-scroll flex-1 overflow-y-auto px-3 pb-5 pt-20 sm:px-5 md:px-7 md:py-7">
+          <div className="mx-auto w-full max-w-[1500px]">
+            {children}
+          </div>
         </main>
       </div>
     </div>
   );
 }
 
-function FullscreenLayout({ children, mode }: { children: React.ReactNode; mode: NavMode }) {
+function FullscreenLayout({ children, mode }: { children: ReactNode; mode: NavMode }) {
   const [sidebarOpen, setSidebarOpen] = useState(false);
 
   useEffect(() => {
     document.body.style.overflow = sidebarOpen ? "hidden" : "";
-    return () => { document.body.style.overflow = ""; };
+    return () => {
+      document.body.style.overflow = "";
+    };
   }, [sidebarOpen]);
 
   return (
-    <div className="min-h-screen w-full relative">
+    <div className="app-shell relative min-h-screen w-full overflow-hidden">
+      <div className="shell-ambient shell-ambient-one" />
+      <div className="shell-ambient shell-ambient-two" />
+      <div className="shell-grid" />
+
       {/* 菜单开关按钮 */}
       <button
         onClick={() => setSidebarOpen((v) => !v)}
-        className="fixed top-4 left-4 z-50 flex items-center gap-1.5 px-3 py-2 rounded-xl bg-white/85 backdrop-blur-sm shadow-md border border-orange-200 hover:bg-white transition-colors"
-        style={{ color: "#92400e" }}
+        className="fixed left-4 top-4 z-50 flex items-center gap-2 rounded-2xl border border-white/60 bg-white/72 px-3.5 py-2.5 text-xs font-black text-orange-800 shadow-xl shadow-orange-950/10 backdrop-blur-xl transition hover:-translate-y-0.5 hover:bg-white"
       >
-        {sidebarOpen ? <X className="w-4 h-4" /> : <Menu className="w-4 h-4" />}
-        <span className="text-xs font-medium">{sidebarOpen ? "收起" : "菜单"}</span>
+        {sidebarOpen ? <X className="h-4 w-4" /> : <Menu className="h-4 w-4" />}
+        <span>{sidebarOpen ? "收起菜单" : "打开菜单"}</span>
       </button>
 
       {/* 半透明遮罩 */}
       {sidebarOpen && (
         <div
-          className="fixed inset-0 bg-black/30 z-40 backdrop-blur-sm"
+          className="fixed inset-0 z-40 bg-stone-950/40 backdrop-blur-sm"
           onClick={() => setSidebarOpen(false)}
         />
       )}
 
       {/* 抽屉菜单（全平台通用，不依赖 Sidebar 的 hidden md:flex） */}
       <div
-        className="fixed left-0 top-0 h-full z-50 flex flex-col bg-sidebar/95 backdrop-blur-xl border-r border-sidebar-border transition-transform duration-300 ease-in-out"
+        className="premium-sidebar fixed left-0 top-0 z-50 flex h-full flex-col overflow-hidden transition-transform duration-300 ease-in-out"
         style={{
-          width: "min(256px, 80vw)",
+          width: "min(288px, 82vw)",
           transform: sidebarOpen ? "translateX(0)" : "translateX(-100%)",
         }}
       >
-        <div className="flex items-center justify-between px-5 py-4 border-b border-sidebar-border shrink-0">
+        <div className="flex items-center justify-between px-5 py-4">
           <div className="flex items-center gap-2.5">
-            <div className="citrus-gradient flex items-center justify-center w-7 h-7 rounded-xl shadow-md shadow-orange-200/70">
-              <Zap className="w-3.5 h-3.5 text-white" />
+            <div className="citrus-orb grid h-8 w-8 place-items-center rounded-xl">
+              <Zap className="h-3.5 w-3.5 text-white" />
             </div>
-            <p className="text-sm font-semibold text-sidebar-foreground">JetBrains AI</p>
+            <p className="text-sm font-black text-sidebar-foreground">JetBrains AI</p>
           </div>
           <button
             onClick={() => setSidebarOpen(false)}
-            className="p-1.5 rounded-md text-sidebar-foreground hover:bg-sidebar-accent transition-colors"
+            className="rounded-xl bg-white/60 p-2 text-sidebar-foreground shadow-sm ring-1 ring-orange-900/10 transition hover:bg-white"
+            aria-label="关闭菜单"
           >
-            <X className="w-4 h-4" />
+            <X className="h-4 w-4" />
           </button>
         </div>
+        <SidebarBrand mode={mode} />
         <NavLinks onNavigate={() => setSidebarOpen(false)} mode={mode} />
-        <div className="px-4 py-3 border-t border-sidebar-border shrink-0">
-          <p className="text-xs text-muted-foreground">v3.0.0 · MIT License</p>
-        </div>
+        <SidebarFooter mode={mode} />
       </div>
 
-      {children}
+      <div className="relative z-10">{children}</div>
     </div>
   );
 }
