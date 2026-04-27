@@ -71,6 +71,44 @@ request aborted ... POST /v1/chat/completions ... statusCode=null responseTime=1
 
 最终生效改动总结：上述三阶段 + 启动检测减压 + 后台扫描错开。
 
+### 五阶段修复：`_first_ready` 滑动窗口分批并发（彻底拆 JWT 刷新洪水）
+
+四阶段部署后用户再报"还是不出字"。生产库实查（重点：dev 1864、生产 **20534**，差 11 倍）：
+- has_quota=True：19752、has_quota=False：811、no_jwt：69
+- **last_quota_check 已 stale（>20 分钟）：19681（95.7%）**
+- old_jwt_24h：179
+
+部署后 `_startup_quota_check` 已成功延后 5 分钟（生效 ✓），但日志显示**第一个 chat 请求**（1777264602759）瞬间引爆几十条"正在为 licenseId XXX 刷新 JWT..."日志——正中四阶段架构师警告的残余风险点。
+
+根因（main.py:2222 `_first_ready`，旧版）：
+```python
+tasks = [asyncio.create_task(_probe(acc)) for _, acc in group]
+await done_event.wait()
+return winner[0] if winner else None
+```
+- `group2`（公共池）在生产可达 **1.9 万账号**；
+- 一次性 `create_task` 全部候选，每个 `_try_account` 内若 jwt stale（>12h）会触发 `_refresh_jetbrains_jwt`；
+- 即使 winner 已选出，剩余上万 task 仍在后台并发刷 JWT → grazie auth 429 + 全局 `http_client` 连接池（500 connections）被全部占满 → Python 后端整体瘫痪。
+
+修复（`jetbrainsai2api/main.py:2225` `_first_ready`）：**滑动窗口分批并发**。
+- 新增 `batch_size=8` 默认参数；
+- 外层 `for batch_start in range(0, len(group), batch_size)` 循环；
+- 每批 8 个候选并发探测，逻辑与原版完全一致（done_event + winner + remaining）；
+- 找到 winner 立即返回（该批最多遗留 7 个后台 task，可控）；
+- 该批全失败 → 进入下一批。
+
+效果：单次请求并发 JWT 刷新数从 ~1.9 万 收敛到 **≤ 8**；正常场景（has_quota=True 占 96%）winner 通常在第一批就出现。
+
+架构师审查结论（evaluate_task + git diff）：
+- 正确性 ✓：可正确返回 winner / None；nonlocal remaining 闭包绑定安全；winner/done_event 仅 append/方法调用不重绑定。
+- 语义有意改变：从"组内全员竞争 first-ready"变为"按批顺序首个成功的批次胜"，引入顺序偏置；但这是**有意降载**，架构师同时确认"该改动直接切断'首个 chat 触发万级 create_task'的根因，是当前止血链路里最关键的一环"。
+- 后续优化建议（按"最简改动"原则本次未做）：
+  1. `_refresh_jetbrains_jwt` / `_check_quota` 外层加全局 `asyncio.Semaphore`（如 20–50），防多请求叠加击穿连接池；
+  2. `_first_ready` 加"组级时间预算 / 最大批次数"，避免 group2 长时间失败时拖慢进入 group3；
+  3. 若需完全保留原语义，可改为"有界并发竞争池（固定窗口补位）"代替严格按批串行。
+
+最终生效改动总结：上述四阶段 + `_first_ready` 滑动窗口分批并发。
+
 ## 复刻状态（2026-04-26）
 
 源码已 1:1 复刻完成，三个工作流均正常运行：

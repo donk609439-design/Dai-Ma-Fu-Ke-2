@@ -2218,10 +2218,16 @@ async def get_next_jetbrains_account(client_key: Optional[str] = None) -> dict:
         raise HTTPException(status_code=429, detail="所有 JetBrains 账户均已超出配额或无效")
 
     # ── 第二步：组内并行验证，组间保持优先顺序 ──
-    # group1 > group2 > group3，同一组内并发就绪检查，取最先通过的账号。
-    async def _first_ready(group: list) -> Optional[dict]:
-        """并发验证同一优先组内的所有账号，返回第一个就绪的，或 None。
-        当全部账号均不可用时也能正确返回 None（不会死锁）。
+    # group1 > group2 > group3，同一组内分批并发就绪检查，取最先通过的账号。
+    async def _first_ready(group: list, batch_size: int = 8) -> Optional[dict]:
+        """分批并发验证同一优先组内的所有账号，返回第一个就绪的，或 None。
+
+        生产事故修复（2026-04-27）：旧版一次性 create_task 全部候选（生产 group2
+        可达 1.9 万账号），其中部分账号 jwt stale 会触发并发 JWT 刷新洪水 →
+        grazie auth 429 + 全局 http_client 连接池（500 connections）被全部占满 →
+        Python 后端整体瘫痪，所有路径 165–180s 后被客户端 abort。
+        新版采用滑动窗口分批并发：每批最多 batch_size 个候选，找到 winner 立即返回。
+        单次请求引发的并发 JWT 刷新上限收敛到 batch_size，可控且语义不变。
         """
         if not group:
             return None
@@ -2229,29 +2235,33 @@ async def get_next_jetbrains_account(client_key: Optional[str] = None) -> dict:
             _, acc = group[0]
             return acc if await _try_account(acc) else None
 
-        done_event = asyncio.Event()
-        winner: list = []
-        remaining = len(group)
+        for batch_start in range(0, len(group), batch_size):
+            batch = group[batch_start: batch_start + batch_size]
+            done_event = asyncio.Event()
+            winner: list = []
+            remaining = len(batch)
 
-        async def _probe(acc: dict):
-            nonlocal remaining
-            try:
-                if await _try_account(acc):
-                    if not done_event.is_set():
-                        winner.append(acc)
-                        done_event.set()
-            except Exception:
-                pass
-            finally:
-                remaining -= 1
-                if remaining <= 0:
-                    done_event.set()  # 所有探测完成，解除阻塞
+            async def _probe(acc: dict):
+                nonlocal remaining
+                try:
+                    if await _try_account(acc):
+                        if not done_event.is_set():
+                            winner.append(acc)
+                            done_event.set()
+                except Exception:
+                    pass
+                finally:
+                    remaining -= 1
+                    if remaining <= 0:
+                        done_event.set()  # 该批全部探测完成，解除阻塞
 
-        tasks = [asyncio.create_task(_probe(acc)) for _, acc in group]
-        await done_event.wait()
-        # 找到 winner 后立即返回，剩余探测任务在后台自行完成（继续更新配额状态）
-        # 若全部失败，done_event 也会被 finally 块触发，winner 为空
-        return winner[0] if winner else None
+            tasks = [asyncio.create_task(_probe(acc)) for _, acc in batch]
+            await done_event.wait()
+            if winner:
+                # 找到 winner，立即返回；该批剩余 task（≤ batch_size-1 个）后台继续完成
+                return winner[0]
+            # 该批全部失败（remaining 在 finally 里降到 0 触发 done_event）→ 进入下一批
+        return None
 
     for grp in (group1, group2, group3):
         chosen = await _first_ready(grp)
