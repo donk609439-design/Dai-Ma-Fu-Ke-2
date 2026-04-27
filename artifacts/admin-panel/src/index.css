@@ -107,7 +107,7 @@
   --ring: 24 94% 54%;
 
   --chart-1: 24 94% 54%;
-  --chart-2: 150 72% 34%;
+  --chart-2: 186 78% 38%;
   --chart-3: 42 94% 50%;
   --chart-4: 226 72% 54%;
   --chart-5: 348 78% 58%;
@@ -200,28 +200,40 @@
   }
 
   .green-ring {
-    box-shadow: 0 0 0 1px rgba(16, 185, 129, 0.24), 0 12px 30px rgba(16, 185, 129, 0.14);
+    box-shadow: 0 0 0 1px rgba(6, 182, 212, 0.36), 0 12px 30px rgba(8, 145, 178, 0.18);
   }
 
-  /* Restore contrast for existing blue/green status panels after the warm light theme shift. */
+  /* Restore contrast for existing blue status panels after the warm light theme shift. */
   [class*="border-blue"] {
-    background-color: rgba(239, 246, 255, 0.78);
-    box-shadow: 0 0 0 1px rgba(59, 130, 246, 0.08), 0 10px 26px rgba(59, 130, 246, 0.10);
+    background-color: rgba(239, 246, 255, 0.82);
+    border-color: rgba(37, 99, 235, 0.55) !important;
+    box-shadow: 0 0 0 1px rgba(59, 130, 246, 0.16), 0 10px 28px rgba(37, 99, 235, 0.14);
   }
 
+  /*
+    Green looked too close to the warm citrus base.
+    Re-map existing green/emerald status blocks to a cooler cyan-teal accent
+    so they stand apart from the orange UI without becoming visually noisy.
+  */
   [class*="border-green"],
   [class*="border-emerald"] {
-    background-color: rgba(236, 253, 245, 0.76);
-    box-shadow: 0 0 0 1px rgba(16, 185, 129, 0.08), 0 10px 26px rgba(16, 185, 129, 0.10);
+    background: linear-gradient(135deg, rgba(236, 254, 255, 0.92), rgba(240, 253, 250, 0.82));
+    border-color: rgba(8, 145, 178, 0.58) !important;
+    box-shadow: 0 0 0 1px rgba(6, 182, 212, 0.18), 0 12px 30px rgba(8, 145, 178, 0.16);
+  }
+
+  [class*="bg-green"],
+  [class*="bg-emerald"] {
+    background-color: rgba(207, 250, 254, 0.78) !important;
   }
 
   [class*="text-blue"] {
-    color: rgb(37 99 235);
+    color: rgb(29 78 216);
   }
 
   [class*="text-green"],
   [class*="text-emerald"] {
-    color: rgb(5 150 105);
+    color: rgb(14 116 144);
   }
 }
 
@@ -230,7 +242,7 @@
     box-shadow: 0 0 24px rgba(59, 130, 246, 0.24);
   }
   .glow-green {
-    box-shadow: 0 0 24px rgba(34, 197, 94, 0.24);
+    box-shadow: 0 0 28px rgba(6, 182, 212, 0.30);
   }
   .glow-red {
     box-shadow: 0 0 20px rgba(239, 68, 68, 0.15);
