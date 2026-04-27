@@ -109,13 +109,13 @@ function NavLinks({ onNavigate, mode }: { onNavigate?: () => void; mode: NavMode
             <span
               onClick={onNavigate}
               className={cn(
-                "flex items-center gap-3 px-3 py-2.5 rounded-md text-sm font-medium transition-colors cursor-pointer",
+                "group flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-medium transition-all duration-200 cursor-pointer",
                 active
-                  ? "bg-primary/10 text-primary"
-                  : "text-sidebar-foreground hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
+                  ? "bg-primary text-primary-foreground shadow-sm shadow-orange-200/70"
+                  : "text-sidebar-foreground hover:bg-sidebar-accent hover:text-sidebar-accent-foreground hover:translate-x-0.5"
               )}
             >
-              <Icon className="w-4 h-4 shrink-0" />
+              <Icon className={cn("w-4 h-4 shrink-0 transition-transform", active ? "scale-105" : "group-hover:scale-105")} />
               {label}
             </span>
           </Link>
@@ -128,19 +128,19 @@ function NavLinks({ onNavigate, mode }: { onNavigate?: () => void; mode: NavMode
 function Sidebar({ mode }: { mode: NavMode }) {
   const subtitle = mode === "admin" ? "管理控制台" : "用户中心";
   return (
-    <aside className="hidden md:flex flex-col w-56 h-full bg-sidebar border-r border-sidebar-border shrink-0 overflow-y-auto">
-      <div className="flex items-center gap-2.5 px-5 py-5 border-b border-sidebar-border">
-        <div className="flex items-center justify-center w-8 h-8 rounded-lg bg-primary/20">
-          <Zap className="w-4 h-4 text-primary" />
+    <aside className="hidden md:flex flex-col w-60 h-full bg-sidebar/85 backdrop-blur-xl border-r border-sidebar-border shrink-0 overflow-y-auto">
+      <div className="flex items-center gap-3 px-5 py-5 border-b border-sidebar-border">
+        <div className="citrus-gradient flex items-center justify-center w-9 h-9 rounded-2xl shadow-lg shadow-orange-200/70">
+          <Zap className="w-4.5 h-4.5 text-white" />
         </div>
         <div>
-          <p className="text-sm font-semibold text-sidebar-foreground leading-tight">JetBrains AI</p>
+          <p className="text-sm font-bold text-sidebar-foreground leading-tight tracking-tight">JetBrains AI</p>
           <p className="text-xs text-muted-foreground leading-tight">{subtitle}</p>
         </div>
       </div>
       <NavLinks mode={mode} />
       <div className="px-4 py-3 border-t border-sidebar-border">
-        <p className="text-xs text-muted-foreground">v3.0.0 · MIT License</p>
+        <p className="text-xs text-muted-foreground">🍊 v3.0.0 · Citrus UI</p>
       </div>
     </aside>
   );
@@ -148,10 +148,10 @@ function Sidebar({ mode }: { mode: NavMode }) {
 
 function MobileHeader({ onMenuOpen }: { onMenuOpen: () => void }) {
   return (
-    <header className="md:hidden fixed top-0 left-0 right-0 z-30 flex items-center justify-between px-4 h-14 bg-sidebar border-b border-sidebar-border">
+    <header className="md:hidden fixed top-0 left-0 right-0 z-30 flex items-center justify-between px-4 h-14 bg-sidebar/90 backdrop-blur-xl border-b border-sidebar-border">
       <div className="flex items-center gap-2.5">
-        <div className="flex items-center justify-center w-7 h-7 rounded-lg bg-primary/20">
-          <Zap className="w-3.5 h-3.5 text-primary" />
+        <div className="citrus-gradient flex items-center justify-center w-7 h-7 rounded-xl shadow-md shadow-orange-200/70">
+          <Zap className="w-3.5 h-3.5 text-white" />
         </div>
         <p className="text-sm font-semibold text-sidebar-foreground">JetBrains AI 管理控制台</p>
       </div>
@@ -186,14 +186,14 @@ function MobileDrawer({ open, onClose, mode }: { open: boolean; onClose: () => v
       )}
       <div
         className={cn(
-          "md:hidden fixed top-0 left-0 bottom-0 z-50 w-64 bg-sidebar border-r border-sidebar-border flex flex-col transition-transform duration-300",
+          "md:hidden fixed top-0 left-0 bottom-0 z-50 w-64 bg-sidebar/95 backdrop-blur-xl border-r border-sidebar-border flex flex-col transition-transform duration-300",
           open ? "translate-x-0" : "-translate-x-full"
         )}
       >
         <div className="flex items-center justify-between px-5 py-4 border-b border-sidebar-border">
           <div className="flex items-center gap-2.5">
-            <div className="flex items-center justify-center w-7 h-7 rounded-lg bg-primary/20">
-              <Zap className="w-3.5 h-3.5 text-primary" />
+            <div className="citrus-gradient flex items-center justify-center w-7 h-7 rounded-xl shadow-md shadow-orange-200/70">
+              <Zap className="w-3.5 h-3.5 text-white" />
             </div>
             <p className="text-sm font-semibold text-sidebar-foreground">JetBrains AI</p>
           </div>
@@ -216,12 +216,12 @@ function MobileDrawer({ open, onClose, mode }: { open: boolean; onClose: () => v
 function Layout({ children, mode }: { children: React.ReactNode; mode: NavMode }) {
   const [mobileOpen, setMobileOpen] = useState(false);
   return (
-    <div className="h-screen flex overflow-hidden">
+    <div className="app-shell h-screen flex overflow-hidden">
       <Sidebar mode={mode} />
       <MobileDrawer open={mobileOpen} onClose={() => setMobileOpen(false)} mode={mode} />
       <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
         <MobileHeader onMenuOpen={() => setMobileOpen(true)} />
-        <main className="flex-1 overflow-y-auto p-4 md:p-6 pt-16 md:pt-6">
+        <main className="flex-1 overflow-y-auto p-4 md:p-7 pt-16 md:pt-7">
           {children}
         </main>
       </div>
@@ -242,7 +242,7 @@ function FullscreenLayout({ children, mode }: { children: React.ReactNode; mode:
       {/* 菜单开关按钮 */}
       <button
         onClick={() => setSidebarOpen((v) => !v)}
-        className="fixed top-4 left-4 z-50 flex items-center gap-1.5 px-3 py-2 rounded-xl bg-white/80 backdrop-blur-sm shadow-md border border-amber-200 hover:bg-white transition-colors"
+        className="fixed top-4 left-4 z-50 flex items-center gap-1.5 px-3 py-2 rounded-xl bg-white/85 backdrop-blur-sm shadow-md border border-orange-200 hover:bg-white transition-colors"
         style={{ color: "#92400e" }}
       >
         {sidebarOpen ? <X className="w-4 h-4" /> : <Menu className="w-4 h-4" />}
@@ -259,7 +259,7 @@ function FullscreenLayout({ children, mode }: { children: React.ReactNode; mode:
 
       {/* 抽屉菜单（全平台通用，不依赖 Sidebar 的 hidden md:flex） */}
       <div
-        className="fixed left-0 top-0 h-full z-50 flex flex-col bg-sidebar border-r border-sidebar-border transition-transform duration-300 ease-in-out"
+        className="fixed left-0 top-0 h-full z-50 flex flex-col bg-sidebar/95 backdrop-blur-xl border-r border-sidebar-border transition-transform duration-300 ease-in-out"
         style={{
           width: "min(256px, 80vw)",
           transform: sidebarOpen ? "translateX(0)" : "translateX(-100%)",
@@ -267,8 +267,8 @@ function FullscreenLayout({ children, mode }: { children: React.ReactNode; mode:
       >
         <div className="flex items-center justify-between px-5 py-4 border-b border-sidebar-border shrink-0">
           <div className="flex items-center gap-2.5">
-            <div className="flex items-center justify-center w-7 h-7 rounded-lg bg-primary/20">
-              <Zap className="w-3.5 h-3.5 text-primary" />
+            <div className="citrus-gradient flex items-center justify-center w-7 h-7 rounded-xl shadow-md shadow-orange-200/70">
+              <Zap className="w-3.5 h-3.5 text-white" />
             </div>
             <p className="text-sm font-semibold text-sidebar-foreground">JetBrains AI</p>
           </div>
