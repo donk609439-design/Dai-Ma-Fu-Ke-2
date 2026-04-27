@@ -45,6 +45,32 @@ request aborted ... POST /v1/chat/completions ... statusCode=null responseTime=1
 
 最终生效改动总结：连接池配置升级 + PoolTimeout 转 503 + `_sse_with_keepalive` 的 finally aclose + Express 代理超时升至 10 分钟。
 
+### 四阶段修复：启动检测减压（生产瘫痪止血）
+
+三阶段部署后用户报"现在生产环境彻底炸了，根本进不去网站"。生产日志显示**所有路径**（`/v1/models`、`/admin/status`、`/key/usage`、`/admin/pending-nc` 等）均在 165–180s 后被 abort，不只是流式 chat。Python 后端整体瘫痪。
+
+根因（不是代码 bug，是上游仓库设计 + 外部 API 异常的化学反应）：
+1. 生产库 1864 个账号；
+2. `_startup_quota_check`（main.py:2587）启动时**立即**对**全部 1864 个**做强制 JWT 刷新；
+3. 当前 grazie auth API 大量 429/401，每次 JWT 刷新 hang 几秒到 timeout；
+4. 这些 hang 住的请求把全局 `http_client` 连接池（500 connections）占满；
+5. 真实用户的所有 Python 后端请求拿不到连接 → 全部 PoolTimeout / 卡死；
+6. dev 环境同样代码、同样 1864 账号但不炸——因为 dev 没有真实用户流量挤压。
+
+修复（`jetbrainsai2api/main.py:2590` `_startup_quota_check`）：
+1. **延后开始**：函数体最前面 `await asyncio.sleep(300)`，让真实流量先获得 5 分钟连接池资源；
+2. **降低并发**：`Semaphore(2) → Semaphore(1)`（串行化 JWT 刷新）；
+3. **缩小分块**：`_CHUNK 20 → 10`；
+4. **拉长块间休息**：`asyncio.sleep(0.3) → 1.5`。
+
+附带（`_background_external_usage_scan` line 2438）：初始 sleep 从 `300` → `3600`，避免 20 分钟后台扫描首轮与启动检测同时跑挤占连接池。
+
+代价：账号 has_quota 状态收敛变慢（约 30 → 60 分钟），但绝不会再因启动瞬间打爆连接池而瘫痪整个 Python 后端。
+
+架构师审查指出**残余风险**：`get_next_jetbrains_account` 内的 `_first_ready` 仍在候选组上"全量并发探测 + 找到 winner 后不取消其余"，在 JWT 普遍陈旧时可触发大规模并发刷新。后续若复发，需要改为"有上限并发 + 早停取消"。本次按用户"最简改动"原则未动。
+
+最终生效改动总结：上述三阶段 + 启动检测减压 + 后台扫描错开。
+
 ## 复刻状态（2026-04-26）
 
 源码已 1:1 复刻完成，三个工作流均正常运行：

@@ -2437,7 +2437,9 @@ async def _background_external_usage_scan():
     扫描结束后自动删除仍无配额的账号（内存 + 数据库同步清理）。
     连续两轮均检测到不明配额消耗时，才自动封禁关联密钥（防止单次误判）。"""
     global current_account_index
-    await asyncio.sleep(300)  # 启动 5 分钟后才开始，避免干扰初始化
+    # 与 _startup_quota_check 错开：后者已加 5 分钟 sleep + 慢节奏扫全量约 30–70 分钟。
+    # 此处后移到 60 分钟，避免与首轮启动检测同时跑挤占 http_client 连接池。
+    await asyncio.sleep(3600)
     while True:
         accounts_snapshot = list(JETBRAINS_ACCOUNTS)
         now_bg = time.time()
@@ -2585,15 +2587,27 @@ async def _cleanup_pending_prizes_loop():
 
 
 async def _startup_quota_check():
-    """启动时立即对所有账号做一次强制配额检测（不受 last_quota_check 限制），
-    确保服务重启后 has_quota 状态与实际 AI Credits 保持一致。"""
+    """启动后对所有账号做一次强制配额检测（不受 last_quota_check 限制），
+    确保服务重启后 has_quota 状态与实际 AI Credits 保持一致。
+
+    生产事故减压（2026-04-27）：
+      之前"启动立即扫全量 1864 账号" + grazie auth API 大量 429/401 →
+      所有 JWT 刷新挤占全局 http_client 连接池 → 真实用户请求全部 PoolTimeout，
+      症状："网站根本进不去，特别卡"。
+      改为：① 启动后等 5 分钟（让真实流量先获得连接池资源）
+            ② 并发降为 1、分块缩小为 10、块间休 1.5s
+      影响：账号 has_quota 状态收敛变慢（约 30 → 60 分钟），
+            但绝不会再因启动瞬间打爆连接池而瘫痪整个 Python 后端。
+    """
     global current_account_index
     if not JETBRAINS_ACCOUNTS:
         return
+    # 启动后让出 5 分钟给真实流量预热（admin-panel/v1 等接口先恢复响应）
+    await asyncio.sleep(300)
     total_acc = len(JETBRAINS_ACCOUNTS)
-    print(f"[启动检测] 开始对 {total_acc} 个账号进行配额强制刷新（分块执行，不阻塞请求处理）...")
-    _CHUNK = 20
-    semaphore = asyncio.Semaphore(2)   # 降低并发避免 JWT 刷新接口 429
+    print(f"[启动检测] 启动 5 分钟缓冲后开始对 {total_acc} 个账号配额刷新（慢节奏，不抢真实流量）...")
+    _CHUNK = 10
+    semaphore = asyncio.Semaphore(1)   # 串行化，最大限度避免 JWT 刷新 429 + 池占用
     async def _check_one(acc: dict):
         async with semaphore:
             try:
@@ -2605,7 +2619,7 @@ async def _startup_quota_check():
         chunk = snapshot[chunk_start: chunk_start + _CHUNK]
         await asyncio.gather(*[_check_one(acc) for acc in chunk])
         # _check_quota.finally 已逐条保存，此处无需冗余 batch save
-        await asyncio.sleep(0.3)  # 块间短暂休息，让远端 JWT 速率限制恢复
+        await asyncio.sleep(1.5)  # 块间显著休息，给远端速率限制充分恢复时间
 
     # 删除确认无配额的账号（内存 + 数据库）
     no_quota_accs_startup = [a for a in JETBRAINS_ACCOUNTS if not a.get("has_quota")]
