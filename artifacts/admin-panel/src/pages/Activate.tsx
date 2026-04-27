@@ -129,10 +129,14 @@ export default function Activate() {
   const [successInfo, setSuccessInfo] = useState<{ licenseId?: string; generatedKey?: string; isExisting?: boolean; isPending?: boolean } | null>(null);
   const [keyCopied, setKeyCopied] = useState(false);
   const logsEndRef = useRef<HTMLDivElement>(null);
+  const logsContainerRef = useRef<HTMLDivElement>(null);
   const esRef = useRef<EventSource | null>(null);
 
   useEffect(() => {
-    logsEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    const el = logsContainerRef.current;
+    if (el) {
+      el.scrollTop = el.scrollHeight;
+    }
   }, [logs]);
 
   useEffect(() => {
@@ -677,7 +681,7 @@ export default function Activate() {
             </span>
             {isRunning && <Loader2 className="w-3 h-3 animate-spin text-primary ml-auto" />}
           </div>
-          <div className="premium-terminal p-4 h-80 overflow-y-auto font-mono text-xs space-y-0.5">
+          <div ref={logsContainerRef} className="premium-terminal p-4 h-80 overflow-y-auto font-mono text-xs space-y-0.5">
             {renderLogs()}
             <div ref={logsEndRef} />
           </div>
