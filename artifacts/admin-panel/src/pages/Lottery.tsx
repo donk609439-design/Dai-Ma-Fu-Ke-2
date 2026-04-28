@@ -24,25 +24,25 @@ interface Prize {
 }
 
 const FALLBACK_SEGMENTS = [
-  { prize: "敬请期待", bg: "#ef4444" },
-  { prize: "敬请期待", bg: "#f97316" },
-  { prize: "敬请期待", bg: "#eab308" },
-  { prize: "敬请期待", bg: "#22c55e" },
-  { prize: "敬请期待", bg: "#06b6d4" },
-  { prize: "敬请期待", bg: "#6366f1" },
-  { prize: "敬请期待", bg: "#8b5cf6" },
-  { prize: "敬请期待", bg: "#ec4899" },
+  { prize: "敬请期待", bg: "#f7f2ea" },
+  { prize: "敬请期待", bg: "#e8ded1" },
+  { prize: "敬请期待", bg: "#d8c7b5" },
+  { prize: "敬请期待", bg: "#f2eadf" },
+  { prize: "敬请期待", bg: "#cfc1b0" },
+  { prize: "敬请期待", bg: "#eee4d8" },
+  { prize: "敬请期待", bg: "#ddcfbf" },
+  { prize: "敬请期待", bg: "#f5efe6" },
 ];
 
 const SEG_COLORS = [
-  "#ef4444",
-  "#f97316",
-  "#eab308",
-  "#22c55e",
-  "#06b6d4",
-  "#6366f1",
-  "#8b5cf6",
-  "#ec4899",
+  "#f7f2ea",
+  "#e8ded1",
+  "#d8c7b5",
+  "#f2eadf",
+  "#cfc1b0",
+  "#eee4d8",
+  "#ddcfbf",
+  "#f5efe6",
 ];
 
 function hexToRgb(hex: string) {
@@ -798,13 +798,13 @@ export default function Lottery() {
           <div className="mx-auto grid w-full max-w-7xl flex-1 items-center gap-6 lg:grid-cols-[320px_minmax(420px,1fr)_320px]">
             {/* Left control deck */}
             <aside className="order-2 space-y-3 lg:order-1">
-              <div className="rounded-[2rem] border border-white/65 bg-white/58 p-4 shadow-2xl shadow-orange-950/10 backdrop-blur-2xl">
+              <div className="rounded-[2rem] border border-white/70 bg-white/54 p-4 shadow-2xl shadow-stone-950/8 backdrop-blur-2xl">
                 <div className="mb-4 flex items-center gap-3">
-                  <div className="grid h-11 w-11 place-items-center rounded-2xl bg-gradient-to-br from-orange-300 to-orange-600 text-white shadow-lg shadow-orange-500/20">
+                  <div className="grid h-11 w-11 place-items-center rounded-2xl border border-stone-200 bg-white/72 text-stone-700 shadow-sm">
                     <Sparkles className="h-5 w-5" />
                   </div>
                   <div>
-                    <p className="text-xs font-black uppercase tracking-[0.2em] text-orange-600">Action Deck</p>
+                    <p className="text-xs font-semibold uppercase tracking-[0.24em] text-stone-400">Control</p>
                     <h2 className="text-lg font-black text-stone-950">圣人控制台</h2>
                   </div>
                 </div>
@@ -812,42 +812,42 @@ export default function Lottery() {
                 <div className="grid gap-2">
                   <button
                     onClick={() => setShowSaint(true)}
-                    className="group flex items-center justify-between rounded-2xl border border-orange-200 bg-gradient-to-r from-orange-50 to-amber-50 px-3.5 py-3 text-left shadow-sm transition hover:-translate-y-0.5 hover:shadow-lg hover:shadow-orange-500/10"
+                    className="group flex items-center justify-between rounded-2xl border border-stone-200/80 bg-white/58 px-3.5 py-3 text-left shadow-sm transition hover:-translate-y-0.5 hover:bg-white/78 hover:shadow-lg hover:shadow-stone-950/5"
                   >
-                    <span className="flex items-center gap-2 text-sm font-black text-orange-800">
-                      <Sparkles className="h-4 w-4 text-orange-500" />
+                    <span className="flex items-center gap-2 text-sm font-black text-stone-800">
+                      <Sparkles className="h-4 w-4 text-stone-500" />
                       我要当圣人
                     </span>
-                    <ArrowRight className="h-4 w-4 text-orange-500 transition group-hover:translate-x-0.5" />
+                    <ArrowRight className="h-4 w-4 text-stone-400 transition group-hover:translate-x-0.5" />
                   </button>
 
                   <button
                     onClick={() => setShowLeaderboard(true)}
-                    className="group flex items-center justify-between rounded-2xl border border-cyan-200 bg-gradient-to-r from-cyan-50 to-emerald-50 px-3.5 py-3 text-left shadow-sm transition hover:-translate-y-0.5 hover:shadow-lg hover:shadow-cyan-500/10"
+                    className="group flex items-center justify-between rounded-2xl border border-stone-200/80 bg-white/44 px-3.5 py-3 text-left shadow-sm transition hover:-translate-y-0.5 hover:bg-white/72 hover:shadow-lg hover:shadow-stone-950/5"
                   >
-                    <span className="flex items-center gap-2 text-sm font-black text-cyan-800">
-                      <Trophy className="h-4 w-4 text-cyan-600" />
+                    <span className="flex items-center gap-2 text-sm font-black text-stone-800">
+                      <Trophy className="h-4 w-4 text-stone-500" />
                       圣人排行榜
                     </span>
-                    <ArrowRight className="h-4 w-4 text-cyan-600 transition group-hover:translate-x-0.5" />
+                    <ArrowRight className="h-4 w-4 text-stone-400 transition group-hover:translate-x-0.5" />
                   </button>
 
                   {dcLoggedIn ? (
                     <button
                       onClick={dcLogout}
-                      className="flex items-center justify-between rounded-2xl border border-indigo-200 bg-indigo-50/80 px-3.5 py-3 text-left shadow-sm transition hover:bg-indigo-50"
+                      className="flex items-center justify-between rounded-2xl border border-stone-200/80 bg-white/48 px-3.5 py-3 text-left shadow-sm transition hover:bg-white/72"
                       title="点击退出 Discord 登录"
                     >
-                      <span className="min-w-0 flex items-center gap-2 text-sm font-black text-indigo-700">
+                      <span className="min-w-0 flex items-center gap-2 text-sm font-black text-stone-700">
                         <LogOut className="h-4 w-4 shrink-0" />
                         <span className="truncate">{userTag}</span>
                       </span>
-                      <span className="text-[10px] font-black uppercase tracking-wider text-indigo-400">Logout</span>
+                      <span className="text-[10px] font-black uppercase tracking-wider text-stone-400">Logout</span>
                     </button>
                   ) : (
                     <button
                       onClick={dcLogin}
-                      className="flex items-center justify-center gap-2 rounded-2xl border border-indigo-200 bg-indigo-600 px-3.5 py-3 text-sm font-black text-white shadow-lg shadow-indigo-500/20 transition hover:bg-indigo-700"
+                      className="flex items-center justify-center gap-2 rounded-2xl border border-stone-800 bg-stone-900 px-3.5 py-3 text-sm font-black text-white shadow-lg shadow-stone-950/15 transition hover:bg-stone-800"
                     >
                       <LogIn className="h-4 w-4" />
                       Discord 登录
@@ -856,8 +856,8 @@ export default function Lottery() {
                 </div>
               </div>
 
-              <div className="rounded-[2rem] border border-white/65 bg-white/50 p-4 shadow-xl shadow-orange-950/5 backdrop-blur-2xl">
-                <p className="mb-3 text-xs font-black uppercase tracking-[0.22em] text-stone-400">Wallet</p>
+              <div className="rounded-[2rem] border border-white/70 bg-white/42 p-4 shadow-xl shadow-stone-950/5 backdrop-blur-2xl">
+                <p className="mb-3 text-xs font-semibold uppercase tracking-[0.24em] text-stone-400">Wallet</p>
                 {dcToken && saintAuthed === false ? (
                   <button
                     className="flex w-full items-center gap-2 rounded-2xl border border-rose-200 bg-rose-50 px-3 py-3 text-left text-sm font-bold text-rose-700"
@@ -868,8 +868,8 @@ export default function Lottery() {
                     会话过期，点此重登
                   </button>
                 ) : dcToken && saintPoints !== null ? (
-                  <div className="rounded-2xl border border-orange-200 bg-orange-50/80 px-4 py-4">
-                    <p className="text-xs font-bold text-orange-700">圣人点数</p>
+                  <div className="rounded-2xl border border-stone-200/80 bg-white/54 px-4 py-4">
+                    <p className="text-xs font-bold text-stone-500">圣人点数</p>
                     <p className="mt-1 text-4xl font-black tracking-tight text-stone-950">{saintPoints}</p>
                     <p className="mt-2 text-xs leading-5 text-stone-500">每 1 点可启动一次橘子机</p>
                   </div>
@@ -883,15 +883,15 @@ export default function Lottery() {
 
             {/* Center stage */}
             <main className="order-1 flex flex-col items-center lg:order-2">
-              <div className="mb-5 text-center">
-                <div className="mx-auto mb-3 inline-flex items-center gap-2 rounded-full border border-white/70 bg-white/58 px-4 py-2 text-xs font-black uppercase tracking-[0.22em] text-orange-700 shadow-sm backdrop-blur">
-                  <Star className="h-3.5 w-3.5 fill-orange-400 text-orange-500" />
-                  Orange Arcade
+              <div className="mb-6 text-center">
+                <div className="mx-auto mb-4 inline-flex items-center gap-2 rounded-full border border-stone-200/80 bg-white/70 px-4 py-2 text-[11px] font-semibold uppercase tracking-[0.28em] text-stone-500 shadow-sm backdrop-blur">
+                  <Star className="h-3.5 w-3.5 text-stone-400" />
+                  Private Draw
                 </div>
-                <h1 className="text-5xl font-black tracking-tight text-stone-950 sm:text-6xl lg:text-7xl">
+                <h1 className="text-5xl font-black tracking-[-0.08em] text-stone-950 sm:text-6xl lg:text-7xl">
                   橘子<span className="citrus-text">机</span>
                 </h1>
-                <p className="mt-3 text-sm font-semibold text-stone-500">圣人点数驱动的高级抽奖转盘</p>
+                <p className="mt-4 text-sm font-medium tracking-wide text-stone-500">去繁从简的圣人点数抽奖台</p>
               </div>
 
               <div className="lottery-wheel-frame relative grid h-[min(86vw,520px)] w-[min(86vw,520px)] place-items-center rounded-full">
@@ -902,140 +902,62 @@ export default function Lottery() {
                   style={{
                     transform: `rotate(${rotation}deg)`,
                     transition: transitionOn ? "transform 3.2s cubic-bezier(0.05, 0.9, 0.1, 1)" : "none",
-                    filter: "drop-shadow(0 28px 52px rgba(124,45,18,0.24))",
+                    filter: "drop-shadow(0 30px 58px rgba(28,25,23,0.16))",
                   }}
                 >
                   <svg viewBox="0 0 320 320" className="h-full w-full overflow-visible">
                     <defs>
-                      <filter id="lotteryWheelShadow" x="-30%" y="-30%" width="160%" height="160%">
-                        <feDropShadow dx="0" dy="18" stdDeviation="14" floodColor="#7c2d12" floodOpacity="0.24" />
+                      <filter id="lotteryWheelShadow" x="-28%" y="-28%" width="156%" height="156%">
+                        <feDropShadow dx="0" dy="22" stdDeviation="18" floodColor="#1c1917" floodOpacity="0.16" />
                       </filter>
-                      <filter id="lotterySegmentDepth" x="-20%" y="-20%" width="140%" height="140%">
-                        <feDropShadow dx="0" dy="5" stdDeviation="3" floodColor="#431407" floodOpacity="0.18" />
-                      </filter>
-                      <filter id="lotteryTextGlow" x="-40%" y="-40%" width="180%" height="180%">
-                        <feDropShadow dx="0" dy="1" stdDeviation="1.1" floodColor="#000000" floodOpacity="0.35" />
-                      </filter>
-                      <radialGradient id="wheelGlass" cx="35%" cy="24%">
-                        <stop offset="0%" stopColor="rgba(255,255,255,0.9)" />
-                        <stop offset="38%" stopColor="rgba(255,255,255,0.22)" />
-                        <stop offset="72%" stopColor="rgba(255,255,255,0.06)" />
-                        <stop offset="100%" stopColor="rgba(124,45,18,0.14)" />
-                      </radialGradient>
-                      <radialGradient id="metalRim" cx="34%" cy="22%">
+                      <radialGradient id="minimalRim" cx="36%" cy="24%">
                         <stop offset="0%" stopColor="#ffffff" />
-                        <stop offset="18%" stopColor="#ffedd5" />
-                        <stop offset="46%" stopColor="#fb923c" />
-                        <stop offset="72%" stopColor="#c2410c" />
-                        <stop offset="100%" stopColor="#7c2d12" />
+                        <stop offset="48%" stopColor="#eee7dd" />
+                        <stop offset="100%" stopColor="#b8aa99" />
                       </radialGradient>
-                      <linearGradient id="rimHighlight" x1="0" x2="1" y1="0" y2="1">
-                        <stop offset="0%" stopColor="rgba(255,255,255,0.95)" />
-                        <stop offset="42%" stopColor="rgba(255,255,255,0.18)" />
-                        <stop offset="100%" stopColor="rgba(255,255,255,0)" />
-                      </linearGradient>
                       <radialGradient id="hubGradient" cx="35%" cy="28%">
-                        <stop offset="0%" stopColor="#fff7ed" />
-                        <stop offset="34%" stopColor="#fdba74" />
-                        <stop offset="68%" stopColor="#f97316" />
-                        <stop offset="100%" stopColor="#9a3412" />
+                        <stop offset="0%" stopColor="#ffffff" />
+                        <stop offset="62%" stopColor="#eee6dc" />
+                        <stop offset="100%" stopColor="#a99a88" />
                       </radialGradient>
                       {segments.map((seg, i) => (
-                        <radialGradient key={`grad-${i}`} id={`segmentGradient-${i}`} cx="36%" cy="24%">
-                          <stop offset="0%" stopColor={mixHex(seg.bg, "white", 0.52)} />
-                          <stop offset="42%" stopColor={seg.bg} />
-                          <stop offset="100%" stopColor={mixHex(seg.bg, "black", 0.34)} />
-                        </radialGradient>
+                        <linearGradient key={`grad-${i}`} id={`segmentGradient-${i}`} x1="0" x2="1" y1="0" y2="1">
+                          <stop offset="0%" stopColor={mixHex(seg.bg, "white", 0.42)} />
+                          <stop offset="100%" stopColor={mixHex(seg.bg, "black", 0.06)} />
+                        </linearGradient>
                       ))}
                     </defs>
 
                     <g filter="url(#lotteryWheelShadow)">
-                      <circle cx={CX} cy={CY} r={R + 23} fill="url(#metalRim)" />
-                      <circle cx={CX} cy={CY} r={R + 18} fill="rgba(255,255,255,0.75)" />
-                      <circle cx={CX} cy={CY} r={R + 13} fill="rgba(124,45,18,0.22)" />
-
-                      {Array.from({ length: 48 }).map((_, i) => {
-                        const deg = (360 / 48) * i;
-                        const x = CX + (R + 18) * Math.cos(toRad(deg));
-                        const y = CY + (R + 18) * Math.sin(toRad(deg));
-                        const active = i % 2 === 0;
-                        return (
-                          <circle
-                            key={`bulb-${i}`}
-                            cx={x}
-                            cy={y}
-                            r={active ? 2.9 : 1.9}
-                            fill={active ? "#fff7ed" : "#fed7aa"}
-                            opacity={active ? 1 : 0.74}
-                          />
-                        );
-                      })}
-
-                      <circle cx={CX} cy={CY} r={R + 7} fill="rgba(255,255,255,0.86)" />
-                      <circle cx={CX} cy={CY} r={R + 2} fill="#fff7ed" />
+                      <circle cx={CX} cy={CY} r={R + 19} fill="url(#minimalRim)" />
+                      <circle cx={CX} cy={CY} r={R + 13} fill="#faf7f2" />
+                      <circle cx={CX} cy={CY} r={R + 4} fill="#d8cbbb" opacity="0.42" />
 
                       {segments.map((seg, i) => {
                         const startDeg = -90 + i * SEG_ANGLE;
                         const endDeg = -90 + (i + 1) * SEG_ANGLE;
                         const midDeg = startDeg + SEG_ANGLE / 2;
-                        const iconR = R * 0.58;
-                        const labelR = R * 0.74;
-                        const iconX = CX + iconR * Math.cos(toRad(midDeg));
-                        const iconY = CY + iconR * Math.sin(toRad(midDeg));
+                        const labelR = R * 0.68;
                         const labelX = CX + labelR * Math.cos(toRad(midDeg));
                         const labelY = CY + labelR * Math.sin(toRad(midDeg));
                         const labelRotation = midDeg + 90;
                         return (
-                          <g key={`${seg.prize}-${i}`} filter="url(#lotterySegmentDepth)">
+                          <g key={`${seg.prize}-${i}`}>
                             <path
-                              d={sectorPath(startDeg + 0.55, endDeg - 0.55)}
+                              d={sectorPath(startDeg + 0.25, endDeg - 0.25)}
                               fill={`url(#segmentGradient-${i})`}
-                              stroke="rgba(255,255,255,0.82)"
-                              strokeWidth="1.2"
+                              stroke="rgba(120,113,108,0.18)"
+                              strokeWidth="0.8"
                             />
-                            <path
-                              d={sectorPath(startDeg + 2.4, endDeg - 2.4)}
-                              fill="url(#wheelGlass)"
-                              opacity="0.52"
-                            />
-                            <line
-                              x1={CX}
-                              y1={CY}
-                              x2={CX + (R - 4) * Math.cos(toRad(startDeg))}
-                              y2={CY + (R - 4) * Math.sin(toRad(startDeg))}
-                              stroke="rgba(255,255,255,0.5)"
-                              strokeWidth="1"
-                            />
-                            <text
-                              x={iconX}
-                              y={iconY}
-                              textAnchor="middle"
-                              dominantBaseline="middle"
-                              fontSize={23}
-                              filter="url(#lotteryTextGlow)"
-                              style={{ userSelect: "none" }}
-                            >
-                              {prizeEmoji(seg.prize)}
-                            </text>
                             <g transform={`translate(${labelX} ${labelY}) rotate(${labelRotation})`}>
-                              <rect
-                                x="-25"
-                                y="-9"
-                                width="50"
-                                height="18"
-                                rx="9"
-                                fill="rgba(255,255,255,0.24)"
-                                stroke="rgba(255,255,255,0.28)"
-                              />
                               <text
                                 y="1"
                                 textAnchor="middle"
                                 dominantBaseline="middle"
-                                fontSize={7.8}
-                                fill="rgba(255,255,255,0.94)"
-                                fontWeight="950"
-                                filter="url(#lotteryTextGlow)"
-                                style={{ userSelect: "none", letterSpacing: "0.02em" }}
+                                fontSize={8.4}
+                                fill="#57534e"
+                                fontWeight="700"
+                                style={{ userSelect: "none", letterSpacing: "0.03em" }}
                               >
                                 {shortenPrize(seg.prize)}
                               </text>
@@ -1044,36 +966,21 @@ export default function Lottery() {
                         );
                       })}
 
-                      <circle cx={CX} cy={CY} r={R + 2} fill="none" stroke="rgba(255,255,255,0.92)" strokeWidth="3.5" />
-                      <circle cx={CX} cy={CY} r={R - 31} fill="none" stroke="rgba(255,255,255,0.22)" strokeWidth="1.5" />
-                      <circle cx={CX} cy={CY} r={R - 58} fill="none" stroke="rgba(255,255,255,0.16)" strokeWidth="1" />
-                      <path
-                        d="M 76 72 C 126 28, 212 30, 250 86"
-                        fill="none"
-                        stroke="url(#rimHighlight)"
-                        strokeWidth="13"
-                        strokeLinecap="round"
-                        opacity="0.72"
-                      />
+                      <circle cx={CX} cy={CY} r={R + 2} fill="none" stroke="rgba(255,255,255,0.9)" strokeWidth="2.2" />
+                      <circle cx={CX} cy={CY} r={R - 36} fill="none" stroke="rgba(87,83,78,0.11)" strokeWidth="1" />
+                      <circle cx={CX} cy={CY} r={R - 68} fill="none" stroke="rgba(87,83,78,0.08)" strokeWidth="1" />
 
-                      <circle cx={CX} cy={CY} r={42} fill="rgba(255,255,255,0.9)" />
-                      <circle cx={CX} cy={CY} r={35} fill="url(#hubGradient)" />
-                      <circle cx={CX} cy={CY} r={25} fill="rgba(255,255,255,0.18)" stroke="rgba(255,255,255,0.52)" strokeWidth="1.2" />
-                      <circle cx={CX} cy={CY} r={15} fill="rgba(255,255,255,0.94)" />
-                      <text x={CX} y={CY + 5} textAnchor="middle" fontSize={18} style={{ userSelect: "none" }}>
-                        🍊
-                      </text>
-                      <circle cx={CX} cy={CY} r={48} fill="none" stroke="rgba(255,255,255,0.55)" strokeWidth="1.4" />
-                      <circle cx={CX} cy={CY} r={54} fill="none" stroke="rgba(124,45,18,0.18)" strokeWidth="1" strokeDasharray="2 5" />
+                      <circle cx={CX} cy={CY} r={39} fill="rgba(255,255,255,0.84)" />
+                      <circle cx={CX} cy={CY} r={31} fill="url(#hubGradient)" stroke="rgba(87,83,78,0.16)" strokeWidth="1" />
+                      <circle cx={CX} cy={CY} r={10} fill="#292524" />
+                      <circle cx={CX} cy={CY} r={4} fill="#f8f3ec" />
                     </g>
                   </svg>
                 </div>
 
-                <div className="lottery-pointer absolute left-1/2 top-4 z-20 -translate-x-1/2">
-                  <div className="h-0 w-0 border-l-[20px] border-r-[20px] border-t-[48px] border-l-transparent border-r-transparent border-t-orange-600 drop-shadow-[0_10px_12px_rgba(124,45,18,0.35)]" />
-                  <div className="absolute left-1/2 top-[-13px] grid h-8 w-8 -translate-x-1/2 place-items-center rounded-full bg-white text-sm shadow-lg ring-4 ring-orange-200">
-                    🍊
-                  </div>
+                <div className="lottery-pointer absolute left-1/2 top-5 z-20 -translate-x-1/2">
+                  <div className="h-0 w-0 border-l-[14px] border-r-[14px] border-t-[38px] border-l-transparent border-r-transparent border-t-stone-900 drop-shadow-[0_12px_18px_rgba(28,25,23,0.24)]" />
+                  <div className="absolute left-1/2 top-[-10px] h-5 w-5 -translate-x-1/2 rounded-full border border-stone-200 bg-white shadow-md" />
                 </div>
               </div>
 
@@ -1122,13 +1029,13 @@ export default function Lottery() {
 
             {/* Right prize deck */}
             <aside className="order-3 space-y-3">
-              <div className="rounded-[2rem] border border-white/65 bg-white/50 p-4 shadow-2xl shadow-orange-950/10 backdrop-blur-2xl">
+              <div className="rounded-[2rem] border border-white/70 bg-white/44 p-4 shadow-2xl shadow-stone-950/8 backdrop-blur-2xl">
                 <div className="mb-4 flex items-center justify-between">
                   <div>
-                    <p className="text-xs font-black uppercase tracking-[0.22em] text-orange-600">Prize Pool</p>
+                    <p className="text-xs font-semibold uppercase tracking-[0.24em] text-stone-400">Prize Pool</p>
                     <h2 className="text-lg font-black text-stone-950">奖品池</h2>
                   </div>
-                  <span className="rounded-full bg-orange-100 px-2.5 py-1 text-xs font-black text-orange-700">
+                  <span className="rounded-full border border-stone-200 bg-white/54 px-2.5 py-1 text-xs font-black text-stone-500">
                     {segments.length} 项
                   </span>
                 </div>
@@ -1136,13 +1043,13 @@ export default function Lottery() {
                   {segments.map((seg, i) => (
                     <div
                       key={`${seg.prize}-deck-${i}`}
-                      className="flex items-center gap-3 rounded-2xl border border-white/70 bg-white/54 px-3 py-2.5 shadow-sm backdrop-blur"
+                      className="flex items-center gap-3 rounded-2xl border border-stone-200/70 bg-white/42 px-3 py-2.5 shadow-sm backdrop-blur"
                     >
                       <span
-                        className="grid h-9 w-9 shrink-0 place-items-center rounded-xl text-sm shadow-sm"
-                        style={{ background: seg.bg, color: "white" }}
+                        className="grid h-9 w-9 shrink-0 place-items-center rounded-xl border border-stone-200 text-[10px] font-black text-stone-500 shadow-sm"
+                        style={{ background: seg.bg }}
                       >
-                        {prizeEmoji(seg.prize)}
+                        {i + 1}
                       </span>
                       <div className="min-w-0 flex-1">
                         <p className="truncate text-sm font-black text-stone-800">{seg.prize}</p>
@@ -1152,8 +1059,8 @@ export default function Lottery() {
                 </div>
               </div>
 
-              <div className="rounded-[2rem] border border-white/65 bg-white/50 p-4 shadow-xl shadow-orange-950/5 backdrop-blur-2xl">
-                <p className="mb-2 text-xs font-black uppercase tracking-[0.22em] text-stone-400">Tips</p>
+              <div className="rounded-[2rem] border border-white/70 bg-white/38 p-4 shadow-xl shadow-stone-950/5 backdrop-blur-2xl">
+                <p className="mb-2 text-xs font-semibold uppercase tracking-[0.24em] text-stone-400">Tips</p>
                 <div className="space-y-2 text-xs font-semibold leading-5 text-stone-500">
                   <p className="rounded-2xl bg-white/52 px-3 py-2 ring-1 ring-white/70">捐献 Key 可获得圣人点数。</p>
                   <p className="rounded-2xl bg-white/52 px-3 py-2 ring-1 ring-white/70">宝可梦球与额度类奖品可领取到 Discord 背包。</p>
