@@ -3984,6 +3984,34 @@ async def openai_stream_adapter(
         )
         final_total_tokens = final_prompt_tokens + final_completion_tokens
 
+        # 兜底：上游可能空流结束（没有 Content/FunctionCall/FinishMetadata/error）。
+        # VS Code/Cline/Roo 等严格客户端要求流里至少出现一次 assistant delta；
+        # 否则会报“语言模型未提供任何辅助消息”。
+        if not first_chunk_sent:
+            role_chunk = {
+                "id": stream_id,
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": model_name,
+                "system_fingerprint": "fp_jetbrains",
+                "choices": [{
+                    "delta": {"role": "assistant", "content": ""},
+                    "index": 0,
+                    "finish_reason": None,
+                }],
+            }
+            yield f"data: {json.dumps(role_chunk, ensure_ascii=False)}\n\n"
+            finish_chunk = {
+                "id": stream_id,
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": model_name,
+                "system_fingerprint": "fp_jetbrains",
+                "choices": [{"delta": {}, "index": 0, "finish_reason": "stop"}],
+            }
+            yield f"data: {json.dumps(finish_chunk, ensure_ascii=False)}\n\n"
+            first_chunk_sent = True
+
         # 如果客户端请求了流式 usage（SillyTavern stream_options.include_usage）
         if include_usage:
             usage_resp = {
