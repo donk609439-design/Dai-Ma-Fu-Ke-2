@@ -3693,16 +3693,22 @@ def _convert_openai_messages_to_jetbrains(
     """OpenAI 历史消息 → JetBrains 内部 messages 格式。
 
     要点：
+    - 过滤空白 user/system 普通文本消息，避免 JetBrains 上游报错：
+      ``system: text content blocks must contain non-whitespace text``。
     - assistant 一次返回多个 tool_calls 时，全部都要保留：第一个 tool_call 跟随原
       assistant 文本作为一条 assistant_message 发出；后续每个 tool_call 单独追加一条
-      content="" 的 assistant_message，避免上游历史丢失并行调用上下文。
+      带非空占位文本的 assistant_message，避免上游历史丢失并行调用上下文。
     - 同时把所有 tool_call.id → function.name 写入映射表，供后续 role='tool' 消息
       转 function_message 时回查 functionName。
     """
     jetbrains_messages: List[Dict[str, Any]] = []
     for msg in messages:
         text_content = extract_text_content(msg.content)
+        has_text = bool(text_content.strip())
+
         if msg.role in ("user", "system"):
+            if not has_text:
+                continue
             jetbrains_messages.append(
                 {"type": f"{msg.role}_message", "content": text_content}
             )
@@ -3716,14 +3722,14 @@ def _convert_openai_messages_to_jetbrains(
                         tool_id_to_func_name_map[tc["id"]] = fn_name
                     jetbrains_messages.append({
                         "type": "assistant_message",
-                        # 只把原 assistant 文本带在第一条上，避免重复
-                        "content": text_content if idx == 0 else "",
+                        # JetBrains 不接受空白-only text block；tool_call 历史无文本时给非空占位
+                        "content": text_content if (idx == 0 and has_text) else "(tool call)",
                         "functionCall": {
                             "functionName": fn_name,
                             "content": fn_args,
                         },
                     })
-            else:
+            elif has_text:
                 jetbrains_messages.append(
                     {"type": "assistant_message", "content": text_content}
                 )
@@ -3732,7 +3738,7 @@ def _convert_openai_messages_to_jetbrains(
             if function_name:
                 jetbrains_messages.append({
                     "type": "function_message",
-                    "content": text_content,
+                    "content": text_content if has_text else "(empty)",
                     "functionName": function_name,
                 })
             else:
@@ -3740,9 +3746,14 @@ def _convert_openai_messages_to_jetbrains(
                     f"警告: 无法为 tool_call_id {msg.tool_call_id} 找到对应的函数调用"
                 )
         else:
-            jetbrains_messages.append(
-                {"type": "user_message", "content": text_content}
-            )
+            if has_text:
+                jetbrains_messages.append(
+                    {"type": "user_message", "content": text_content}
+                )
+
+    if not jetbrains_messages:
+        # 防御性兜底：所有输入消息都是空白时，不把空 messages 发给上游
+        jetbrains_messages.append({"type": "user_message", "content": "继续"})
     return jetbrains_messages
 
 
@@ -4175,15 +4186,20 @@ async def aggregate_stream_for_non_stream_response(
 
 
 def extract_text_content(content: Optional[Union[str, List[Dict[str, Any]]]]) -> str:
-    """从消息内容中提取文本内容"""
+    """从消息内容中提取文本内容；空白-only 文本规整为空串，避免上游 400。"""
     if isinstance(content, str):
-        return content
+        return content if content.strip() else ""
     elif isinstance(content, list):
-        # 处理多模态消息格式，提取所有文本内容
+        # 处理多模态消息格式，提取所有非空白文本内容
         text_parts = []
         for item in content:
+            text = ""
             if isinstance(item, dict) and item.get("type") == "text":
-                text_parts.append(item.get("text", ""))
+                text = str(item.get("text", "") or "")
+            elif getattr(item, "type", None) == "text":
+                text = str(getattr(item, "text", "") or "")
+            if text.strip():
+                text_parts.append(text)
         return " ".join(text_parts)
     return ""
 
@@ -4799,34 +4815,9 @@ async def messages_completions(
                 if tc.get("id") and tc.get("function", {}).get("name"):
                     tool_id_to_func_name_map[tc["id"]] = tc["function"]["name"]
 
-    jetbrains_messages = []
-    for msg in openai_request.messages:
-        text_content = extract_text_content(msg.content)
-        if msg.role in ["user", "system"]:
-            jetbrains_messages.append({"type": f"{msg.role}_message", "content": text_content})
-        elif msg.role == "assistant":
-            if msg.tool_calls:
-                # 多个 tool_calls：第一条带原 content，其余拆成 content="" 的独立 assistant_message
-                for idx, tc in enumerate(msg.tool_calls):
-                    fn = tc.get("function", {}) or {}
-                    fn_name = fn.get("name") or ""
-                    fn_args = fn.get("arguments") or ""
-                    if tc.get("id") and fn_name:
-                        tool_id_to_func_name_map[tc["id"]] = fn_name
-                    jetbrains_messages.append({
-                        "type": "assistant_message",
-                        "content": text_content if idx == 0 else "",
-                        "functionCall": {
-                            "functionName": fn_name,
-                            "content": fn_args,
-                        },
-                    })
-            else:
-                jetbrains_messages.append({"type": "assistant_message", "content": text_content})
-        elif msg.role == "tool":
-            function_name = tool_id_to_func_name_map.get(msg.tool_call_id)
-            if function_name:
-                jetbrains_messages.append({"type": "function_message", "content": text_content, "functionName": function_name})
+    jetbrains_messages = _convert_openai_messages_to_jetbrains(
+        openai_request.messages, tool_id_to_func_name_map
+    )
 
     # tool_choice：与 OpenAI 端口一致的语义近似（none → 不发；指定 function → 仅发那一个）
     data = []
