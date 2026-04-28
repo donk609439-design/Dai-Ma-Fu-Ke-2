@@ -9085,7 +9085,15 @@ async def _import_partner_credential(cred: dict) -> str | None:
 
 
 async def _run_partner_credentials_poll() -> dict:
-    """一次性拉取合作方全量凭证（游标分页），写入 jb_accounts"""
+    """一次性拉取合作方新增凭证（游标分页），写入 jb_accounts。
+
+    安全启动策略：
+    - 正常情况下从 DB 中持久化的 poll_cursor 继续拉取；
+    - 如果 poll_cursor 缺失（例如清库/新库首次启动），绝不能从 0 开始导入历史凭证，
+      否则会把合作方很久以前的全部凭证重新拉入本实例；
+    - 此时将游标 bootstrap 到当前时间戳（毫秒）并跳过本轮，后续只拉取此刻之后的新凭证。
+      合作方 poll 游标按时间/自增位置单调推进；即使远端无新增，本地也会持久化该基线。
+    """
     cfg = await _get_client_cfg_for_push()
     if not cfg or not cfg.get("endpoint") or not cfg.get("hmac_secret_enc"):
         return {"skipped": True, "reason": "配置不完整"}
@@ -9095,8 +9103,24 @@ async def _run_partner_credentials_poll() -> dict:
         return {"skipped": True, "reason": "DB不可用"}
     async with pool.acquire() as conn:
         cursor_row = await conn.fetchrow("SELECT value FROM partner_client_config WHERE key='poll_cursor'")
-    raw_cursor = cursor_row["value"] if cursor_row else "0"
-    cursor = int(raw_cursor) if raw_cursor and raw_cursor.isdigit() else 0
+        if not cursor_row or not str(cursor_row["value"] or "").isdigit():
+            bootstrap_cursor = int(time.time() * 1000)
+            await conn.execute(
+                "INSERT INTO partner_client_config (key,value) VALUES ('poll_cursor',$1) "
+                "ON CONFLICT (key) DO UPDATE SET value=$1",
+                str(bootstrap_cursor),
+            )
+            print(
+                f"[partner_poll] poll_cursor 缺失/无效，已初始化为当前时间 {bootstrap_cursor}，"
+                "本轮跳过历史凭证导入"
+            )
+            return {
+                "skipped": True,
+                "reason": "poll_cursor missing; bootstrapped to current time",
+                "cursor": bootstrap_cursor,
+            }
+        raw_cursor = str(cursor_row["value"])
+    cursor = int(raw_cursor)
     imported = 0
     while True:
         body_obj = {"cursor": cursor, "limit": 200}
