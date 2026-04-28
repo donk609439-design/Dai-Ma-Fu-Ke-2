@@ -24,27 +24,47 @@ interface Prize {
 }
 
 const FALLBACK_SEGMENTS = [
+  { prize: "敬请期待", bg: "#ef4444" },
   { prize: "敬请期待", bg: "#f97316" },
-  { prize: "敬请期待", bg: "#ea580c" },
-  { prize: "敬请期待", bg: "#fb923c" },
-  { prize: "敬请期待", bg: "#c2410c" },
-  { prize: "敬请期待", bg: "#fd7f46" },
-  { prize: "敬请期待", bg: "#9a3412" },
-  { prize: "敬请期待", bg: "#f26a21" },
-  { prize: "敬请期待", bg: "#7c2d12" },
+  { prize: "敬请期待", bg: "#eab308" },
+  { prize: "敬请期待", bg: "#22c55e" },
+  { prize: "敬请期待", bg: "#06b6d4" },
+  { prize: "敬请期待", bg: "#6366f1" },
+  { prize: "敬请期待", bg: "#8b5cf6" },
+  { prize: "敬请期待", bg: "#ec4899" },
 ];
 
-// Premium citrus/copper palette: cohesive orange metal instead of rainbow blocks.
 const SEG_COLORS = [
+  "#ef4444",
   "#f97316",
-  "#ea580c",
-  "#fb923c",
-  "#c2410c",
-  "#fd7f46",
-  "#9a3412",
-  "#f26a21",
-  "#7c2d12",
+  "#eab308",
+  "#22c55e",
+  "#06b6d4",
+  "#6366f1",
+  "#8b5cf6",
+  "#ec4899",
 ];
+
+function hexToRgb(hex: string) {
+  const normalized = hex.replace("#", "");
+  const value = parseInt(normalized, 16);
+  return {
+    r: (value >> 16) & 255,
+    g: (value >> 8) & 255,
+    b: value & 255,
+  };
+}
+
+function mixHex(hex: string, target: "white" | "black", amount: number) {
+  const rgb = hexToRgb(hex);
+  const to = target === "white" ? 255 : 0;
+  const mixed = {
+    r: Math.round(rgb.r + (to - rgb.r) * amount),
+    g: Math.round(rgb.g + (to - rgb.g) * amount),
+    b: Math.round(rgb.b + (to - rgb.b) * amount),
+  };
+  return `rgb(${mixed.r}, ${mixed.g}, ${mixed.b})`;
+}
 
 const CX = 160;
 const CY = 160;
@@ -887,149 +907,165 @@ export default function Lottery() {
                 >
                   <svg viewBox="0 0 320 320" className="h-full w-full overflow-visible">
                     <defs>
-                      <filter id="lotteryInnerShadow" x="-24%" y="-24%" width="148%" height="148%">
-                        <feDropShadow dx="0" dy="10" stdDeviation="8" floodColor="#7c2d12" floodOpacity="0.22" />
+                      <filter id="lotteryWheelShadow" x="-30%" y="-30%" width="160%" height="160%">
+                        <feDropShadow dx="0" dy="18" stdDeviation="14" floodColor="#7c2d12" floodOpacity="0.24" />
                       </filter>
-                      <filter id="lotterySoftGlow" x="-50%" y="-50%" width="200%" height="200%">
-                        <feGaussianBlur stdDeviation="4" result="blur" />
-                        <feMerge>
-                          <feMergeNode in="blur" />
-                          <feMergeNode in="SourceGraphic" />
-                        </feMerge>
+                      <filter id="lotterySegmentDepth" x="-20%" y="-20%" width="140%" height="140%">
+                        <feDropShadow dx="0" dy="5" stdDeviation="3" floodColor="#431407" floodOpacity="0.18" />
                       </filter>
-                      <radialGradient id="wheelVignette" cx="48%" cy="38%" r="66%">
-                        <stop offset="0%" stopColor="rgba(255,255,255,0.30)" />
-                        <stop offset="58%" stopColor="rgba(255,255,255,0.04)" />
-                        <stop offset="100%" stopColor="rgba(67,20,7,0.24)" />
+                      <filter id="lotteryTextGlow" x="-40%" y="-40%" width="180%" height="180%">
+                        <feDropShadow dx="0" dy="1" stdDeviation="1.1" floodColor="#000000" floodOpacity="0.35" />
+                      </filter>
+                      <radialGradient id="wheelGlass" cx="35%" cy="24%">
+                        <stop offset="0%" stopColor="rgba(255,255,255,0.9)" />
+                        <stop offset="38%" stopColor="rgba(255,255,255,0.22)" />
+                        <stop offset="72%" stopColor="rgba(255,255,255,0.06)" />
+                        <stop offset="100%" stopColor="rgba(124,45,18,0.14)" />
                       </radialGradient>
+                      <radialGradient id="metalRim" cx="34%" cy="22%">
+                        <stop offset="0%" stopColor="#ffffff" />
+                        <stop offset="18%" stopColor="#ffedd5" />
+                        <stop offset="46%" stopColor="#fb923c" />
+                        <stop offset="72%" stopColor="#c2410c" />
+                        <stop offset="100%" stopColor="#7c2d12" />
+                      </radialGradient>
+                      <linearGradient id="rimHighlight" x1="0" x2="1" y1="0" y2="1">
+                        <stop offset="0%" stopColor="rgba(255,255,255,0.95)" />
+                        <stop offset="42%" stopColor="rgba(255,255,255,0.18)" />
+                        <stop offset="100%" stopColor="rgba(255,255,255,0)" />
+                      </linearGradient>
                       <radialGradient id="hubGradient" cx="35%" cy="28%">
                         <stop offset="0%" stopColor="#fff7ed" />
-                        <stop offset="35%" stopColor="#fdba74" />
-                        <stop offset="72%" stopColor="#f97316" />
+                        <stop offset="34%" stopColor="#fdba74" />
+                        <stop offset="68%" stopColor="#f97316" />
                         <stop offset="100%" stopColor="#9a3412" />
                       </radialGradient>
-                      <linearGradient id="goldRim" x1="40" y1="0" x2="280" y2="320">
-                        <stop offset="0%" stopColor="#fff7ed" />
-                        <stop offset="18%" stopColor="#fdba74" />
-                        <stop offset="48%" stopColor="#f97316" />
-                        <stop offset="74%" stopColor="#c2410c" />
-                        <stop offset="100%" stopColor="#fff7ed" />
-                      </linearGradient>
                       {segments.map((seg, i) => (
-                        <radialGradient key={`grad-${i}`} id={`segGrad-${i}`} cx="35%" cy="28%" r="82%">
-                          <stop offset="0%" stopColor="#fff7ed" stopOpacity="0.62" />
-                          <stop offset="36%" stopColor={seg.bg} stopOpacity="0.92" />
-                          <stop offset="72%" stopColor={seg.bg} stopOpacity="0.78" />
-                          <stop offset="100%" stopColor="#431407" stopOpacity="0.30" />
+                        <radialGradient key={`grad-${i}`} id={`segmentGradient-${i}`} cx="36%" cy="24%">
+                          <stop offset="0%" stopColor={mixHex(seg.bg, "white", 0.52)} />
+                          <stop offset="42%" stopColor={seg.bg} />
+                          <stop offset="100%" stopColor={mixHex(seg.bg, "black", 0.34)} />
                         </radialGradient>
                       ))}
                     </defs>
 
-                    <circle cx={CX} cy={CY} r={R + 22} fill="rgba(255,255,255,0.34)" filter="url(#lotterySoftGlow)" />
-                    <circle cx={CX} cy={CY} r={R + 15} fill="none" stroke="url(#goldRim)" strokeWidth="14" />
-                    <circle cx={CX} cy={CY} r={R + 5} fill="rgba(255,255,255,0.72)" stroke="rgba(255,255,255,0.92)" strokeWidth="2" />
+                    <g filter="url(#lotteryWheelShadow)">
+                      <circle cx={CX} cy={CY} r={R + 23} fill="url(#metalRim)" />
+                      <circle cx={CX} cy={CY} r={R + 18} fill="rgba(255,255,255,0.75)" />
+                      <circle cx={CX} cy={CY} r={R + 13} fill="rgba(124,45,18,0.22)" />
 
-                    {segments.map((seg, i) => {
-                      const startDeg = -90 + i * SEG_ANGLE;
-                      const endDeg = -90 + (i + 1) * SEG_ANGLE;
-                      const midDeg = startDeg + SEG_ANGLE / 2;
-                      const iconR = R * 0.62;
-                      const labelR = R * 0.78;
-                      const iconX = CX + iconR * Math.cos(toRad(midDeg));
-                      const iconY = CY + iconR * Math.sin(toRad(midDeg));
-                      const labelX = CX + labelR * Math.cos(toRad(midDeg));
-                      const labelY = CY + labelR * Math.sin(toRad(midDeg));
-                      const dividerX = CX + (R + 2) * Math.cos(toRad(startDeg));
-                      const dividerY = CY + (R + 2) * Math.sin(toRad(startDeg));
-                      const rotate = midDeg + 90;
-                      return (
-                        <g key={`${seg.prize}-${i}`}>
-                          <path
-                            d={sectorPath(startDeg, endDeg)}
-                            fill={`url(#segGrad-${i})`}
-                            stroke="rgba(255,255,255,0.88)"
-                            strokeWidth="1.8"
-                            filter="url(#lotteryInnerShadow)"
+                      {Array.from({ length: 48 }).map((_, i) => {
+                        const deg = (360 / 48) * i;
+                        const x = CX + (R + 18) * Math.cos(toRad(deg));
+                        const y = CY + (R + 18) * Math.sin(toRad(deg));
+                        const active = i % 2 === 0;
+                        return (
+                          <circle
+                            key={`bulb-${i}`}
+                            cx={x}
+                            cy={y}
+                            r={active ? 2.9 : 1.9}
+                            fill={active ? "#fff7ed" : "#fed7aa"}
+                            opacity={active ? 1 : 0.74}
                           />
-                          <path d={sectorPath(startDeg + 1.8, endDeg - 1.8)} fill="rgba(255,255,255,0.12)" />
-                          <line
-                            x1={CX}
-                            y1={CY}
-                            x2={dividerX}
-                            y2={dividerY}
-                            stroke="rgba(255,255,255,0.78)"
-                            strokeWidth="2"
-                            strokeLinecap="round"
-                          />
-                          <g transform={`translate(${labelX} ${labelY}) rotate(${rotate})`}>
-                            <rect
-                              x="-28"
-                              y="-10"
-                              width="56"
-                              height="20"
-                              rx="10"
-                              fill="rgba(255,255,255,0.74)"
-                              stroke="rgba(255,255,255,0.85)"
-                              strokeWidth="0.8"
+                        );
+                      })}
+
+                      <circle cx={CX} cy={CY} r={R + 7} fill="rgba(255,255,255,0.86)" />
+                      <circle cx={CX} cy={CY} r={R + 2} fill="#fff7ed" />
+
+                      {segments.map((seg, i) => {
+                        const startDeg = -90 + i * SEG_ANGLE;
+                        const endDeg = -90 + (i + 1) * SEG_ANGLE;
+                        const midDeg = startDeg + SEG_ANGLE / 2;
+                        const iconR = R * 0.58;
+                        const labelR = R * 0.74;
+                        const iconX = CX + iconR * Math.cos(toRad(midDeg));
+                        const iconY = CY + iconR * Math.sin(toRad(midDeg));
+                        const labelX = CX + labelR * Math.cos(toRad(midDeg));
+                        const labelY = CY + labelR * Math.sin(toRad(midDeg));
+                        const labelRotation = midDeg + 90;
+                        return (
+                          <g key={`${seg.prize}-${i}`} filter="url(#lotterySegmentDepth)">
+                            <path
+                              d={sectorPath(startDeg + 0.55, endDeg - 0.55)}
+                              fill={`url(#segmentGradient-${i})`}
+                              stroke="rgba(255,255,255,0.82)"
+                              strokeWidth="1.2"
+                            />
+                            <path
+                              d={sectorPath(startDeg + 2.4, endDeg - 2.4)}
+                              fill="url(#wheelGlass)"
+                              opacity="0.52"
+                            />
+                            <line
+                              x1={CX}
+                              y1={CY}
+                              x2={CX + (R - 4) * Math.cos(toRad(startDeg))}
+                              y2={CY + (R - 4) * Math.sin(toRad(startDeg))}
+                              stroke="rgba(255,255,255,0.5)"
+                              strokeWidth="1"
                             />
                             <text
-                              x="0"
-                              y="1"
+                              x={iconX}
+                              y={iconY}
                               textAnchor="middle"
                               dominantBaseline="middle"
-                              fontSize={8.2}
-                              fill="#431407"
-                              fontWeight="950"
-                              style={{ userSelect: "none" }}
-                            >
-                              {shortenPrize(seg.prize)}
-                            </text>
-                          </g>
-                          <g transform={`translate(${iconX} ${iconY})`}>
-                            <circle r="18" fill="rgba(255,255,255,0.72)" stroke="rgba(255,255,255,0.92)" strokeWidth="1.2" />
-                            <circle r="13.5" fill="rgba(255,247,237,0.72)" />
-                            <text
-                              x="0"
-                              y="1"
-                              textAnchor="middle"
-                              dominantBaseline="middle"
-                              fontSize={16}
+                              fontSize={23}
+                              filter="url(#lotteryTextGlow)"
                               style={{ userSelect: "none" }}
                             >
                               {prizeEmoji(seg.prize)}
                             </text>
+                            <g transform={`translate(${labelX} ${labelY}) rotate(${labelRotation})`}>
+                              <rect
+                                x="-25"
+                                y="-9"
+                                width="50"
+                                height="18"
+                                rx="9"
+                                fill="rgba(255,255,255,0.24)"
+                                stroke="rgba(255,255,255,0.28)"
+                              />
+                              <text
+                                y="1"
+                                textAnchor="middle"
+                                dominantBaseline="middle"
+                                fontSize={7.8}
+                                fill="rgba(255,255,255,0.94)"
+                                fontWeight="950"
+                                filter="url(#lotteryTextGlow)"
+                                style={{ userSelect: "none", letterSpacing: "0.02em" }}
+                              >
+                                {shortenPrize(seg.prize)}
+                              </text>
+                            </g>
                           </g>
-                        </g>
-                      );
-                    })}
+                        );
+                      })}
 
-                    <circle cx={CX} cy={CY} r={R + 2} fill="url(#wheelVignette)" pointerEvents="none" />
-                    <circle cx={CX} cy={CY} r={R + 5} fill="none" stroke="rgba(255,255,255,0.9)" strokeWidth="6" />
-                    <circle cx={CX} cy={CY} r={R + 16} fill="none" stroke="rgba(124,45,18,0.20)" strokeWidth="1.3" />
-                    {Array.from({ length: 36 }).map((_, i) => {
-                      const deg = (360 / 36) * i;
-                      const x = CX + (R + 16) * Math.cos(toRad(deg));
-                      const y = CY + (R + 16) * Math.sin(toRad(deg));
-                      return (
-                        <circle
-                          key={i}
-                          cx={x}
-                          cy={y}
-                          r={i % 3 === 0 ? 3.4 : 2.35}
-                          fill={i % 3 === 0 ? "#ffffff" : "#fed7aa"}
-                          stroke="rgba(154,52,18,0.22)"
-                          strokeWidth="0.8"
-                        />
-                      );
-                    })}
+                      <circle cx={CX} cy={CY} r={R + 2} fill="none" stroke="rgba(255,255,255,0.92)" strokeWidth="3.5" />
+                      <circle cx={CX} cy={CY} r={R - 31} fill="none" stroke="rgba(255,255,255,0.22)" strokeWidth="1.5" />
+                      <circle cx={CX} cy={CY} r={R - 58} fill="none" stroke="rgba(255,255,255,0.16)" strokeWidth="1" />
+                      <path
+                        d="M 76 72 C 126 28, 212 30, 250 86"
+                        fill="none"
+                        stroke="url(#rimHighlight)"
+                        strokeWidth="13"
+                        strokeLinecap="round"
+                        opacity="0.72"
+                      />
 
-                    <circle cx={CX} cy={CY} r={46} fill="rgba(255,255,255,0.78)" stroke="rgba(255,255,255,0.95)" strokeWidth="2" />
-                    <circle cx={CX} cy={CY} r={37} fill="url(#hubGradient)" stroke="rgba(124,45,18,0.18)" strokeWidth="2" />
-                    <circle cx={CX} cy={CY} r={23} fill="rgba(255,255,255,0.92)" />
-                    <circle cx={CX} cy={CY} r={14} fill="#fff7ed" stroke="#fb923c" strokeWidth="3" />
-                    <text x={CX} y={CY + 5} textAnchor="middle" fontSize={19} style={{ userSelect: "none" }}>
-                      🍊
-                    </text>
+                      <circle cx={CX} cy={CY} r={42} fill="rgba(255,255,255,0.9)" />
+                      <circle cx={CX} cy={CY} r={35} fill="url(#hubGradient)" />
+                      <circle cx={CX} cy={CY} r={25} fill="rgba(255,255,255,0.18)" stroke="rgba(255,255,255,0.52)" strokeWidth="1.2" />
+                      <circle cx={CX} cy={CY} r={15} fill="rgba(255,255,255,0.94)" />
+                      <text x={CX} y={CY + 5} textAnchor="middle" fontSize={18} style={{ userSelect: "none" }}>
+                        🍊
+                      </text>
+                      <circle cx={CX} cy={CY} r={48} fill="none" stroke="rgba(255,255,255,0.55)" strokeWidth="1.4" />
+                      <circle cx={CX} cy={CY} r={54} fill="none" stroke="rgba(124,45,18,0.18)" strokeWidth="1" strokeDasharray="2 5" />
+                    </g>
                   </svg>
                 </div>
 
