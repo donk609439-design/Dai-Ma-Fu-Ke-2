@@ -3296,6 +3296,58 @@ def _build_ai_cache_key(route: str, api_key: str, body: dict) -> tuple:
     return cache_key, request_hash
 
 
+def _is_valid_openai_chat_response(resp: Any) -> bool:
+    """校验缓存里的 OpenAI chat 响应是否含有效 assistant message。
+    旧版本可能缓存过 content=None / 无 choices 的坏响应，会触发 VS Code
+    “语言模型未提供任何辅助消息”。命中缓存前必须过滤掉。
+    """
+    if not isinstance(resp, dict) or "error" in resp:
+        return False
+    choices = resp.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return False
+    msg = (choices[0] or {}).get("message")
+    if not isinstance(msg, dict) or msg.get("role") != "assistant":
+        return False
+    # content="" 是合法空响应；None 才是不兼容风险。
+    return msg.get("content") is not None or bool(msg.get("tool_calls"))
+
+
+def _is_valid_anthropic_message_response(resp: Any) -> bool:
+    """校验缓存里的 Anthropic message 响应是否含有效 assistant content。"""
+    if not isinstance(resp, dict) or "error" in resp:
+        return False
+    if resp.get("role") != "assistant":
+        return False
+    content = resp.get("content")
+    return isinstance(content, list) and len(content) > 0
+
+
+async def _ai_cache_delete(cache_key: str) -> None:
+    pool = await _get_db_pool()
+    if not pool:
+        return
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute("DELETE FROM ai_response_cache WHERE cache_key=$1", cache_key)
+    except Exception:
+        pass
+
+
+async def _ai_idem_delete(owner_scope: str, idem_key: str) -> None:
+    pool = await _get_db_pool()
+    if not pool:
+        return
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM ai_idempotency_cache WHERE owner_discord_id=$1 AND idempotency_key=$2",
+                owner_scope, idem_key,
+            )
+    except Exception:
+        pass
+
+
 async def _ai_cache_get(cache_key: str) -> Optional[dict]:
     """从 DB 读取缓存行，命中则自动 hit_count +1。未命中/过期返回 None。"""
     pool = await _get_db_pool()
@@ -3776,9 +3828,33 @@ async def openai_stream_adapter(
                     continue
 
                 try:
-                    # 透传上游的错误事件（如账号全部耗尽时的 rate_limit_error）
+                    # 流式接口里不要直接透传无 choices 的 error 事件：
+                    # VS Code/Cline/Roo 等严格客户端会把这种 200 SSE 判定为
+                    # “语言模型未提供任何辅助消息”。改为发送一条 assistant 文本
+                    # chunk，再正常 stop，保证协议层始终有 assistant delta。
                     if "error" in data:
-                        yield f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+                        err = data.get("error") or {}
+                        err_msg = err.get("message") if isinstance(err, dict) else str(err)
+                        if not err_msg:
+                            err_msg = "上游 JetBrains API 返回错误"
+                        chunk = {
+                            "id": stream_id, "object": "chat.completion.chunk",
+                            "created": int(time.time()), "model": model_name,
+                            "system_fingerprint": "fp_jetbrains",
+                            "choices": [{
+                                "delta": {"role": "assistant", "content": f"[上游错误] {err_msg}"},
+                                "index": 0,
+                                "finish_reason": None,
+                            }],
+                        }
+                        yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                        finish_chunk = {
+                            "id": stream_id, "object": "chat.completion.chunk",
+                            "created": int(time.time()), "model": model_name,
+                            "system_fingerprint": "fp_jetbrains",
+                            "choices": [{"delta": {}, "index": 0, "finish_reason": "stop"}],
+                        }
+                        yield f"data: {json.dumps(finish_chunk, ensure_ascii=False)}\n\n"
                         yield "data: [DONE]\n\n"
                         return
 
@@ -3931,14 +4007,25 @@ async def openai_stream_adapter(
         print(f"流式适配器错误: {e}")
         # 使用 OpenAI 标准 error 事件格式，不含 content/tool_calls，
         # 这样 _stream_with_key_consume 不会将此次错误计入用量
-        error_event = json.dumps({
-            "error": {
-                "message": str(e),
-                "type": "server_error",
-                "code": "upstream_error",
-            }
-        })
-        yield f"data: {error_event}\n\n"
+        err_msg = str(e) or "上游流式适配器错误"
+        chunk = {
+            "id": stream_id, "object": "chat.completion.chunk",
+            "created": int(time.time()), "model": model_name,
+            "system_fingerprint": "fp_jetbrains",
+            "choices": [{
+                "delta": {"role": "assistant", "content": f"[上游错误] {err_msg}"},
+                "index": 0,
+                "finish_reason": None,
+            }],
+        }
+        yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+        finish_chunk = {
+            "id": stream_id, "object": "chat.completion.chunk",
+            "created": int(time.time()), "model": model_name,
+            "system_fingerprint": "fp_jetbrains",
+            "choices": [{"delta": {}, "index": 0, "finish_reason": "stop"}],
+        }
+        yield f"data: {json.dumps(finish_chunk, ensure_ascii=False)}\n\n"
         yield "data: [DONE]\n\n"
 
 
@@ -4154,10 +4241,13 @@ async def chat_completions(
     if _idem_header:
         _idem_status, _idem_resp = await _ai_idem_get(_ai_cache_owner, _idem_header, _idem_body_hash)
         if _idem_status == "hit" and _idem_resp:
-            _idem_resp["cached"] = True
-            _idem_resp["cache_hit"] = True
-            _append_log(request.model, client_key, 0, 0, 0, "ok", exempt=True)
-            return JSONResponse(_idem_resp)
+            if _is_valid_openai_chat_response(_idem_resp):
+                _idem_resp["cached"] = True
+                _idem_resp["cache_hit"] = True
+                _append_log(request.model, client_key, 0, 0, 0, "ok", exempt=True)
+                return JSONResponse(_idem_resp)
+            await _ai_idem_delete(_ai_cache_owner, _idem_header)
+            print("[ai-idem] 丢弃旧版坏缓存：OpenAI 响应缺少有效 assistant message")
         elif _idem_status == "conflict":
             return JSONResponse(
                 {"error": {"message": "Idempotency-Key conflict: body changed", "type": "conflict", "code": "409"}},
@@ -4170,10 +4260,13 @@ async def chat_completions(
         # Exact match 缓存
         _cached_resp = await _ai_cache_get(_ai_cache_key)
         if _cached_resp:
-            _cached_resp["cached"] = True
-            _cached_resp["cache_hit"] = True
-            _append_log(request.model, client_key, 0, 0, 0, "ok", exempt=True)
-            return JSONResponse(_cached_resp)
+            if _is_valid_openai_chat_response(_cached_resp):
+                _cached_resp["cached"] = True
+                _cached_resp["cache_hit"] = True
+                _append_log(request.model, client_key, 0, 0, 0, "ok", exempt=True)
+                return JSONResponse(_cached_resp)
+            await _ai_cache_delete(_ai_cache_key)
+            print("[ai-cache] 丢弃旧版坏缓存：OpenAI 响应缺少有效 assistant message")
     # ────────────────────────────────────────────────────────────────────────
 
     account = await get_next_jetbrains_account(client_key=client_key)
@@ -4626,10 +4719,13 @@ async def messages_completions(
     if _idem_hdr_msg:
         _is_msg, _ir_msg = await _ai_idem_get(_msg_cache_owner, _idem_hdr_msg, _idem_body_hash_msg)
         if _is_msg == "hit" and _ir_msg:
-            _ir_msg["cached"] = True
-            _ir_msg["cache_hit"] = True
-            _append_log(openai_request.model, client_key, 0, 0, 0, "ok", exempt=True)
-            return JSONResponse(_ir_msg)
+            if _is_valid_anthropic_message_response(_ir_msg):
+                _ir_msg["cached"] = True
+                _ir_msg["cache_hit"] = True
+                _append_log(openai_request.model, client_key, 0, 0, 0, "ok", exempt=True)
+                return JSONResponse(_ir_msg)
+            await _ai_idem_delete(_msg_cache_owner, _idem_hdr_msg)
+            print("[ai-idem] 丢弃旧版坏缓存：Anthropic 响应缺少有效 assistant content")
         elif _is_msg == "conflict":
             return JSONResponse(
                 {"error": {"type": "invalid_request_error", "message": "Idempotency-Key conflict: body changed"}},
@@ -4641,10 +4737,13 @@ async def messages_completions(
 
         _cached_msg = await _ai_cache_get(_msg_cache_key)
         if _cached_msg:
-            _cached_msg["cached"] = True
-            _cached_msg["cache_hit"] = True
-            _append_log(openai_request.model, client_key, 0, 0, 0, "ok", exempt=True)
-            return JSONResponse(_cached_msg)
+            if _is_valid_anthropic_message_response(_cached_msg):
+                _cached_msg["cached"] = True
+                _cached_msg["cache_hit"] = True
+                _append_log(openai_request.model, client_key, 0, 0, 0, "ok", exempt=True)
+                return JSONResponse(_cached_msg)
+            await _ai_cache_delete(_msg_cache_key)
+            print("[ai-cache] 丢弃旧版坏缓存：Anthropic 响应缺少有效 assistant content")
     # ────────────────────────────────────────────────────────────────────────
 
     account = await get_next_jetbrains_account(client_key=client_key)
