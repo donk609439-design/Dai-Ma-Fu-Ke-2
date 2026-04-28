@@ -3746,6 +3746,17 @@ def _convert_openai_messages_to_jetbrains(
     return jetbrains_messages
 
 
+def _jetbrains_profile_supports_functions(model_name: str) -> bool:
+    """JetBrains 聚合网关里 OpenAI provider 不支持 llm.parameters.functions。
+    VS Code/Cline/Roo 常会默认携带 tools；如果原样转发到 openai-* / gpt-* profile，
+    上游会返回 400: Configuration parameters [functions] are not supported for chat OpenAI provider。
+    """
+    m = (model_name or "").lower()
+    if m.startswith("openai-") or m.startswith("gpt-") or m.startswith("o1") or m.startswith("o3") or m.startswith("o4"):
+        return False
+    return True
+
+
 def _filter_tools_by_choice(
     tools: List[Dict[str, Any]],
     tool_choice: Any,
@@ -4320,11 +4331,16 @@ async def chat_completions(
     data = []
     tools = None
     if request.tools:
-        tools_filtered = _filter_tools_by_choice(request.tools, request.tool_choice)
-        if tools_filtered:
-            data.append({"type": "json", "fqdn": "llm.parameters.functions"})
-            tools = [t["function"] for t in tools_filtered]
-            data.append({"type": "json", "value": json.dumps(tools)})
+        if _jetbrains_profile_supports_functions(request.model):
+            tools_filtered = _filter_tools_by_choice(request.tools, request.tool_choice)
+            if tools_filtered:
+                data.append({"type": "json", "fqdn": "llm.parameters.functions"})
+                tools = [t["function"] for t in tools_filtered]
+                data.append({"type": "json", "value": json.dumps(tools)})
+        else:
+            # OpenAI provider 不支持 functions 参数；忽略 VS Code 自动附带的 tools，
+            # 避免上游 400 导致客户端报“没有辅助消息”。
+            print(f"[tools] model={request.model} 使用 OpenAI provider，已忽略 {len(request.tools)} 个 tools")
 
     payload = {
         "prompt": "ij.chat.request.new-chat-on-start",
@@ -4816,11 +4832,15 @@ async def messages_completions(
     data = []
     tools = None
     if openai_request.tools:
-        tools_filtered = _filter_tools_by_choice(openai_request.tools, openai_request.tool_choice)
-        if tools_filtered:
-            data.append({"type": "json", "fqdn": "llm.parameters.functions"})
-            tools = [t["function"] for t in tools_filtered]
-            data.append({"type": "json", "value": json.dumps(tools)})
+        if _jetbrains_profile_supports_functions(openai_request.model):
+            tools_filtered = _filter_tools_by_choice(openai_request.tools, openai_request.tool_choice)
+            if tools_filtered:
+                data.append({"type": "json", "fqdn": "llm.parameters.functions"})
+                tools = [t["function"] for t in tools_filtered]
+                data.append({"type": "json", "value": json.dumps(tools)})
+        else:
+            # OpenAI provider 不支持 functions 参数；忽略 Anthropic→OpenAI 后携带的 tools。
+            print(f"[tools] model={openai_request.model} 使用 OpenAI provider，已忽略 {len(openai_request.tools)} 个 tools")
 
     payload = {
         "prompt": "ij.chat.request.new-chat-on-start",
