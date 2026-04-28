@@ -891,7 +891,6 @@ export default function Lottery() {
                 <h1 className="text-5xl font-black tracking-[-0.08em] text-stone-950 sm:text-6xl lg:text-7xl">
                   橘子<span className="citrus-text">机</span>
                 </h1>
-                <p className="mt-4 text-sm font-medium tracking-wide text-stone-500">去繁从简的圣人点数抽奖台</p>
               </div>
 
               <div className="lottery-wheel-frame relative grid h-[min(86vw,520px)] w-[min(86vw,520px)] place-items-center rounded-full">
