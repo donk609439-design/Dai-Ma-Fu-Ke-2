@@ -886,80 +886,146 @@ export default function Lottery() {
                 >
                   <svg viewBox="0 0 320 320" className="h-full w-full overflow-visible">
                     <defs>
-                      <filter id="lotteryInnerShadow" x="-20%" y="-20%" width="140%" height="140%">
-                        <feDropShadow dx="0" dy="8" stdDeviation="6" floodColor="#7c2d12" floodOpacity="0.18" />
+                      <filter id="lotteryInnerShadow" x="-24%" y="-24%" width="148%" height="148%">
+                        <feDropShadow dx="0" dy="10" stdDeviation="8" floodColor="#7c2d12" floodOpacity="0.22" />
                       </filter>
+                      <filter id="lotterySoftGlow" x="-50%" y="-50%" width="200%" height="200%">
+                        <feGaussianBlur stdDeviation="4" result="blur" />
+                        <feMerge>
+                          <feMergeNode in="blur" />
+                          <feMergeNode in="SourceGraphic" />
+                        </feMerge>
+                      </filter>
+                      <radialGradient id="wheelVignette" cx="48%" cy="38%" r="66%">
+                        <stop offset="0%" stopColor="rgba(255,255,255,0.30)" />
+                        <stop offset="58%" stopColor="rgba(255,255,255,0.04)" />
+                        <stop offset="100%" stopColor="rgba(67,20,7,0.24)" />
+                      </radialGradient>
+                      <radialGradient id="hubGradient" cx="35%" cy="28%">
+                        <stop offset="0%" stopColor="#fff7ed" />
+                        <stop offset="35%" stopColor="#fdba74" />
+                        <stop offset="72%" stopColor="#f97316" />
+                        <stop offset="100%" stopColor="#9a3412" />
+                      </radialGradient>
+                      <linearGradient id="goldRim" x1="40" y1="0" x2="280" y2="320">
+                        <stop offset="0%" stopColor="#fff7ed" />
+                        <stop offset="18%" stopColor="#fdba74" />
+                        <stop offset="48%" stopColor="#f97316" />
+                        <stop offset="74%" stopColor="#c2410c" />
+                        <stop offset="100%" stopColor="#fff7ed" />
+                      </linearGradient>
+                      {segments.map((seg, i) => (
+                        <radialGradient key={`grad-${i}`} id={`segGrad-${i}`} cx="35%" cy="28%" r="82%">
+                          <stop offset="0%" stopColor="#ffffff" stopOpacity="0.48" />
+                          <stop offset="34%" stopColor={seg.bg} stopOpacity="0.94" />
+                          <stop offset="100%" stopColor={seg.bg} stopOpacity="0.72" />
+                        </radialGradient>
+                      ))}
                     </defs>
+
+                    <circle cx={CX} cy={CY} r={R + 22} fill="rgba(255,255,255,0.34)" filter="url(#lotterySoftGlow)" />
+                    <circle cx={CX} cy={CY} r={R + 15} fill="none" stroke="url(#goldRim)" strokeWidth="14" />
+                    <circle cx={CX} cy={CY} r={R + 5} fill="rgba(255,255,255,0.72)" stroke="rgba(255,255,255,0.92)" strokeWidth="2" />
 
                     {segments.map((seg, i) => {
                       const startDeg = -90 + i * SEG_ANGLE;
                       const endDeg = -90 + (i + 1) * SEG_ANGLE;
                       const midDeg = startDeg + SEG_ANGLE / 2;
-                      const textR = R * 0.6;
-                      const tx = CX + textR * Math.cos(toRad(midDeg));
-                      const ty = CY + textR * Math.sin(toRad(midDeg));
+                      const iconR = R * 0.62;
+                      const labelR = R * 0.78;
+                      const iconX = CX + iconR * Math.cos(toRad(midDeg));
+                      const iconY = CY + iconR * Math.sin(toRad(midDeg));
+                      const labelX = CX + labelR * Math.cos(toRad(midDeg));
+                      const labelY = CY + labelR * Math.sin(toRad(midDeg));
+                      const dividerX = CX + (R + 2) * Math.cos(toRad(startDeg));
+                      const dividerY = CY + (R + 2) * Math.sin(toRad(startDeg));
+                      const rotate = midDeg + 90;
                       return (
                         <g key={`${seg.prize}-${i}`}>
                           <path
                             d={sectorPath(startDeg, endDeg)}
-                            fill={seg.bg}
-                            opacity={0.9}
-                            stroke="rgba(255,255,255,0.82)"
-                            strokeWidth="2.2"
+                            fill={`url(#segGrad-${i})`}
+                            stroke="rgba(255,255,255,0.88)"
+                            strokeWidth="1.8"
                             filter="url(#lotteryInnerShadow)"
                           />
-                          <path d={sectorPath(startDeg + 1.6, endDeg - 1.6)} fill="rgba(255,255,255,0.14)" />
-                          <text
-                            x={tx}
-                            y={ty - 10}
-                            textAnchor="middle"
-                            dominantBaseline="middle"
-                            fontSize={20}
-                            style={{ userSelect: "none" }}
-                          >
-                            {prizeEmoji(seg.prize)}
-                          </text>
-                          <text
-                            x={tx}
-                            y={ty + 13}
-                            textAnchor="middle"
-                            dominantBaseline="middle"
-                            fontSize={9}
-                            fill="rgba(255,255,255,0.92)"
-                            fontWeight="900"
-                            style={{
-                              userSelect: "none",
-                              paintOrder: "stroke",
-                              stroke: "rgba(0,0,0,0.20)",
-                              strokeWidth: 2,
-                            }}
-                          >
-                            {shortenPrize(seg.prize)}
-                          </text>
+                          <path d={sectorPath(startDeg + 1.8, endDeg - 1.8)} fill="rgba(255,255,255,0.12)" />
+                          <line
+                            x1={CX}
+                            y1={CY}
+                            x2={dividerX}
+                            y2={dividerY}
+                            stroke="rgba(255,255,255,0.78)"
+                            strokeWidth="2"
+                            strokeLinecap="round"
+                          />
+                          <g transform={`translate(${labelX} ${labelY}) rotate(${rotate})`}>
+                            <rect
+                              x="-28"
+                              y="-10"
+                              width="56"
+                              height="20"
+                              rx="10"
+                              fill="rgba(255,255,255,0.74)"
+                              stroke="rgba(255,255,255,0.85)"
+                              strokeWidth="0.8"
+                            />
+                            <text
+                              x="0"
+                              y="1"
+                              textAnchor="middle"
+                              dominantBaseline="middle"
+                              fontSize={8.2}
+                              fill="#431407"
+                              fontWeight="950"
+                              style={{ userSelect: "none" }}
+                            >
+                              {shortenPrize(seg.prize)}
+                            </text>
+                          </g>
+                          <g transform={`translate(${iconX} ${iconY})`}>
+                            <circle r="18" fill="rgba(255,255,255,0.72)" stroke="rgba(255,255,255,0.92)" strokeWidth="1.2" />
+                            <circle r="13.5" fill="rgba(255,247,237,0.72)" />
+                            <text
+                              x="0"
+                              y="1"
+                              textAnchor="middle"
+                              dominantBaseline="middle"
+                              fontSize={16}
+                              style={{ userSelect: "none" }}
+                            >
+                              {prizeEmoji(seg.prize)}
+                            </text>
+                          </g>
                         </g>
                       );
                     })}
 
-                    <circle cx={CX} cy={CY} r={R + 4} fill="none" stroke="rgba(255,255,255,0.92)" strokeWidth="8" />
-                    <circle cx={CX} cy={CY} r={R + 12} fill="none" stroke="rgba(251,146,60,0.36)" strokeWidth="8" />
-                    {Array.from({ length: 24 }).map((_, i) => {
-                      const deg = (360 / 24) * i;
-                      const x = CX + (R + 17) * Math.cos(toRad(deg));
-                      const y = CY + (R + 17) * Math.sin(toRad(deg));
-                      return <circle key={i} cx={x} cy={y} r={2.8} fill={i % 2 ? "#fed7aa" : "#fff7ed"} />;
+                    <circle cx={CX} cy={CY} r={R + 2} fill="url(#wheelVignette)" pointerEvents="none" />
+                    <circle cx={CX} cy={CY} r={R + 5} fill="none" stroke="rgba(255,255,255,0.9)" strokeWidth="6" />
+                    <circle cx={CX} cy={CY} r={R + 16} fill="none" stroke="rgba(124,45,18,0.20)" strokeWidth="1.3" />
+                    {Array.from({ length: 36 }).map((_, i) => {
+                      const deg = (360 / 36) * i;
+                      const x = CX + (R + 16) * Math.cos(toRad(deg));
+                      const y = CY + (R + 16) * Math.sin(toRad(deg));
+                      return (
+                        <circle
+                          key={i}
+                          cx={x}
+                          cy={y}
+                          r={i % 3 === 0 ? 3.4 : 2.35}
+                          fill={i % 3 === 0 ? "#ffffff" : "#fed7aa"}
+                          stroke="rgba(154,52,18,0.22)"
+                          strokeWidth="0.8"
+                        />
+                      );
                     })}
 
-                    <circle cx={CX} cy={CY} r={34} fill="rgba(255,255,255,0.95)" />
-                    <circle cx={CX} cy={CY} r={28} fill="url(#hubGradient)" />
-                    <defs>
-                      <radialGradient id="hubGradient" cx="35%" cy="28%">
-                        <stop offset="0%" stopColor="#fff7ed" />
-                        <stop offset="42%" stopColor="#fb923c" />
-                        <stop offset="100%" stopColor="#c2410c" />
-                      </radialGradient>
-                    </defs>
-                    <circle cx={CX} cy={CY} r={13} fill="rgba(255,255,255,0.94)" />
-                    <text x={CX} y={CY + 4} textAnchor="middle" fontSize={16} style={{ userSelect: "none" }}>
+                    <circle cx={CX} cy={CY} r={46} fill="rgba(255,255,255,0.78)" stroke="rgba(255,255,255,0.95)" strokeWidth="2" />
+                    <circle cx={CX} cy={CY} r={37} fill="url(#hubGradient)" stroke="rgba(124,45,18,0.18)" strokeWidth="2" />
+                    <circle cx={CX} cy={CY} r={23} fill="rgba(255,255,255,0.92)" />
+                    <circle cx={CX} cy={CY} r={14} fill="#fff7ed" stroke="#fb923c" strokeWidth="3" />
+                    <text x={CX} y={CY + 5} textAnchor="middle" fontSize={19} style={{ userSelect: "none" }}>
                       🍊
                     </text>
                   </svg>
