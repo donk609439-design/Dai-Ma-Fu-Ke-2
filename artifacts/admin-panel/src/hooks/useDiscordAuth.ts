@@ -1,4 +1,9 @@
 import { useState, useEffect, useCallback } from "react";
+import {
+  safeGetStorageItem,
+  safeRemoveStorageItem,
+  safeSetStorageItem,
+} from "@/lib/safe-storage";
 
 const SESSION_KEY = "dc_auth";
 // 与后端保持一致：7 天有效期
@@ -10,24 +15,41 @@ interface DcSession {
   ts: number;
 }
 
+function isValidSession(value: unknown): value is DcSession {
+  if (!value || typeof value !== "object") return false;
+  const s = value as Partial<DcSession>;
+  return (
+    typeof s.token === "string" &&
+    s.token.length > 0 &&
+    typeof s.userTag === "string" &&
+    typeof s.ts === "number" &&
+    Number.isFinite(s.ts)
+  );
+}
+
 function loadSession(): DcSession | null {
   try {
-    const raw = localStorage.getItem(SESSION_KEY);
+    const raw = safeGetStorageItem(SESSION_KEY);
     if (!raw) return null;
-    const s: DcSession = JSON.parse(raw);
-    if (Date.now() - s.ts > SESSION_TTL_MS) {
-      localStorage.removeItem(SESSION_KEY);
+    const parsed: unknown = JSON.parse(raw);
+    if (!isValidSession(parsed)) {
+      safeRemoveStorageItem(SESSION_KEY);
       return null;
     }
-    return s;
+    if (Date.now() - parsed.ts > SESSION_TTL_MS) {
+      safeRemoveStorageItem(SESSION_KEY);
+      return null;
+    }
+    return parsed;
   } catch {
+    safeRemoveStorageItem(SESSION_KEY);
     return null;
   }
 }
 
 function saveSession(token: string, userTag: string) {
   const s: DcSession = { token, userTag, ts: Date.now() };
-  localStorage.setItem(SESSION_KEY, JSON.stringify(s));
+  safeSetStorageItem(SESSION_KEY, JSON.stringify(s));
 }
 
 export function useDiscordAuth(
@@ -58,7 +80,7 @@ export function useDiscordAuth(
   }, [redirectPage]);
 
   const logout = useCallback(() => {
-    localStorage.removeItem(SESSION_KEY);
+    safeRemoveStorageItem(SESSION_KEY);
     setSession(null);
   }, []);
 

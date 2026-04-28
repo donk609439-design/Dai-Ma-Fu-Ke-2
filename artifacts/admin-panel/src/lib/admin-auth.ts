@@ -1,4 +1,9 @@
 import { useEffect, useState } from "react";
+import {
+  safeGetStorageItem,
+  safeRemoveStorageItem,
+  safeSetStorageItem,
+} from "@/lib/safe-storage";
 
 const STORAGE_KEY = "jb_admin_key";
 const API_BASE_KEY = "jb_api_base";
@@ -10,34 +15,39 @@ export type AdminRole = "admin" | "low_admin";
 /** 含未确认状态：仅有 key 但尚未通过 /admin/status 校验时返回 'unknown' */
 export type AdminRoleResolved = AdminRole | "unknown";
 
+function dispatchRoleChange(): void {
+  if (typeof window !== "undefined") window.dispatchEvent(new Event(ROLE_EVT));
+}
+
 export function getAdminKey(): string {
-  return localStorage.getItem(STORAGE_KEY) ?? "";
+  return safeGetStorageItem(STORAGE_KEY) ?? "";
 }
 
 export function setAdminKey(key: string): void {
-  localStorage.setItem(STORAGE_KEY, key);
+  safeSetStorageItem(STORAGE_KEY, key);
   // key 变更时清除旧 role，强制重新校验身份
-  localStorage.removeItem(ROLE_KEY);
-  if (typeof window !== "undefined") window.dispatchEvent(new Event(ROLE_EVT));
+  safeRemoveStorageItem(ROLE_KEY);
+  dispatchRoleChange();
 }
 
 export function clearAdminKey(): void {
-  localStorage.removeItem(STORAGE_KEY);
-  localStorage.removeItem(ROLE_KEY);
-  if (typeof window !== "undefined") window.dispatchEvent(new Event(ROLE_EVT));
+  safeRemoveStorageItem(STORAGE_KEY);
+  safeRemoveStorageItem(ROLE_KEY);
+  dispatchRoleChange();
 }
 
 /** 同步读取 role；未确认时返回 'unknown'，避免 UI 先闪一下 admin */
 export function getAdminRole(): AdminRoleResolved {
-  const v = localStorage.getItem(ROLE_KEY);
+  const v = safeGetStorageItem(ROLE_KEY);
   if (v === "low_admin") return "low_admin";
   if (v === "admin") return "admin";
+  if (v !== null) safeRemoveStorageItem(ROLE_KEY);
   return "unknown";
 }
 
 export function setAdminRole(role: AdminRole): void {
-  localStorage.setItem(ROLE_KEY, role);
-  if (typeof window !== "undefined") window.dispatchEvent(new Event(ROLE_EVT));
+  safeSetStorageItem(ROLE_KEY, role);
+  dispatchRoleChange();
 }
 
 /** 是否完整管理员（仅在角色已确认为 admin 时为 true） */
@@ -68,14 +78,33 @@ export function useAdminRole(): AdminRoleResolved {
  * In production: Replit path-based router sends /admin/* to the API Server
  */
 export function getApiBase(): string {
-  return localStorage.getItem(API_BASE_KEY)?.replace(/\/$/, "") ?? window.location.origin;
+  const fallback =
+    typeof window !== "undefined" && window.location?.origin
+      ? window.location.origin
+      : "";
+
+  const raw = safeGetStorageItem(API_BASE_KEY)?.trim();
+  if (!raw) return fallback;
+
+  try {
+    const parsed = new URL(raw, fallback || undefined);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      safeRemoveStorageItem(API_BASE_KEY);
+      return fallback;
+    }
+    return parsed.href.replace(/\/$/, "");
+  } catch {
+    safeRemoveStorageItem(API_BASE_KEY);
+    return fallback;
+  }
 }
 
 export function setApiBase(url: string): void {
-  if (url) {
-    localStorage.setItem(API_BASE_KEY, url.replace(/\/$/, ""));
+  const normalized = url.trim().replace(/\/$/, "");
+  if (normalized) {
+    safeSetStorageItem(API_BASE_KEY, normalized);
   } else {
-    localStorage.removeItem(API_BASE_KEY);
+    safeRemoveStorageItem(API_BASE_KEY);
   }
 }
 
