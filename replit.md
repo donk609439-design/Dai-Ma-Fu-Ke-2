@@ -240,28 +240,19 @@ temperature=0 → 86400s（24h）；其他 → 3600s（1h）。
 
 ### 数据库初始化注意
 
-源码 `_ensure_db_tables()` 中存在迁移顺序问题：在 `ALTER TABLE jb_accounts ADD COLUMN pending_nc_key` 之前就执行了 `SELECT pending_nc_key FROM jb_accounts` 的回填语句。
-全新数据库必须预先创建带 `pending_nc_key` 列的 `jb_accounts` 表，否则启动会失败。当前数据库已完成预建。
-若重置数据库，需重新执行：
-```sql
-DROP TABLE IF EXISTS jb_accounts CASCADE;
-DROP TABLE IF EXISTS jb_client_keys CASCADE;
-CREATE TABLE jb_accounts (
-  id TEXT PRIMARY KEY, license_id TEXT, auth_token TEXT, jwt TEXT,
-  last_updated DOUBLE PRECISION DEFAULT 0, last_quota_check DOUBLE PRECISION DEFAULT 0,
-  has_quota BOOLEAN DEFAULT TRUE, created_at TIMESTAMPTZ DEFAULT NOW(),
-  pending_nc_key TEXT DEFAULT NULL
-);
-CREATE TABLE jb_client_keys (
-  key TEXT PRIMARY KEY, usage_limit INTEGER, usage_count INTEGER DEFAULT 0,
-  created_at TIMESTAMPTZ DEFAULT NOW()
-);
-```
+当前 Python 后端使用 PostgreSQL（`asyncpg`）作为主要持久化存储，表结构由 `jetbrainsai2api/main.py` 的 `_ensure_db_tables()` 在启动时通过 `CREATE TABLE IF NOT EXISTS` / `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` 自动补齐。
+
+历史版本曾存在 `pending_nc_key` 迁移顺序问题：在添加 `jb_accounts.pending_nc_key` 列之前就执行了引用该列的回填 SQL。当前实现已修复：`pending_nc_key` 等 pending-NC 字段会先通过 `ALTER TABLE` 添加，再执行相关回填逻辑。因此全新 PostgreSQL 数据库不再需要手工预建 `pending_nc_key` 列。
+
+重置数据库时只需确保：
+1. `DATABASE_URL` 指向可连接的 PostgreSQL 数据库；
+2. 启动应用，让 `_ensure_db_tables()` 自动创建/迁移表；
+3. 如需保留生产数据，务必先使用 `/admin/db-export-stream` 导出 NDJSON 备份。
 
 ### 必需的环境变量
 
 要使代理服务真正可用，需配置：
-- `ADMIN_KEY` 或 `ADMIN_KEYS` — 管理面板登录密钥
+- `ADMIN_KEY` — 管理面板登录密钥
 - `jetbrainsai2api/jetbrainsai.json` — JetBrains AI 账号配置
 - `jetbrainsai2api/client_api_keys.json` — 客户端 API 密钥
 
@@ -293,12 +284,12 @@ Dashboard, Accounts, ApiKeys, Models, Stats, Logs, Docs, Prizes, Partners, Donat
 - **Frontend**: React 19, Vite 7, TailwindCSS 4, shadcn/ui, wouter, @tanstack/react-query
 - **API Server**: Node.js + Express 5, pino logging, http-proxy-middleware
 - **Python Backend**: FastAPI, uvicorn, httpx, cryptography
-- **Database**: PostgreSQL via Drizzle ORM (for Node.js), SQLite (for Python via aiosqlite)
+- **Database**: PostgreSQL（Node.js 侧通过 Drizzle ORM；Python 侧通过 asyncpg）
 - **Language**: TypeScript + Python 3.11
 
 ## Environment Variables
 
-- `ADMIN_KEY` / `ADMIN_KEYS` — Admin authentication key(s)
+- `ADMIN_KEY` — Admin authentication key
 - `LOW_ADMIN_KEY` — Secondary admin key (low_admin role) — limited /admin/* whitelist (status, activate, low-cf-proxies, low-config, pending-nc/low, cf-proxies/test)
 - `DATABASE_URL` — PostgreSQL connection string
 - `SESSION_SECRET` — Session secret
@@ -308,7 +299,7 @@ Dashboard, Accounts, ApiKeys, Models, Stats, Logs, Docs, Prizes, Partners, Donat
 
 LOW_ADMIN_KEY users get a separate, isolated activation flow with their own per-tier limits:
 
-- **Per-tier limits** — Constants in `main.py`: `_NORMAL_KEY_QUOTA=25`, `_LOW_USER_KEY_QUOTA=16`, `_LOW_USER_INPUT_TOKENS=300_000`, `_LOW_USER_OUTPUT_TOKENS=40_000`. Helpers `_key_tier()` and `_key_tier_limits()` resolve a key → its tier limits. `/v1/chat/completions` and `/v1/messages` enforce token caps per tier; `_activate_key_quota` upgrades quota to 16 (LOW) or 25 (normal) based on the `is_low_admin_key` column.
+- **Per-tier limits** — Constants in `main.py`: `_NORMAL_KEY_QUOTA=25`, `_LOW_USER_KEY_QUOTA=16`, `_LOW_USER_INPUT_TOKENS=2_000_000_000`（实际等同 LOW 输入无限制）, `_LOW_USER_OUTPUT_TOKENS=40_000`. Helpers `_key_tier()` and `_key_tier_limits()` resolve a key → its tier limits. `/v1/chat/completions` and `/v1/messages` enforce token caps per tier; `_activate_key_quota` upgrades quota to 16 (LOW) or 25 (normal) based on the `is_low_admin_key` column.
 - **Per-key tagging** — `jb_client_keys.is_low_admin_key` (bool) marks LOW-issued keys at creation; load/upsert/bulk-save preserve it; cleanup uses `usage_limit > 0` (no longer hard-coded 25).
 - **Dedicated CF pool, sharded by Discord ID** — `cf_proxy_pool` rows with `owner='low_admin'` are further split by `owner_discord_id` (TEXT NOT NULL DEFAULT ''). The unique key is `(url, owner, owner_discord_id)`. `jb_activate.LOW_CF_PROXY_POOL` is now `Dict[discord_id, list[url]]` and `_low_proxy_idx` is `Dict[discord_id, int]`; `_set_proxy_pool_context(use_low, discord_id)` is thread-local so `_get_proxy_url()` picks the LOW user's own sub-pool. `process_account(..., use_low_pool=True, low_discord_id=...)` propagates the routing key end-to-end. Pending-NC rows store the originating discord ID in `jb_accounts.pending_nc_discord_id`; `_retry_pending_nc_lids` reads it back and routes auto-retries to the matching sub-pool.
 - **Forced Discord auth for LOW users** — `/admin/activate` and `/admin/activate-batch` now require LOW users to send a Discord-verified `discord_token` (same gate as guests; only the daily-20 cap is skipped for LOW). The verified Discord user_id becomes `low_discord_id` and is persisted alongside every pending-NC row, so auto-retries always replay through the same Discord sub-pool.
