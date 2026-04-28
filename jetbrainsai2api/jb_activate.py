@@ -15,6 +15,7 @@ JetBrains AI 账号激活模块
 """
 import json, re, time, base64, hashlib, os, secrets, urllib.parse, threading
 import datetime
+import concurrent.futures
 from typing import Callable, Optional
 
 try:
@@ -117,6 +118,37 @@ def _clear_proxy_pool_context() -> None:
     for attr in ("use_low", "low_discord_id"):
         if hasattr(_proxy_ctx, attr):
             delattr(_proxy_ctx, attr)
+
+
+def _get_current_proxy_pool_context() -> tuple:
+    """读取当前线程的代理池上下文，用于把 LOW/主池选择透传到并发 worker。"""
+    return (
+        bool(getattr(_proxy_ctx, "use_low", False)),
+        str(getattr(_proxy_ctx, "low_discord_id", "") or ""),
+    )
+
+
+def _apply_proxy_pool_context(ctx: tuple) -> None:
+    """在并发 worker 中恢复父线程代理池上下文，避免 LOW 激活误走主池。"""
+    use_low, discord_id = ctx
+    _set_proxy_pool_context(bool(use_low), str(discord_id or ""))
+
+
+def _current_proxy_pool_size() -> int:
+    """当前上下文实际可用的 CF Worker 数量；无代理返回 0。"""
+    use_low = bool(getattr(_proxy_ctx, "use_low", False))
+    if use_low:
+        dc_id = str(getattr(_proxy_ctx, "low_discord_id", "") or "")
+        return len(LOW_CF_PROXY_POOL.get(dc_id) or [])
+    return len(CF_PROXY_POOL or [])
+
+
+def _activation_parallel_workers(task_count: int, no_proxy_workers: int = 2) -> int:
+    """激活阶段并发度：有 CF 池时按池大小放开，无代理时保守并发，避免单 IP 限流。"""
+    pool_size = _current_proxy_pool_size()
+    if pool_size > 0:
+        return max(1, min(task_count, pool_size, 6))
+    return max(1, min(task_count, no_proxy_workers))
 
 
 def _get_proxy_url() -> Optional[str]:
@@ -380,26 +412,48 @@ def obtain_trial_nocard(user_id, log_cb=None):
     返回: (successful_ides: list, any_success: bool)
     """
     successful = []       # [(ide_code, encoded_asset), ...]
-    for ide_code, prod_code, family_id, build_num, ver in NOCARD_IDES:
-        _log(f"  [无卡] 尝试 {ide_code}...", log_cb)
+    ctx = _get_current_proxy_pool_context()
+    workers = _activation_parallel_workers(len(NOCARD_IDES), no_proxy_workers=2)
+    _log(f"  [无卡] 并发尝试 {len(NOCARD_IDES)} 个 IDE（并发={workers}）...", log_cb)
+
+    def _try_one(item):
+        _apply_proxy_pool_context(ctx)
+        ide_code, prod_code, family_id, build_num, ver = item
         try:
-            rc, rr, encoded_asset = obtain_trial(user_id,
-                                                  ide_product_code=ide_code,
-                                                  build_number=build_num,
-                                                  version=ver,
-                                                  product_code=prod_code,
-                                                  product_family_id=family_id)
+            rc, rr, encoded_asset = obtain_trial(
+                user_id,
+                ide_product_code=ide_code,
+                build_number=build_num,
+                version=ver,
+                product_code=prod_code,
+                product_family_id=family_id,
+            )
+            return ide_code, rc, rr, encoded_asset, None
         except Exception as e:
-            _log(f"  [无卡] {ide_code} 请求异常: {e}", log_cb)
-            continue
-        _log(f"  [无卡] {ide_code}: {rc}" + (f" ({rr})" if rr else "") +
-             (f" [EncodedAsset {len(encoded_asset)}字符]" if encoded_asset else ""), log_cb)
-        if rc in ("OK", "ALREADY_OBTAINED", "TRIAL_AVAILABLE"):
-            _log(f"  ✓ {ide_code} 许可证获取成功！", log_cb)
-            successful.append((ide_code, encoded_asset))
-        else:
-            _log(f"  [无卡] {ide_code} 返回 {rc}，继续...", log_cb)
-        time.sleep(0.5)
+            return ide_code, None, "", "", e
+        finally:
+            _clear_proxy_pool_context()
+
+    results_by_ide = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = [ex.submit(_try_one, item) for item in NOCARD_IDES]
+        for fut in concurrent.futures.as_completed(futures):
+            ide_code, rc, rr, encoded_asset, err = fut.result()
+            if err is not None:
+                _log(f"  [无卡] {ide_code} 请求异常: {err}", log_cb)
+                continue
+            _log(f"  [无卡] {ide_code}: {rc}" + (f" ({rr})" if rr else "") +
+                 (f" [EncodedAsset {len(encoded_asset)}字符]" if encoded_asset else ""), log_cb)
+            if rc in ("OK", "ALREADY_OBTAINED", "TRIAL_AVAILABLE"):
+                _log(f"  ✓ {ide_code} 许可证获取成功！", log_cb)
+                results_by_ide[ide_code] = encoded_asset
+            else:
+                _log(f"  [无卡] {ide_code} 返回 {rc}，继续...", log_cb)
+
+    # 保持返回顺序稳定，便于后续日志与排查
+    for ide_code, *_ in NOCARD_IDES:
+        if ide_code in results_by_ide:
+            successful.append((ide_code, results_by_ide[ide_code]))
 
     if successful:
         _log(f"  ✓ 共获得 {len(successful)} 个 IDE 许可证: {', '.join(x[0] for x in successful)}", log_cb)
@@ -656,8 +710,9 @@ def collect_all_ide_jwts(id_token, license_ids, log_cb=None, max_consecutive_400
     untrusted_lids = []
     seen_ids = set()
     consecutive_400 = 0
-    # 代理池存在时请求间隔缩短（IP 已分散），否则适当放慢避免触发限流
-    _req_interval = 0.3 if CF_PROXY_POOL else 0.8
+    # 代理池存在时请求间隔缩短（IP 已分散），否则适当放慢避免触发限流；
+    # 使用当前上下文判断，确保 LOW 专属池也能走快速间隔。
+    _req_interval = 0.3 if _current_proxy_pool_size() > 0 else 0.8
     _req_idx = 0
     for lid in license_ids:
         if not lid or lid in seen_ids:
@@ -756,7 +811,13 @@ def create_nc_licenses(s, user_id, log_cb=None):
         ("DB", "2026.1.2 Build DB-261.23567.23",  "20260325"),
         ("RD", "2026.1.0.1 Build RD-261.22158.394", "20260325"),
     ]
-    for pc, build, bdate in nc_products:
+    ctx = _get_current_proxy_pool_context()
+    workers = _activation_parallel_workers(len(nc_products), no_proxy_workers=2)
+    _log(f"  [nc-create] 并发创建 {len(nc_products)} 个 NC 许可证（并发={workers}）...", log_cb)
+
+    def _create_one(item):
+        _apply_proxy_pool_context(ctx)
+        pc, build, bdate = item
         params = {
             "productFamilyId": pc, "hostName": ENCRYPTED_HOSTNAME,
             "salt": str(int(time.time() * 1000)),
@@ -773,12 +834,22 @@ def create_nc_licenses(s, user_id, log_cb=None):
             rc = re.search(r"<responseCode>(.*?)</responseCode>", r.text)
             has_asset = "<EncodedAsset>" in r.text
             msg = re.search(r"<message>(.*?)</message>", r.text)
-            _log(f"  [nc-create:{pc}] rc={rc.group(1) if rc else '?'} "
-                 f"asset={'✓' if has_asset else '✗'} "
-                 f"msg={msg.group(1) if msg else ''}", log_cb)
+            return pc, rc.group(1) if rc else "?", has_asset, msg.group(1) if msg else "", None
         except Exception as e:
-            _log(f"  [nc-create:{pc}] 异常: {e}", log_cb)
-        time.sleep(0.5)
+            return pc, "?", False, "", e
+        finally:
+            _clear_proxy_pool_context()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = [ex.submit(_create_one, item) for item in nc_products]
+        for fut in concurrent.futures.as_completed(futures):
+            pc, rc, has_asset, msg, err = fut.result()
+            if err is not None:
+                _log(f"  [nc-create:{pc}] 异常: {err}", log_cb)
+            else:
+                _log(f"  [nc-create:{pc}] rc={rc} "
+                     f"asset={'✓' if has_asset else '✗'} "
+                     f"msg={msg}", log_cb)
 
     # 调 obtainLicense.action (AIP, 无 licenseId) — 让服务器绑定 AIP 权益
     params_aip = {
@@ -799,16 +870,23 @@ def create_nc_licenses(s, user_id, log_cb=None):
     except Exception as e:
         _log(f"  [nc-create:AIP] 异常: {e}", log_cb)
 
-    time.sleep(3)
-    try:
-        after_lids = set(extract_license_ids(s))    # 用正确的解析器
-        new_lids = list(after_lids - before_lids)
-        all_nc = list(after_lids)
-        _log(f"  [nc-create] 新增 licenseId: {new_lids}，账号全量: {all_nc}", log_cb)
-        return new_lids, all_nc
-    except Exception as e:
-        _log(f"  [nc-create] 读取新 licenseId 失败: {e}", log_cb)
-        return [], []
+    # 读取新 licenseId：以前固定等待 3s；现在改成短轮询，成功同步即提前返回。
+    last_err = None
+    for attempt, wait_s in enumerate((1.0, 1.0, 2.0), start=1):
+        time.sleep(wait_s)
+        try:
+            after_lids = set(extract_license_ids(s))    # 用正确的解析器
+            new_lids = list(after_lids - before_lids)
+            all_nc = list(after_lids)
+            if new_lids or all_nc or attempt == 3:
+                _log(f"  [nc-create] 新增 licenseId: {new_lids}，账号全量: {all_nc}", log_cb)
+                return new_lids, all_nc
+        except Exception as e:
+            last_err = e
+            _log(f"  [nc-create] 读取新 licenseId 失败(第{attempt}次): {e}", log_cb)
+    if last_err:
+        _log(f"  [nc-create] 读取新 licenseId 最终失败: {last_err}", log_cb)
+    return [], []
 
 
 def get_jwt_from_grazie_lite(id_token, log_cb=None):
@@ -1122,8 +1200,8 @@ def _process_account_inner(email: str, password: str, log_cb: Optional[Callable]
             ide_codes = [x[0] for x in successful_ides]
             result["activate_mode"] = f"nocard:{'+'.join(ide_codes)}"
             _log(f"  ✓ 获得 {len(successful_ides)} 个 IDE 许可证: {', '.join(ide_codes)}", log_cb)
-            _log("  等待 10s 让许可证同步到账号...", log_cb)
-            time.sleep(10)
+            _log("  快速等待 2s 让许可证同步到账号...", log_cb)
+            time.sleep(2)
         else:
             result["activate_mode"] = "free_tier"
             _log("  [5/8] 所有 IDE 许可证均失败，继续...", log_cb)
@@ -1131,10 +1209,11 @@ def _process_account_inner(email: str, password: str, log_cb: Optional[Callable]
         result["activate_mode"] = "already_active"
         _log("[5/8] 跳过（AI 已激活）", log_cb)
 
-    _log("[6/8] 提取 licenseId（等待 5s 让账号系统同步）...", log_cb)
-    time.sleep(5)
+    _log("[6/8] 提取 licenseId（快速短轮询同步）...", log_cb)
     ids = []
-    for attempt in range(1, 4):
+    for attempt, wait_s in enumerate((0, 2, 5), start=1):
+        if wait_s:
+            time.sleep(wait_s)
         try:
             ids = extract_license_ids(s, log_cb=log_cb)
         except Exception as e:
@@ -1142,8 +1221,7 @@ def _process_account_inner(email: str, password: str, log_cb: Optional[Callable]
         if ids:
             break
         if attempt < 3:
-            _log(f"  [6] 未找到 licenseId，10s 后第{attempt+1}次重试...", log_cb)
-            time.sleep(10)
+            _log(f"  [6] 未找到 licenseId，{(2, 5)[attempt-1]}s 后第{attempt+1}次重试...", log_cb)
     _log(f"  最终 License IDs: {ids}", log_cb)
 
     _log("[7/8] Grazie 注册...", log_cb)
