@@ -3835,12 +3835,18 @@ async def openai_stream_adapter(
                                     "index": current_tool_call_index,
                                     "function": {"arguments": func_argu or ""},
                                 }
+                        delta = {"tool_calls": [tc_delta]}
+                        # 严格 OpenAI 兼容客户端要求整条响应流中至少出现一次
+                        # assistant role；当模型首个输出就是 tool_call 时，也要在首包补 role。
+                        if not first_chunk_sent:
+                            delta["role"] = "assistant"
+                            first_chunk_sent = True
                         chunk = {
                             "id": stream_id, "object": "chat.completion.chunk",
                             "created": int(time.time()), "model": model_name,
                             "system_fingerprint": "fp_jetbrains",
                             "choices": [{
-                                "delta": {"tool_calls": [tc_delta]},
+                                "delta": delta,
                                 "index": 0,
                                 "finish_reason": None,
                             }],
@@ -3873,6 +3879,15 @@ async def openai_stream_adapter(
                                 _usage_capture["prompt_tokens"] = int(api_prompt_tokens)
                             if api_completion_tokens:
                                 _usage_capture["completion_tokens"] = int(api_completion_tokens)
+                        if not first_chunk_sent:
+                            role_chunk = {
+                                "id": stream_id, "object": "chat.completion.chunk",
+                                "created": int(time.time()), "model": model_name,
+                                "system_fingerprint": "fp_jetbrains",
+                                "choices": [{"delta": {"role": "assistant", "content": ""}, "index": 0, "finish_reason": None}],
+                            }
+                            yield f"data: {json.dumps(role_chunk, ensure_ascii=False)}\n\n"
+                            first_chunk_sent = True
                         finish_chunk = {
                             "id": stream_id, "object": "chat.completion.chunk",
                             "created": int(time.time()), "model": model_name,
@@ -3941,6 +3956,21 @@ async def aggregate_stream_for_non_stream_response(
             try:
                 data = json.loads(sse_line[6:].strip())
 
+                if "error" in data:
+                    err = data.get("error") or {}
+                    message = err.get("message") if isinstance(err, dict) else str(err)
+                    err_type = err.get("type", "") if isinstance(err, dict) else ""
+                    err_code = str(err.get("code", "")) if isinstance(err, dict) else ""
+                    status_code = 502
+                    if err_type == "rate_limit_error" or err_code in {"429", "quota_exhausted"}:
+                        status_code = 429
+                    elif err_type == "invalid_request_error" or err_code == "400":
+                        status_code = 400
+                    raise HTTPException(
+                        status_code=status_code,
+                        detail=message or "上游 JetBrains API 返回错误",
+                    )
+
                 # 捕获 usage 块（choices 为空列表时是 usage-only 块）
                 if "usage" in data and data.get("choices") == []:
                     captured_usage = data["usage"]
@@ -3986,14 +4016,16 @@ async def aggregate_stream_for_non_stream_response(
             v["id"] = f"call_{uuid.uuid4().hex}"
         final_tool_calls.append(v)
 
-    full_content = "".join(content_parts) or None
+    full_content = "".join(content_parts)
 
     if final_tool_calls:
         message = ChatMessage(
-            role="assistant", content=full_content, tool_calls=final_tool_calls
+            role="assistant", content=full_content or None, tool_calls=final_tool_calls
         )
         final_finish_reason = "tool_calls"
     else:
+        # 非流式 OpenAI 响应必须显式返回 assistant 消息；content 用空串而不是 None，
+        # 避免严格客户端报“语言模型未提供任何辅助消息/assistant message”。
         message = ChatMessage(role="assistant", content=full_content)
 
     # 使用捕获到的真实 token 统计（如果有）；估算时复用已 join 的 full_content
@@ -4518,6 +4550,10 @@ def convert_openai_to_anthropic_response(
                     input=tool_input,
                 )
             )
+
+    if not content_blocks:
+        # Anthropic 严格客户端不接受空 content 数组；纯空响应兜底为一个空文本块。
+        content_blocks.append(AnthropicResponseContent(type="text", text=""))
 
     return AnthropicResponseMessage(
         id=resp.id.replace("chatcmpl-", "msg_"),
