@@ -170,7 +170,7 @@ export default function ApiKeys() {
     onSuccess: (data) => {
       toast({
         title: "一键解封完成",
-        description: `已解封 ${data.unbanned_count} 个密钥，清除 ${data.cleared_accounts} 个账号的封禁标记`,
+        description: `已解封 ${data.unbanned_count} 个密钥`,
       });
       qc.invalidateQueries({ queryKey: ["admin-keys"] });
       qc.invalidateQueries({ queryKey: ["admin-status"] });

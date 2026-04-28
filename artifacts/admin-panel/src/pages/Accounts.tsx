@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useMemo } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { Plus, Trash2, CheckCircle, XCircle, RefreshCw, Users, ShieldCheck, Copy, Check, RotateCcw, ListChecks, Eraser, AlertTriangle, ChevronDown, ChevronRight, KeyRound, Unlink, ShieldX, Search, X } from "lucide-react";
+import { Plus, Trash2, CheckCircle, XCircle, RefreshCw, Users, ShieldCheck, Copy, Check, RotateCcw, ListChecks, Eraser, ChevronDown, ChevronRight, KeyRound, Unlink, Search, X } from "lucide-react";
 import { adminFetch } from "@/lib/admin-auth";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -21,8 +21,6 @@ interface Account {
   daily_used: number | null;
   daily_total: number | null;
   last_quota_check: number;
-  external_usage_flag: boolean;
-  external_usage_count: number;
   account_id: string;
   quota_status_reason: string | null;
 }
@@ -116,11 +114,6 @@ function AccountCard({
                 {account.licenseId}
               </Badge>
             )}
-            {account.external_usage_count > 0 && (
-              <Badge variant="outline" className="text-xs border-amber-500/40 text-amber-400 bg-amber-500/10 font-mono px-1.5">
-                {account.external_usage_count}
-              </Badge>
-            )}
             {account.jwt_preview && (
               <code className="text-xs text-muted-foreground font-mono bg-muted px-2 py-0.5 rounded">
                 JWT: {account.jwt_preview}
@@ -147,15 +140,6 @@ function AccountCard({
           </div>
         </div>
 
-        {account.external_usage_flag && (
-          <Badge
-            className="shrink-0 bg-amber-500/20 text-amber-400 border-amber-500/30 flex items-center gap-1"
-            title={`检测到外部调用（第 ${account.external_usage_count}/2 次）`}
-          >
-            <AlertTriangle className="w-3 h-3" />
-            外部调用 {account.external_usage_count}/2
-          </Badge>
-        )}
         <Badge className={`shrink-0 ${account.has_quota ? "bg-emerald-500/20 text-emerald-400 border-emerald-500/30" : "bg-destructive/20 text-destructive border-destructive/30"}`}>
           {account.has_quota
             ? "正常"
@@ -400,22 +384,6 @@ export default function Accounts() {
     onError: () => toast({ title: "启动重检失败", variant: "destructive" }),
   });
 
-  const clearFlagsMutation = useMutation({
-    mutationFn: async () => {
-      const res = await adminFetch("/admin/accounts/clear-external-flags", { method: "POST" });
-      if (!res.ok) throw new Error("清空失败");
-      return res.json();
-    },
-    onSuccess: (data) => {
-      toast({
-        title: "标记已清空",
-        description: `已清除 ${data.cleared} 个账号的外部调用标记和计数`,
-      });
-      qc.invalidateQueries({ queryKey: ["admin-accounts"] });
-    },
-    onError: () => toast({ title: "清空失败", variant: "destructive" }),
-  });
-
   const deleteExhaustedMutation = useMutation({
     mutationFn: async () => {
       const res = await adminFetch("/admin/accounts/exhausted", { method: "DELETE" });
@@ -553,16 +521,6 @@ export default function Accounts() {
           >
             <ListChecks className={`w-4 h-4 mr-2 ${(recheckAllMutation.isPending || isRechecking) ? "animate-pulse" : ""}`} />
             {isRechecking ? "检测中…" : "全量重检配额"}
-          </Button>
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => clearFlagsMutation.mutate()}
-            disabled={clearFlagsMutation.isPending}
-            className="border-amber-500/40 text-amber-400 hover:text-amber-300 hover:bg-amber-500/10 hover:border-amber-500/60"
-          >
-            <ShieldX className={`w-4 h-4 mr-2 ${clearFlagsMutation.isPending ? "animate-pulse" : ""}`} />
-            {clearFlagsMutation.isPending ? "清空中…" : "清空外部调用标记"}
           </Button>
           <Button
             variant="outline"

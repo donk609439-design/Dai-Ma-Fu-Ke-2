@@ -753,11 +753,6 @@ async def _ensure_db_tables():
         # 注意：将 pending_nc_key 引用的 key 标记 is_nc_key=TRUE 的回填，
         # 必须放在下方 ALTER TABLE jb_accounts ADD COLUMN pending_nc_key 之后，
         # 否则新建数据库时该列还不存在会报错。已挪至 ALTER 序列结束后。
-        # 配额快照 & 外部调用检测
-        await conn.execute("ALTER TABLE jb_accounts ADD COLUMN IF NOT EXISTS quota_snapshot_available DOUBLE PRECISION DEFAULT -1")
-        await conn.execute("ALTER TABLE jb_accounts ADD COLUMN IF NOT EXISTS quota_snapshot_proxy_tokens BIGINT DEFAULT 0")
-        await conn.execute("ALTER TABLE jb_accounts ADD COLUMN IF NOT EXISTS external_usage_flag BOOLEAN DEFAULT FALSE")
-        await conn.execute("ALTER TABLE jb_accounts ADD COLUMN IF NOT EXISTS external_usage_count INTEGER DEFAULT 0")
         # 每日用量展示
         await conn.execute("ALTER TABLE jb_accounts ADD COLUMN IF NOT EXISTS daily_used INTEGER DEFAULT NULL")
         await conn.execute("ALTER TABLE jb_accounts ADD COLUMN IF NOT EXISTS daily_total INTEGER DEFAULT NULL")
@@ -1278,10 +1273,6 @@ async def _batch_save_accounts_to_db(accounts: List[dict]):
             float(acc.get("last_updated") or 0),
             float(acc.get("last_quota_check") or 0),
             bool(acc.get("has_quota", True)),
-            float(acc.get("quota_snapshot_available", -1)),
-            int(acc.get("quota_snapshot_proxy_tokens", 0)),
-            bool(acc.get("external_usage_flag", False)),
-            int(acc.get("external_usage_count", 0)),
             acc.get("daily_used"),
             acc.get("daily_total"),
         )
@@ -1293,9 +1284,8 @@ async def _batch_save_accounts_to_db(accounts: List[dict]):
                 """
                 INSERT INTO jb_accounts
                     (id, license_id, auth_token, jwt, last_updated, last_quota_check, has_quota,
-                     quota_snapshot_available, quota_snapshot_proxy_tokens, external_usage_flag,
-                     external_usage_count, daily_used, daily_total)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+                     daily_used, daily_total)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
                 ON CONFLICT (id) DO UPDATE SET
                     license_id                  = EXCLUDED.license_id,
                     auth_token                  = EXCLUDED.auth_token,
@@ -1303,10 +1293,6 @@ async def _batch_save_accounts_to_db(accounts: List[dict]):
                     last_updated                = EXCLUDED.last_updated,
                     last_quota_check            = EXCLUDED.last_quota_check,
                     has_quota                   = EXCLUDED.has_quota,
-                    quota_snapshot_available    = EXCLUDED.quota_snapshot_available,
-                    quota_snapshot_proxy_tokens = EXCLUDED.quota_snapshot_proxy_tokens,
-                    external_usage_flag         = EXCLUDED.external_usage_flag,
-                    external_usage_count        = EXCLUDED.external_usage_count,
                     daily_used                  = EXCLUDED.daily_used,
                     daily_total                 = EXCLUDED.daily_total
                 """,
@@ -1424,9 +1410,8 @@ async def _save_account_to_db(account: dict, pool=None):
                 """
                 INSERT INTO jb_accounts
                     (id, license_id, auth_token, jwt, last_updated, last_quota_check, has_quota,
-                     quota_snapshot_available, quota_snapshot_proxy_tokens, external_usage_flag,
-                     external_usage_count, daily_used, daily_total)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                     daily_used, daily_total)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                 ON CONFLICT (id) DO UPDATE SET
                     license_id                  = EXCLUDED.license_id,
                     auth_token                  = EXCLUDED.auth_token,
@@ -1434,10 +1419,6 @@ async def _save_account_to_db(account: dict, pool=None):
                     last_updated                = EXCLUDED.last_updated,
                     last_quota_check            = EXCLUDED.last_quota_check,
                     has_quota                   = EXCLUDED.has_quota,
-                    quota_snapshot_available    = EXCLUDED.quota_snapshot_available,
-                    quota_snapshot_proxy_tokens = EXCLUDED.quota_snapshot_proxy_tokens,
-                    external_usage_flag         = EXCLUDED.external_usage_flag,
-                    external_usage_count        = EXCLUDED.external_usage_count,
                     daily_used                  = EXCLUDED.daily_used,
                     daily_total                 = EXCLUDED.daily_total
                 """,
@@ -1448,10 +1429,6 @@ async def _save_account_to_db(account: dict, pool=None):
                 float(account.get("last_updated") or 0),
                 float(account.get("last_quota_check") or 0),
                 bool(account.get("has_quota", True)),
-                float(account.get("quota_snapshot_available", -1)),
-                int(account.get("quota_snapshot_proxy_tokens", 0)),
-                bool(account.get("external_usage_flag", False)),
-                int(account.get("external_usage_count", 0)),
                 account.get("daily_used"),
                 account.get("daily_total"),
             )
@@ -1622,8 +1599,7 @@ async def load_accounts_from_db():
     try:
         rows = await pool.fetch(
             "SELECT id, jwt, auth_token, license_id, last_updated, has_quota, last_quota_check,"
-            " quota_snapshot_available, quota_snapshot_proxy_tokens, external_usage_flag,"
-            " external_usage_count, daily_used, daily_total"
+            " daily_used, daily_total"
             " FROM jb_accounts WHERE jwt IS NOT NULL ORDER BY created_at"
         )
         if rows:
@@ -1633,10 +1609,6 @@ async def load_accounts_from_db():
                     "last_updated": row["last_updated"] or 0,
                     "has_quota": row["has_quota"],
                     "last_quota_check": row["last_quota_check"] or 0,
-                    "quota_snapshot_available": float(row["quota_snapshot_available"]) if row["quota_snapshot_available"] is not None else -1,
-                    "quota_snapshot_proxy_tokens": int(row["quota_snapshot_proxy_tokens"] or 0),
-                    "external_usage_flag": bool(row["external_usage_flag"]) if row["external_usage_flag"] is not None else False,
-                    "external_usage_count": int(row["external_usage_count"]) if row["external_usage_count"] is not None else 0,
                     "daily_used": int(row["daily_used"]) if row["daily_used"] is not None else None,
                     "daily_total": int(row["daily_total"]) if row["daily_total"] is not None else None,
                 }
@@ -1646,10 +1618,6 @@ async def load_accounts_from_db():
                     acc["authorization"] = row["auth_token"]
                 return acc
             JETBRAINS_ACCOUNTS = [_row_to_account(row) for row in rows]
-            # 服务重启后 account_stats（内存）已清零，将快照 proxy_tokens 同步置 0
-            # 避免第一轮外部调用扫描时因 proxy_tokens_delta < 0 而漏判
-            for acc in JETBRAINS_ACCOUNTS:
-                acc["quota_snapshot_proxy_tokens"] = 0
             print(f"从数据库加载 {len(JETBRAINS_ACCOUNTS)} 个账户")
             # 迁移旧格式 ID（jwt:前16字符）→ 新格式（jwt:SHA256哈希）
             old_ids = [
@@ -1776,7 +1744,7 @@ def _validate_key(key: str) -> None:
     if meta.get("banned"):
         raise HTTPException(
             status_code=403,
-            detail="This API key has been banned. The account associated with this key was detected making external API calls outside of this proxy. Please contact the administrator.",
+            detail="This API key has been banned. Please contact the administrator.",
         )
     limit = meta.get("usage_limit")
     count = meta.get("usage_count", 0)
@@ -2077,51 +2045,6 @@ async def _check_quota(account: dict):
         print(f"Account {account.get('licenseId') or 'with static JWT'} "
               f"AI Credits: {int(tariff_available):,}/{int(tariff_total):,} "
               f"(used {int(tariff_used):,}) → has_quota={has_quota}")
-
-        # 外部调用检测：对比上次快照
-        if tariff_total != 0:
-            prev_snap   = account.get("quota_snapshot_available", -1)
-            prev_tokens = account.get("quota_snapshot_proxy_tokens", 0)
-            stats       = account_stats.get(acc_id, {})
-            curr_tokens = stats.get("prompt_tokens", 0) + stats.get("completion_tokens", 0)
-
-            if prev_snap >= 0:
-                quota_drop           = prev_snap - tariff_available
-                proxy_tokens_delta   = curr_tokens - prev_tokens
-                min_drop_threshold   = tariff_total * 0.01
-                if quota_drop > min_drop_threshold and proxy_tokens_delta == 0:
-                    current_count = account.get("external_usage_count", 0) + 1
-                    account["external_usage_count"] = current_count
-                    account["external_usage_flag"]  = True
-                    acc_label = account.get('licenseId', acc_id[:12])
-                    if current_count >= 2:
-                        newly_banned = []
-                        ban_ts = time.time()
-                        for k, v in list(VALID_CLIENT_KEYS.items()):
-                            if v.get("account_id") == acc_id and not v.get("banned"):
-                                v["banned"]    = True
-                                v["banned_at"] = ban_ts
-                                asyncio.create_task(_upsert_key_to_db(k, dict(v)))
-                                # 若是 LOW 用户个人 key，持久化封禁审计（与 import 互斥）
-                                # _persist_low_user_ban 内部 acquire 了 import 锁，保证 import 看到 banned=True
-                                _low_did = str(v.get("low_admin_discord_id") or "")
-                                if _low_did:
-                                    asyncio.create_task(_persist_low_user_ban(_low_did, ban_ts))
-                                newly_banned.append(k)
-                                print(f"[外部调用] 已自动封禁密钥 {k[:20]}...")
-                        print(f"[外部调用] 账号 {acc_label} 第 {current_count} 次检测到外部消耗："
-                              f"AI Credits 减少 {quota_drop:.0f}/{tariff_total:.0f}"
-                              f"（{quota_drop/tariff_total*100:.1f}%），本代理零调用，本轮封禁 {len(newly_banned)} 个密钥")
-                    else:
-                        print(f"[外部调用] 账号 {acc_label} 第 {current_count} 次检测到可疑外部消耗："
-                              f"AI Credits 减少 {quota_drop:.0f}/{tariff_total:.0f}"
-                              f"（{quota_drop/tariff_total*100:.1f}%），本代理零调用，暂不封禁")
-                elif quota_drop < 0:
-                    account["external_usage_flag"]  = False
-                    account["external_usage_count"] = 0
-
-            account["quota_snapshot_available"]    = tariff_available
-            account["quota_snapshot_proxy_tokens"] = curr_tokens
 
     except Exception as e:
         print(f"Error checking quota for account {acc_id}: {e}")
@@ -2539,67 +2462,6 @@ async def _stream_with_account_fallback(
 
 
 # FastAPI 生命周期事件
-async def _scan_one_account(acc: dict, semaphore: asyncio.Semaphore):
-    """后台扫描辅助：带并发限制地检查单个账号配额（供 _background_external_usage_scan 调用）"""
-    async with semaphore:
-        try:
-            await _check_quota(acc)
-        except Exception as e:
-            print(f"[后台扫描] 账号 {_account_id(acc)} 出错: {e}")
-
-
-async def _background_external_usage_scan():
-    """后台定时扫描：每 20 分钟对所有账号做一轮配额检测。
-    扫描结束后自动删除仍无配额的账号（内存 + 数据库同步清理）。
-    连续两轮均检测到不明配额消耗时，才自动封禁关联密钥（防止单次误判）。"""
-    global current_account_index
-    # 与 _startup_quota_check 错开：后者已加 5 分钟 sleep + 慢节奏扫全量约 30–70 分钟。
-    # 此处后移到 60 分钟，避免与首轮启动检测同时跑挤占 http_client 连接池。
-    await asyncio.sleep(3600)
-    while True:
-        accounts_snapshot = list(JETBRAINS_ACCOUNTS)
-        now_bg = time.time()
-        # 每 20 分钟强制扫描一次，无论上次检查时间
-        to_check = [
-            acc for acc in accounts_snapshot
-            if now_bg - acc.get("last_quota_check", 0) >= 1200
-        ]
-        if to_check:
-            print(f"[后台扫描] 开始配额检测，待检账号 {len(to_check)}/{len(accounts_snapshot)}")
-            # 分块并发：每次只创建 _CHUNK 个协程，避免大批量任务积压事件循环
-            _CHUNK = 30
-            semaphore = asyncio.Semaphore(3)   # 降低并发，减少 JWT 刷新 429
-            for chunk_start in range(0, len(to_check), _CHUNK):
-                chunk = to_check[chunk_start: chunk_start + _CHUNK]
-                await asyncio.gather(*[_scan_one_account(acc, semaphore) for acc in chunk])
-                # _check_quota.finally 已逐条保存，此处无需冗余 batch save
-                await asyncio.sleep(0.2)  # 块间短暂休息，让远端速率限制恢复
-            print(f"[后台扫描] 本轮检测完成，共检查 {len(to_check)} 个账号")
-
-            # ── 自动清理无配额账号（批量 SQL + O(n) 内存过滤）──
-            no_quota_accs = [acc for acc in JETBRAINS_ACCOUNTS if not acc.get("has_quota")]
-            no_quota_ids = [_account_id(acc) for acc in no_quota_accs]
-            if no_quota_ids:
-                try:
-                    # 先打标，防止 fire-and-forget _save_account_to_db 在删除后重新写回
-                    for acc in no_quota_accs:
-                        acc["_deleted"] = True
-                    await _batch_delete_accounts_from_db(no_quota_ids)
-                    delete_set = set(no_quota_ids)
-                    async with account_rotation_lock:
-                        JETBRAINS_ACCOUNTS[:] = [
-                            acc for acc in JETBRAINS_ACCOUNTS
-                            if _account_id(acc) not in delete_set
-                        ]
-                        if JETBRAINS_ACCOUNTS and current_account_index >= len(JETBRAINS_ACCOUNTS):
-                            current_account_index = 0
-                    print(f"[后台扫描] 本轮共删除 {len(no_quota_ids)} 个无配额账号，"
-                          f"剩余 {len(JETBRAINS_ACCOUNTS)} 个")
-                except Exception as e:
-                    print(f"[后台扫描] 批量删除无配额账号失败: {e}")
-
-        await asyncio.sleep(1200)  # 20 分钟后再扫一轮
-
 
 async def _do_cleanup_pending_param_keys() -> dict:
     """手动触发：清除【等待返回参数】中不在排队行列里的 key。
@@ -3656,7 +3518,6 @@ async def startup():
         ),
     )
     asyncio.create_task(_startup_quota_check())
-    asyncio.create_task(_background_external_usage_scan())
     asyncio.create_task(_cleanup_pending_prizes_loop())
     asyncio.create_task(_partner_credentials_poller())
     asyncio.create_task(_startup_resume_bind_tasks())
@@ -5100,8 +4961,6 @@ async def admin_list_accounts():
             "daily_used": acc.get("daily_used", None),
             "daily_total": acc.get("daily_total", None),
             "last_quota_check": acc.get("last_quota_check", 0),
-            "external_usage_flag": acc.get("external_usage_flag", False),
-            "external_usage_count": acc.get("external_usage_count", 0),
             "account_id": _account_id(acc),
             "quota_status_reason": acc.get("quota_status_reason", None),
         })
@@ -5364,19 +5223,6 @@ async def admin_recheck_cancel():
         task.cancel()
     return {"success": True, "message": "取消信号已发送"}
 
-@app.post("/admin/accounts/clear-external-flags")
-async def admin_clear_external_flags():
-    """一键清空所有账号的外部调用标记和计数（批量写 DB，不影响密钥封禁状态）"""
-    changed: list = []
-    for acc in JETBRAINS_ACCOUNTS:
-        if acc.get("external_usage_flag") or acc.get("external_usage_count", 0) > 0:
-            acc["external_usage_flag"] = False
-            acc["external_usage_count"] = 0
-            changed.append(acc)
-    # 批量写入 DB（单次连接代替 N 次独立写入）
-    asyncio.create_task(_batch_save_accounts_to_db(changed))
-    print(f"[管理员] 一键清空外部调用标记，共清除 {len(changed)} 个账号的标记和计数")
-    return {"success": True, "cleared": len(changed)}
 
 
 @app.get("/admin/keys")
@@ -5451,16 +5297,6 @@ async def admin_unban_key(key: str):
     VALID_CLIENT_KEYS[key]["banned"] = False
     VALID_CLIENT_KEYS[key]["banned_at"] = None
     await _upsert_key_to_db(key, VALID_CLIENT_KEYS[key])
-    # 同时清除关联账号的外部调用标记，使外部调用检测在下次快照时能重新生效（如有需要可重新封禁）
-    acc_id = VALID_CLIENT_KEYS[key].get("account_id")
-    if acc_id:
-        for acc in JETBRAINS_ACCOUNTS:
-            if _account_id(acc) == acc_id and (acc.get("external_usage_flag") or acc.get("external_usage_count", 0) > 0):
-                acc["external_usage_flag"] = False
-                acc["external_usage_count"] = 0
-                asyncio.create_task(_save_account_to_db(acc))
-                print(f"[管理员] 已清除账号 {acc_id[:12]} 的外部调用标记和计数")
-                break
     print(f"[管理员] 已解封密钥 {key[:20]}...")
     _admin_cache_invalidate("keys", "status")
     return {"success": True}
@@ -5468,31 +5304,19 @@ async def admin_unban_key(key: str):
 
 @app.post("/admin/keys/unban-all")
 async def admin_unban_all_keys():
-    """一键解封所有被封禁的 API 密钥，并清除关联账号的外部调用标记"""
+    """一键解封所有被封禁的 API 密钥"""
     banned_keys = [(k, v) for k, v in VALID_CLIENT_KEYS.items() if v.get("banned")]
     if not banned_keys:
-        return {"success": True, "unbanned_count": 0, "cleared_accounts": 0}
+        return {"success": True, "unbanned_count": 0}
 
-    affected_account_ids: set[str] = set()
     for k, v in banned_keys:
         v["banned"] = False
         v["banned_at"] = None
         asyncio.create_task(_upsert_key_to_db(k, dict(v)))
-        acc_id = v.get("account_id")
-        if acc_id:
-            affected_account_ids.add(acc_id)
 
-    cleared_accounts = 0
-    for acc in JETBRAINS_ACCOUNTS:
-        if _account_id(acc) in affected_account_ids and (acc.get("external_usage_flag") or acc.get("external_usage_count", 0) > 0):
-            acc["external_usage_flag"] = False
-            acc["external_usage_count"] = 0
-            asyncio.create_task(_save_account_to_db(acc))
-            cleared_accounts += 1
-
-    print(f"[管理员] 一键解封 {len(banned_keys)} 个密钥，清除 {cleared_accounts} 个账号的外部调用标记和计数")
+    print(f"[管理员] 一键解封 {len(banned_keys)} 个密钥")
     _admin_cache_invalidate("keys", "status")
-    return {"success": True, "unbanned_count": len(banned_keys), "cleared_accounts": cleared_accounts}
+    return {"success": True, "unbanned_count": len(banned_keys)}
 
 
 @app.post("/admin/keys")
@@ -9063,10 +8887,6 @@ async def _import_partner_credential(cred: dict) -> str | None:
             "last_updated": time.time(),
             "has_quota": True,
             "last_quota_check": 0,
-            "quota_snapshot_available": -1,
-            "quota_snapshot_proxy_tokens": 0,
-            "external_usage_flag": False,
-            "external_usage_count": 0,
             "daily_used": None,
             "daily_total": None,
         }
