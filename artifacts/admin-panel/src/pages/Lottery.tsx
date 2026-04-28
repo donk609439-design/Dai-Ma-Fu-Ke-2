@@ -24,25 +24,26 @@ interface Prize {
 }
 
 const FALLBACK_SEGMENTS = [
-  { prize: "敬请期待", bg: "#ef4444" },
   { prize: "敬请期待", bg: "#f97316" },
-  { prize: "敬请期待", bg: "#eab308" },
-  { prize: "敬请期待", bg: "#22c55e" },
-  { prize: "敬请期待", bg: "#06b6d4" },
-  { prize: "敬请期待", bg: "#6366f1" },
-  { prize: "敬请期待", bg: "#8b5cf6" },
-  { prize: "敬请期待", bg: "#ec4899" },
+  { prize: "敬请期待", bg: "#ea580c" },
+  { prize: "敬请期待", bg: "#fb923c" },
+  { prize: "敬请期待", bg: "#c2410c" },
+  { prize: "敬请期待", bg: "#fd7f46" },
+  { prize: "敬请期待", bg: "#9a3412" },
+  { prize: "敬请期待", bg: "#f26a21" },
+  { prize: "敬请期待", bg: "#7c2d12" },
 ];
 
+// Premium citrus/copper palette: cohesive orange metal instead of rainbow blocks.
 const SEG_COLORS = [
-  "#ef4444",
   "#f97316",
-  "#eab308",
-  "#22c55e",
-  "#06b6d4",
-  "#6366f1",
-  "#8b5cf6",
-  "#ec4899",
+  "#ea580c",
+  "#fb923c",
+  "#c2410c",
+  "#fd7f46",
+  "#9a3412",
+  "#f26a21",
+  "#7c2d12",
 ];
 
 const CX = 160;
@@ -916,9 +917,10 @@ export default function Lottery() {
                       </linearGradient>
                       {segments.map((seg, i) => (
                         <radialGradient key={`grad-${i}`} id={`segGrad-${i}`} cx="35%" cy="28%" r="82%">
-                          <stop offset="0%" stopColor="#ffffff" stopOpacity="0.48" />
-                          <stop offset="34%" stopColor={seg.bg} stopOpacity="0.94" />
-                          <stop offset="100%" stopColor={seg.bg} stopOpacity="0.72" />
+                          <stop offset="0%" stopColor="#fff7ed" stopOpacity="0.62" />
+                          <stop offset="36%" stopColor={seg.bg} stopOpacity="0.92" />
+                          <stop offset="72%" stopColor={seg.bg} stopOpacity="0.78" />
+                          <stop offset="100%" stopColor="#431407" stopOpacity="0.30" />
                         </radialGradient>
                       ))}
                     </defs>
