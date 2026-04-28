@@ -531,10 +531,11 @@
   .lottery-stage {
     isolation: isolate;
     background:
-      radial-gradient(circle at 50% -10%, rgba(255, 255, 255, 0.9), transparent 32%),
-      radial-gradient(circle at 16% 12%, rgba(214, 198, 177, 0.26), transparent 30%),
-      radial-gradient(circle at 82% 24%, rgba(120, 113, 108, 0.08), transparent 28%),
-      linear-gradient(135deg, #f7f3ec 0%, #eee8dd 48%, #e6ded2 100%);
+      radial-gradient(circle at 50% -10%, rgba(255, 255, 255, 0.92), transparent 32%),
+      radial-gradient(circle at 15% 14%, rgba(251, 146, 60, 0.22), transparent 30%),
+      radial-gradient(circle at 84% 22%, rgba(245, 158, 11, 0.16), transparent 28%),
+      radial-gradient(circle at 50% 92%, rgba(234, 88, 12, 0.1), transparent 34%),
+      linear-gradient(135deg, #fff8ed 0%, #ffedd5 48%, #fed7aa 100%);
   }
 
   .lottery-stage::before {
@@ -544,8 +545,8 @@
     pointer-events: none;
     opacity: 0.34;
     background-image:
-      linear-gradient(rgba(87, 83, 78, 0.045) 1px, transparent 1px),
-      linear-gradient(90deg, rgba(87, 83, 78, 0.045) 1px, transparent 1px);
+      linear-gradient(rgba(154, 78, 18, 0.05) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(154, 78, 18, 0.05) 1px, transparent 1px);
     background-size: 72px 72px;
     mask-image: radial-gradient(circle at 50% 44%, black 0%, transparent 72%);
   }
@@ -572,7 +573,7 @@
     top: 6%;
     width: 420px;
     height: 420px;
-    background: radial-gradient(circle, rgba(183, 164, 139, 0.28), transparent 68%);
+    background: radial-gradient(circle, rgba(251, 146, 60, 0.28), transparent 68%);
   }
 
   .lottery-aurora-two {
@@ -580,7 +581,7 @@
     top: 12%;
     width: 440px;
     height: 440px;
-    background: radial-gradient(circle, rgba(255, 255, 255, 0.48), transparent 70%);
+    background: radial-gradient(circle, rgba(255, 237, 213, 0.58), transparent 70%);
   }
 
   .lottery-aurora-three {
@@ -588,19 +589,19 @@
     bottom: -240px;
     width: 680px;
     height: 460px;
-    background: radial-gradient(circle, rgba(120, 113, 108, 0.11), transparent 72%);
+    background: radial-gradient(circle, rgba(234, 88, 12, 0.14), transparent 72%);
     transform: translateX(-50%);
   }
 
   .lottery-wheel-frame {
     background:
-      radial-gradient(circle at 50% 50%, rgba(255, 255, 255, 0.58), transparent 48%),
-      linear-gradient(145deg, rgba(255, 255, 255, 0.42), rgba(214, 204, 190, 0.24));
+      radial-gradient(circle at 50% 50%, rgba(255, 255, 255, 0.62), transparent 48%),
+      linear-gradient(145deg, rgba(255, 247, 237, 0.64), rgba(251, 146, 60, 0.18));
     box-shadow:
-      inset 0 0 0 1px rgba(255, 255, 255, 0.72),
-      inset 0 0 90px rgba(255, 255, 255, 0.34),
-      0 36px 96px rgba(28, 25, 23, 0.12);
-    backdrop-filter: blur(24px) saturate(1.04);
+      inset 0 0 0 1px rgba(255, 255, 255, 0.76),
+      inset 0 0 90px rgba(255, 247, 237, 0.4),
+      0 36px 96px rgba(154, 52, 18, 0.14);
+    backdrop-filter: blur(24px) saturate(1.1);
   }
 
   .lottery-wheel-frame::before,
@@ -618,16 +619,16 @@
 
   .lottery-wheel-frame::after {
     inset: 2%;
-    border: 1px solid rgba(120, 113, 108, 0.1);
+    border: 1px solid rgba(249, 115, 22, 0.16);
   }
 
   .lottery-wheel-halo {
     position: absolute;
     inset: 12%;
     border-radius: inherit;
-    background: radial-gradient(circle, rgba(255, 255, 255, 0.72), rgba(184, 170, 153, 0.2) 48%, transparent 70%);
+    background: radial-gradient(circle, rgba(255, 255, 255, 0.72), rgba(251, 146, 60, 0.24) 48%, transparent 70%);
     filter: blur(24px);
-    opacity: 0.54;
+    opacity: 0.56;
   }
 
   .lottery-pointer {
@@ -637,11 +638,11 @@
   .lottery-spin-button {
     position: relative;
     overflow: hidden;
-    border: 1px solid rgba(41, 37, 36, 0.12);
+    border: 1px solid rgba(154, 52, 18, 0.18);
     text-shadow: none;
     box-shadow:
-      inset 0 1px 0 rgba(255, 255, 255, 0.18),
-      0 18px 42px rgba(28, 25, 23, 0.16);
+      inset 0 1px 0 rgba(255, 255, 255, 0.26),
+      0 18px 42px rgba(154, 52, 18, 0.2);
   }
 
   .lottery-spin-button::before {
@@ -654,20 +655,20 @@
   }
 
   .lottery-spin-button[data-state="ready"] {
-    background: linear-gradient(180deg, #292524 0%, #1c1917 100%);
+    background: linear-gradient(180deg, #fb923c 0%, #f97316 54%, #ea580c 100%);
   }
 
   .lottery-spin-button[data-state="empty"] {
-    background: linear-gradient(180deg, #8a7968 0%, #6f6254 100%);
+    background: linear-gradient(180deg, #fbbf24 0%, #f59e0b 56%, #d97706 100%);
   }
 
   .lottery-spin-button[data-state="expired"] {
-    background: linear-gradient(180deg, #57534e 0%, #3f3a34 100%);
+    background: linear-gradient(180deg, #fdba74 0%, #f97316 56%, #c2410c 100%);
   }
 
   .lottery-spin-button[data-state="spinning"] {
-    background: linear-gradient(180deg, #a8a29e 0%, #78716c 100%);
-    box-shadow: 0 12px 30px rgba(28, 25, 23, 0.12);
+    background: linear-gradient(180deg, #fdba74 0%, #f59e0b 100%);
+    box-shadow: 0 12px 30px rgba(154, 52, 18, 0.16);
     transform: translateY(2px);
   }
 
