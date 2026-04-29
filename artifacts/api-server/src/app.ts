@@ -34,10 +34,17 @@ app.use(cors());
 // ── Admin-panel 路由 ────────────────────────────────────────────────────────
 // 生产模式：dist 存在时直接服务静态文件 + SPA fallback
 // 开发模式：反向代理到 Vite dev server（固定端口 20130）
-const adminPanelDist = path.resolve(
-  process.cwd(),
-  "..",
-  "..",
+//
+// 路径解析：兼容两种 cwd 情况：
+//   生产（从 workspace 根运行）: process.cwd() = /home/runner/workspace
+//   开发（从 artifacts/api-server/ 运行）: process.cwd() = .../artifacts/api-server
+const _repoRoot = (() => {
+  const cwd = process.cwd();
+  if (fs.existsSync(path.join(cwd, "artifacts", "admin-panel"))) return cwd;
+  return path.resolve(cwd, "..", "..");
+})();
+const adminPanelDist = path.join(
+  _repoRoot,
   "artifacts",
   "admin-panel",
   "dist",
