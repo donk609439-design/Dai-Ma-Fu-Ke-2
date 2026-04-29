@@ -11,6 +11,43 @@ env = { "CI" = "true" }
 [workflows]
 runButton = "Project"
 
+[[workflows.workflow]]
+name = "Project"
+mode = "parallel"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "Start application"
+
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "Admin Panel"
+
+[[workflows.workflow]]
+name = "Start application"
+author = "agent"
+
+[workflows.workflow.metadata]
+outputType = "console"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "PORT=8080 cd artifacts/api-server && PORT=8080 pnpm run dev"
+waitForPort = 8080
+
+[[workflows.workflow]]
+name = "Admin Panel"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "PORT=20130 BASE_PATH=/admin-panel/ cd artifacts/admin-panel && PORT=20130 BASE_PATH=/admin-panel/ pnpm run dev"
+waitForPort = 20130
+
+[workflows.workflow.metadata]
+outputType = "webview"
+
 [agent]
 stack = "PNPM_WORKSPACE"
 expertMode = true

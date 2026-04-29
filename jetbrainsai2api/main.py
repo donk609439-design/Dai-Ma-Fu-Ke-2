@@ -856,6 +856,13 @@ async def _ensure_db_tables():
                 v TEXT NOT NULL
             )
         """)
+        # 必须在下方回填 SQL 引用前提前添加（回填 SQL 引用此列）
+        await conn.execute(
+            "ALTER TABLE jb_accounts ADD COLUMN IF NOT EXISTS pending_nc_low_admin BOOLEAN DEFAULT FALSE"
+        )
+        await conn.execute(
+            "ALTER TABLE jb_accounts ADD COLUMN IF NOT EXISTS pending_nc_discord_id TEXT NOT NULL DEFAULT ''"
+        )
         # 一次性回填：旧机制下"全部信任后一次性升 16/25"会导致 LOW key.usage_limit > 0；
         # 切到新机制后，把"已经领过那次 +16 的最早一行"标记为 granted=TRUE，
         # 否则重启后会被当作"未贡献"再次触发 +16。用 jb_settings 加幂等标记，确保只跑一次。
