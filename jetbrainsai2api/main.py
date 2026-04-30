@@ -10940,7 +10940,9 @@ async def _get_table_columns(conn, table: str) -> set:
             "SELECT column_name FROM information_schema.columns WHERE table_name = $1",
             table,
         )
-        _table_columns_cache[table] = {r["column_name"] for r in rows}
+        cols = {r["column_name"] for r in rows}
+        _table_columns_cache[table] = cols
+        print(f"[schema-cache] {table}: {len(cols)} 列", flush=True)
     return _table_columns_cache[table]
 
 
@@ -10951,7 +10953,14 @@ async def _upsert_one_row(conn, table: str, row: dict) -> None:
     # 过滤掉目标表不存在的列（源端可能有目标端尚未迁移的字段）
     known = await _get_table_columns(conn, table)
     if known:
+        original_keys = set(row.keys())
         row = {k: v for k, v in row.items() if k in known}
+        dropped = original_keys - set(row.keys())
+        if dropped and table not in getattr(_upsert_one_row, "_logged_drops", set()):
+            if not hasattr(_upsert_one_row, "_logged_drops"):
+                _upsert_one_row._logged_drops = set()
+            _upsert_one_row._logged_drops.add(table)
+            print(f"[schema-filter] {table}: 过滤掉源端多余列 {sorted(dropped)}", flush=True)
 
     cols = list(row.keys())
     if not cols:
@@ -11253,10 +11262,12 @@ _migration_jobs: Dict[str, dict] = {}
 
 async def _run_migration_bg(job_id: str, source_url: str, source_key: str) -> None:
     """后台执行迁移，进度实时写入 _migration_jobs[job_id]，不占用 HTTP 连接。"""
+    print(f"[bg-migration:{job_id}] 启动，source={source_url}", flush=True)
     job = _migration_jobs[job_id]
     pool = await _get_db_pool()
     if not pool:
         job.update({"status": "failed", "error": "DB unavailable", "finished": True})
+        print(f"[bg-migration:{job_id}] 失败：DB unavailable", flush=True)
         return
 
     BATCH_COMMIT = 500
@@ -11366,10 +11377,13 @@ async def _run_migration_bg(job_id: str, source_url: str, source_key: str) -> No
         except Exception:
             pass
 
+    total = sum(job["counts"].values())
+    elapsed = round(time.time() - job["started_at"], 1)
+    print(f"[bg-migration:{job_id}] 完成：{total} 行 / {elapsed}s / 错误 {len(job['errors'])} 个", flush=True)
     job.update({
         "status": "completed",
         "finished": True,
-        "elapsed_sec": round(time.time() - job["started_at"], 1),
+        "elapsed_sec": elapsed,
     })
 
 
