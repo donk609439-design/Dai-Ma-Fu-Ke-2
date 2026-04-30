@@ -126,3 +126,8 @@ httpServer = app.listen(port, (err) => {
 
   logger.info({ port }, "Server listening");
 });
+
+// Node.js HTTP 服务器默认 requestTimeout = 300s（5 分钟），
+// 会在迁移、流式 AI 等长请求期间强制切断连接。
+// 设置为 0 禁用此限制，由 proxy 层的 600s 超时兜底。
+httpServer.requestTimeout = 0;
