@@ -11189,6 +11189,55 @@ async def _run_import_bg(job_id: str, data: bytes) -> None:
     job.update({"status": "completed", "finished": True, "elapsed_sec": elapsed})
 
 
+# ── 分块上传三步接口（解决 Cloud Run ≤32 MB 单请求限制）────────────────────
+
+@app.post("/admin/db-import-start")
+async def admin_db_import_start(request: Request):
+    """第一步：创建上传会话，返回 session_id。"""
+    if request.headers.get("X-Admin-Key", "") != ADMIN_KEY:
+        return JSONResponse(status_code=403, content={"detail": "forbidden"})
+    session_id = uuid.uuid4().hex[:12]
+    _import_sessions[session_id] = bytearray()
+    return {"session_id": session_id}
+
+
+@app.post("/admin/db-import-chunk/{session_id}")
+async def admin_db_import_chunk(session_id: str, request: Request):
+    """第二步（重复多次）：追加一个数据块（≤8 MB）到会话缓冲区。"""
+    if request.headers.get("X-Admin-Key", "") != ADMIN_KEY:
+        return JSONResponse(status_code=403, content={"detail": "forbidden"})
+    if session_id not in _import_sessions:
+        return JSONResponse(status_code=404, content={"error": "session not found (server may have restarted)"})
+    async for chunk in request.stream():
+        if chunk:
+            _import_sessions[session_id].extend(chunk)
+    return {"session_id": session_id, "buffered_bytes": len(_import_sessions[session_id])}
+
+
+@app.post("/admin/db-import-finish/{session_id}")
+async def admin_db_import_finish(session_id: str, request: Request):
+    """第三步：所有块上传完毕，启动后台导入任务，返回 job_id。"""
+    if request.headers.get("X-Admin-Key", "") != ADMIN_KEY:
+        return JSONResponse(status_code=403, content={"detail": "forbidden"})
+    buf = _import_sessions.pop(session_id, None)
+    if buf is None:
+        return JSONResponse(status_code=404, content={"error": "session not found"})
+    data_bytes = bytes(buf)
+    job_id = uuid.uuid4().hex[:8]
+    _migration_jobs[job_id] = {
+        "status": "running",
+        "started_at": time.time(),
+        "counts": {},
+        "bytes_read": 0,
+        "total_file_bytes": len(data_bytes),
+        "errors": [],
+        "finished": False,
+    }
+    print(f"[bg-import:{job_id}] session={session_id} 启动，{len(data_bytes)/1024/1024:.1f}MB", flush=True)
+    asyncio.ensure_future(_run_import_bg(job_id, data_bytes))
+    return {"job_id": job_id, "bytes": len(data_bytes)}
+
+
 @app.post("/admin/import-from-source-stream")
 async def admin_import_from_source_stream(request: Request, data: dict = Body(...)):
     """从源端 /admin/db-export-stream 流式拉取并导入。
@@ -11320,6 +11369,8 @@ async def admin_import_from_source_stream(request: Request, data: dict = Body(..
 
 # ── 后台迁移任务（绕过 Autoscale 5 分钟代理超时）────────────────────────
 _migration_jobs: Dict[str, dict] = {}
+# ── 分块上传会话缓冲（Cloud Run 单请求 ≤32 MB，大文件必须分块）───────────
+_import_sessions: Dict[str, bytearray] = {}
 
 
 async def _run_migration_bg(job_id: str, source_url: str, source_key: str) -> None:

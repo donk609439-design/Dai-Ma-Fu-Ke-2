@@ -62,6 +62,8 @@ export function MigrationPanel() {
   }
 
   // ── 上传文件导入 ──────────────────────────────────────────────────────────
+  const CHUNK_SIZE = 8 * 1024 * 1024; // 8 MB，小于 Cloud Run 32 MB 限制
+
   function stopUploadPoll() {
     if (uploadPollTimer.current) { clearInterval(uploadPollTimer.current); uploadPollTimer.current = null; }
   }
@@ -78,15 +80,59 @@ export function MigrationPanel() {
         setUploading(false);
         setUploadPhase(null);
         if (data.status === "completed") {
-          toast({
-            title: "导入完成",
-            description: `共 ${data.total_rows} 行 / 耗时 ${data.elapsed_sec}s`,
-          });
+          toast({ title: "导入完成", description: `共 ${data.total_rows} 行 / 耗时 ${data.elapsed_sec}s` });
         } else {
           toast({ title: "导入失败", description: data.error || "未知错误", variant: "destructive" });
         }
       }
     } catch { /* 网络抖动静默重试 */ }
+  }
+
+  /** 将 File 按 \n 行边界切成 ≤ CHUNK_SIZE 的 Blob 数组 */
+  async function splitIntoChunks(file: File): Promise<Blob[]> {
+    const buf = await file.arrayBuffer();
+    const bytes = new Uint8Array(buf);
+    const chunks: Blob[] = [];
+    let start = 0;
+    while (start < bytes.length) {
+      let end = Math.min(start + CHUNK_SIZE, bytes.length);
+      // 若不是最后一块，向后找最近的 \n（0x0a）作为切割点
+      if (end < bytes.length) {
+        let nl = end;
+        while (nl > start && bytes[nl] !== 0x0a) nl--;
+        if (nl > start) end = nl + 1; // 含 \n
+      }
+      chunks.push(new Blob([bytes.subarray(start, end)]));
+      start = end;
+    }
+    return chunks;
+  }
+
+  /** XHR 上传单个 Blob，返回解析后的 JSON */
+  function xhrPost(url: string, body: Blob | null, onProgress?: (pct: number) => void): Promise<unknown> {
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      if (onProgress) {
+        xhr.upload.onprogress = (e) => {
+          if (e.lengthComputable) onProgress(Math.round(e.loaded / e.total * 100));
+        };
+      }
+      xhr.onload = () => {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          try { resolve(JSON.parse(xhr.responseText)); }
+          catch { resolve(xhr.responseText); }
+        } else {
+          const text = xhr.responseText.slice(0, 300).replace(/<[^>]+>/g, " ").trim();
+          reject(new Error(`HTTP ${xhr.status}: ${text}`));
+        }
+      };
+      xhr.onerror   = () => reject(new Error("网络错误"));
+      xhr.ontimeout = () => reject(new Error("请求超时"));
+      xhr.open("POST", url);
+      xhr.setRequestHeader("X-Admin-Key", getAdminKey() ?? "");
+      if (body) xhr.setRequestHeader("Content-Type", "application/octet-stream");
+      xhr.send(body);
+    });
   }
 
   async function handleUpload(file: File) {
@@ -98,34 +144,29 @@ export function MigrationPanel() {
     setImportStatus(null);
 
     try {
-      // Phase 1: XHR 上传（可以监听 onprogress）
-      const jobId = await new Promise<string>((resolve, reject) => {
-        const xhr = new XMLHttpRequest();
-        xhr.upload.onprogress = (e) => {
-          if (e.lengthComputable) setUploadProgress(Math.round(e.loaded / e.total * 100));
-        };
-        xhr.onload = () => {
-          if (xhr.status === 200) {
-            try {
-              const data = JSON.parse(xhr.responseText);
-              if (data.job_id) resolve(data.job_id);
-              else reject(new Error(data.error || "未返回 job_id"));
-            } catch { reject(new Error("响应解析失败")); }
-          } else {
-            reject(new Error(`HTTP ${xhr.status}: ${xhr.responseText.slice(0, 200)}`));
-          }
-        };
-        xhr.onerror   = () => reject(new Error("网络错误"));
-        xhr.ontimeout = () => reject(new Error("上传超时"));
-        xhr.open("POST", "/admin/db-import-stream");
-        xhr.setRequestHeader("Content-Type", "application/x-ndjson");
-        xhr.setRequestHeader("X-Admin-Key", getAdminKey() ?? "");
-        xhr.send(file);
-      });
+      // Step 1: 创建会话
+      const startData = await xhrPost("/admin/db-import-start", null) as { session_id: string };
+      const sessionId = startData.session_id;
 
-      // Phase 2: 轮询导入进度
+      // Step 2: 切块并逐块上传
+      const chunks = await splitIntoChunks(file);
+      const total = chunks.length;
+      for (let i = 0; i < total; i++) {
+        await xhrPost(
+          `/admin/db-import-chunk/${sessionId}`,
+          chunks[i],
+          (pct) => setUploadProgress(Math.round((i / total + pct / 100 / total) * 100)),
+        );
+        setUploadProgress(Math.round((i + 1) / total * 100));
+      }
+
+      // Step 3: 通知服务端上传完毕，启动后台导入
       setUploadPhase("import");
       setUploadProgress(100);
+      const finishData = await xhrPost(`/admin/db-import-finish/${sessionId}`, null) as { job_id: string };
+      const jobId = finishData.job_id;
+
+      // Step 4: 轮询导入进度
       await pollImportJob(jobId);
       uploadPollTimer.current = setInterval(() => pollImportJob(jobId), 2000);
     } catch (e: unknown) {
@@ -274,11 +315,14 @@ export function MigrationPanel() {
           {uploading && uploadPhase === "upload" && (
             <div className="mt-3 space-y-1">
               <div className="flex justify-between text-xs text-muted-foreground">
-                <span>正在上传...</span>
+                <span>正在上传（分块传输，每块 ≤8 MB）...</span>
                 <span>{uploadProgress}%</span>
               </div>
               <Progress value={uploadProgress} className="h-2" />
             </div>
+          )}
+          {uploading && uploadPhase === "import" && !importStatus && (
+            <div className="mt-3 text-xs text-muted-foreground">⏳ 上传完成，等待后台导入启动...</div>
           )}
 
           {/* 导入进度 */}
