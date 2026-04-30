@@ -11287,7 +11287,9 @@ async def _run_migration_bg(job_id: str, source_url: str, source_key: str) -> No
         print(f"[bg-migration:{job_id}] 失败：DB unavailable", flush=True)
         return
 
-    BATCH_COMMIT = 500
+    BATCH_INSERT = 500   # 每次 executemany 的行数
+    BATCH_COMMIT = 5000  # 每次 COMMIT 的行数（executemany 后才计数）
+
     timeout = httpx.Timeout(connect=30.0, read=900.0, write=30.0, pool=300.0)
     async with httpx.AsyncClient(verify=False, timeout=timeout) as client:
         try:
@@ -11307,11 +11309,71 @@ async def _run_migration_bg(job_id: str, source_url: str, source_key: str) -> No
 
                 conn = await pool.acquire()
                 current_table: Optional[str] = None
-                try:
-                    tx = conn.transaction()
-                    await tx.start()
-                    rows_in_tx = 0
+                row_buffer: list = []
+                # 用列表包装事务对象，让内嵌函数可以替换它
+                tx_box = [conn.transaction()]
+                await tx_box[0].start()
+                rows_in_tx = [0]
 
+                async def _flush(tbl: Optional[str]) -> None:
+                    """将 row_buffer 批量写入 tbl，清空 buffer。"""
+                    if not row_buffer or not tbl:
+                        row_buffer.clear()
+                        return
+                    known = await _get_table_columns(conn, tbl)
+                    # 用第一行确定列集合（所有行过滤到相同 known 列）
+                    sample = {k: v for k, v in row_buffer[0].items() if k in known}
+                    cols = list(sample.keys())
+                    if not cols:
+                        row_buffer.clear()
+                        return
+
+                    conflict_col   = _TABLE_CONFLICT_COL.get(tbl)
+                    conflict_multi = _TABLE_CONFLICT_MULTI.get(tbl)
+                    ph = "(" + ", ".join(f"${i+1}" for i in range(len(cols))) + ")"
+                    cn = ", ".join(f'"{c}"' for c in cols)
+
+                    if conflict_multi and all(c in cols for c in conflict_multi):
+                        target = "(" + ", ".join(f'"{c}"' for c in conflict_multi) + ")"
+                        uc = [c for c in cols if c not in conflict_multi]
+                        sc = ", ".join(f'"{c}"=EXCLUDED."{c}"' for c in uc)
+                        sql = (f'INSERT INTO "{tbl}" ({cn}) VALUES {ph} ON CONFLICT {target} '
+                               f'DO UPDATE SET {sc}') if uc else (
+                               f'INSERT INTO "{tbl}" ({cn}) VALUES {ph} ON CONFLICT {target} DO NOTHING')
+                    elif conflict_col and conflict_col in cols:
+                        uc = [c for c in cols if c != conflict_col]
+                        sc = ", ".join(f'"{c}"=EXCLUDED."{c}"' for c in uc)
+                        sql = (f'INSERT INTO "{tbl}" ({cn}) VALUES {ph} ON CONFLICT ("{conflict_col}") '
+                               f'DO UPDATE SET {sc}') if uc else (
+                               f'INSERT INTO "{tbl}" ({cn}) VALUES {ph} ON CONFLICT ("{conflict_col}") DO NOTHING')
+                    else:
+                        sql = f'INSERT INTO "{tbl}" ({cn}) VALUES {ph} ON CONFLICT DO NOTHING'
+
+                    args = [
+                        tuple(_coerce_json_value(r.get(c)) for c in cols)
+                        for r in row_buffer
+                    ]
+                    try:
+                        await conn.executemany(sql, args)
+                        n = len(row_buffer)
+                        job["counts"][tbl] = job["counts"].get(tbl, 0) + n
+                        rows_in_tx[0] += n
+                    except Exception as ex:
+                        job["errors"].append(f"{tbl} batch({len(row_buffer)}): {type(ex).__name__}: {ex}")
+                        try: await tx_box[0].rollback()
+                        except Exception: pass
+                        tx_box[0] = conn.transaction()
+                        await tx_box[0].start()
+                        rows_in_tx[0] = 0
+                    row_buffer.clear()
+
+                    if rows_in_tx[0] >= BATCH_COMMIT:
+                        await tx_box[0].commit()
+                        tx_box[0] = conn.transaction()
+                        await tx_box[0].start()
+                        rows_in_tx[0] = 0
+
+                try:
                     async for line in resp.aiter_lines():
                         if not line or not line.strip():
                             continue
@@ -11325,6 +11387,7 @@ async def _run_migration_bg(job_id: str, source_url: str, source_key: str) -> No
                         if "_meta" in obj:
                             continue
                         if "_table" in obj:
+                            await _flush(current_table)
                             tbl = obj["_table"]
                             current_table = tbl if tbl in _EXPORT_TABLES else None
                             if current_table:
@@ -11335,28 +11398,13 @@ async def _run_migration_bg(job_id: str, source_url: str, source_key: str) -> No
                             continue
                         if not current_table:
                             continue
-                        try:
-                            await _upsert_one_row(conn, current_table, obj)
-                            job["counts"][current_table] = job["counts"].get(current_table, 0) + 1
-                            rows_in_tx += 1
-                        except Exception as e:
-                            job["errors"].append(f"{current_table} row: {type(e).__name__}: {e}")
-                            # 事务已中止，必须回滚后重开，否则后续所有行都级联失败
-                            try:
-                                await tx.rollback()
-                            except Exception:
-                                pass
-                            tx = conn.transaction()
-                            await tx.start()
-                            rows_in_tx = 0
 
-                        if rows_in_tx >= BATCH_COMMIT:
-                            await tx.commit()
-                            tx = conn.transaction()
-                            await tx.start()
-                            rows_in_tx = 0
+                        row_buffer.append(obj)
+                        if len(row_buffer) >= BATCH_INSERT:
+                            await _flush(current_table)
 
-                    await tx.commit()
+                    await _flush(current_table)
+                    await tx_box[0].commit()
                 finally:
                     await pool.release(conn)
 
