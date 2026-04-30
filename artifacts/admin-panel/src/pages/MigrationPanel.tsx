@@ -3,6 +3,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Progress } from "@/components/ui/progress";
 import { useToast } from "@/hooks/use-toast";
 import { getAdminKey } from "@/lib/admin-auth";
 
@@ -15,20 +16,29 @@ interface JobStatus {
   elapsed_sec: number;
   errors: string[];
   error?: string;
+  total_file_bytes?: number;
 }
 
 export function MigrationPanel() {
   const { toast } = useToast();
   const [sourceUrl, setSourceUrl] = useState("");
   const [sourceKey, setSourceKey] = useState("");
-  const [downloading, setDownloading] = useState(false);
-  const [uploading,   setUploading]   = useState(false);
-  const [pulling,     setPulling]     = useState(false);
-  const [probeResult, setProbeResult] = useState("");
-  const [jobStatus,   setJobStatus]   = useState<JobStatus | null>(null);
-  const fileInputRef = useRef<HTMLInputElement>(null);
-  const pollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
+  const [downloading,     setDownloading]     = useState(false);
+  const [uploading,       setUploading]       = useState(false);
+  const [uploadProgress,  setUploadProgress]  = useState(0);
+  const [uploadPhase,     setUploadPhase]     = useState<"upload"|"import"|null>(null);
+  const [importStatus,    setImportStatus]    = useState<JobStatus | null>(null);
+
+  const [pulling,         setPulling]         = useState(false);
+  const [jobStatus,       setJobStatus]       = useState<JobStatus | null>(null);
+  const [probeResult,     setProbeResult]     = useState("");
+
+  const fileInputRef      = useRef<HTMLInputElement>(null);
+  const uploadPollTimer   = useRef<ReturnType<typeof setInterval> | null>(null);
+  const pullPollTimer     = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // ── 下载导出 ──────────────────────────────────────────────────────────────
   async function handleStreamExport() {
     setDownloading(true);
     try {
@@ -51,52 +61,96 @@ export function MigrationPanel() {
     }
   }
 
+  // ── 上传文件导入 ──────────────────────────────────────────────────────────
+  function stopUploadPoll() {
+    if (uploadPollTimer.current) { clearInterval(uploadPollTimer.current); uploadPollTimer.current = null; }
+  }
+
+  async function pollImportJob(jobId: string) {
+    try {
+      const r = await fetch(`/admin/migration-job/${jobId}`, {
+        headers: { "X-Admin-Key": getAdminKey() ?? "" },
+      });
+      const data: JobStatus = await r.json();
+      setImportStatus(data);
+      if (data.finished) {
+        stopUploadPoll();
+        setUploading(false);
+        setUploadPhase(null);
+        if (data.status === "completed") {
+          toast({
+            title: "导入完成",
+            description: `共 ${data.total_rows} 行 / 耗时 ${data.elapsed_sec}s`,
+          });
+        } else {
+          toast({ title: "导入失败", description: data.error || "未知错误", variant: "destructive" });
+        }
+      }
+    } catch { /* 网络抖动静默重试 */ }
+  }
+
   async function handleUpload(file: File) {
     if (!confirm(`将上传 ${(file.size / 1024 / 1024).toFixed(1)} MB 数据并 upsert 到当前实例。继续？`)) return;
+
     setUploading(true);
+    setUploadProgress(0);
+    setUploadPhase("upload");
+    setImportStatus(null);
+
     try {
-      const r = await fetch("/admin/db-import-stream", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/x-ndjson",
-          "X-Admin-Key":  getAdminKey() ?? "",
-        },
-        body: file,
-        // @ts-expect-error: duplex 是 fetch 流式上传必须
-        duplex: "half",
+      // Phase 1: XHR 上传（可以监听 onprogress）
+      const jobId = await new Promise<string>((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        xhr.upload.onprogress = (e) => {
+          if (e.lengthComputable) setUploadProgress(Math.round(e.loaded / e.total * 100));
+        };
+        xhr.onload = () => {
+          if (xhr.status === 200) {
+            try {
+              const data = JSON.parse(xhr.responseText);
+              if (data.job_id) resolve(data.job_id);
+              else reject(new Error(data.error || "未返回 job_id"));
+            } catch { reject(new Error("响应解析失败")); }
+          } else {
+            reject(new Error(`HTTP ${xhr.status}: ${xhr.responseText.slice(0, 200)}`));
+          }
+        };
+        xhr.onerror   = () => reject(new Error("网络错误"));
+        xhr.ontimeout = () => reject(new Error("上传超时"));
+        xhr.open("POST", "/admin/db-import-stream");
+        xhr.setRequestHeader("Content-Type", "application/x-ndjson");
+        xhr.setRequestHeader("X-Admin-Key", getAdminKey() ?? "");
+        xhr.send(file);
       });
-      const data = await r.json();
-      if (!r.ok || !data.success) throw new Error(data.error || `HTTP ${r.status}`);
-      const total = Object.values(data.imported as Record<string, number>).reduce((a, b) => a + b, 0);
-      toast({
-        title: "导入成功",
-        description: `共 ${total} 行 / 耗时 ${data.stats.elapsed_sec}s / ${(data.stats.bytes_read / 1024 / 1024).toFixed(1)} MB`,
-      });
+
+      // Phase 2: 轮询导入进度
+      setUploadPhase("import");
+      setUploadProgress(100);
+      await pollImportJob(jobId);
+      uploadPollTimer.current = setInterval(() => pollImportJob(jobId), 2000);
     } catch (e: unknown) {
-      toast({ title: "导入失败", description: String(e), variant: "destructive" });
-    } finally {
       setUploading(false);
+      setUploadPhase(null);
+      toast({ title: "上传失败", description: String(e), variant: "destructive" });
+    } finally {
       if (fileInputRef.current) fileInputRef.current.value = "";
     }
   }
 
-  function stopPolling() {
-    if (pollTimerRef.current) {
-      clearInterval(pollTimerRef.current);
-      pollTimerRef.current = null;
-    }
+  // ── 流式拉取 ─────────────────────────────────────────────────────────────
+  function stopPullPoll() {
+    if (pullPollTimer.current) { clearInterval(pullPollTimer.current); pullPollTimer.current = null; }
   }
 
-  async function pollJobStatus(jobId: string) {
+  async function pollPullJob(jobId: string) {
     try {
       const r = await fetch(`/admin/migration-job/${jobId}`, {
         headers: { "X-Admin-Key": getAdminKey() ?? "" },
       });
       const data: JobStatus = await r.json();
       setJobStatus(data);
-
       if (data.finished) {
-        stopPolling();
+        stopPullPoll();
         setPulling(false);
         if (data.status === "completed") {
           toast({
@@ -104,16 +158,10 @@ export function MigrationPanel() {
             description: `共 ${data.total_rows} 行 / 耗时 ${data.elapsed_sec}s / ${(data.bytes_read / 1024 / 1024).toFixed(1)} MB`,
           });
         } else {
-          toast({
-            title: "拉取失败",
-            description: data.error || "未知错误",
-            variant: "destructive",
-          });
+          toast({ title: "拉取失败", description: data.error || "未知错误", variant: "destructive" });
         }
       }
-    } catch (e) {
-      // 网络抖动时静默重试，不停止轮询
-    }
+    } catch { /* 静默重试 */ }
   }
 
   async function handleStreamPull() {
@@ -122,12 +170,9 @@ export function MigrationPanel() {
       return;
     }
     if (!confirm("将从源端拉取所有数据并 upsert 到当前实例。继续？")) return;
-
     setJobStatus(null);
     setPulling(true);
-
     try {
-      // 启动后台任务，立即返回 job_id（绕过 5 分钟代理超时）
       const r = await fetch("/admin/start-migration-bg", {
         method: "POST",
         headers: { "Content-Type": "application/json", "X-Admin-Key": getAdminKey() ?? "" },
@@ -135,11 +180,9 @@ export function MigrationPanel() {
       });
       const data = await r.json();
       if (!r.ok || !data.job_id) throw new Error(data.error || `HTTP ${r.status}`);
-
       const jobId: string = data.job_id;
-      // 立刻查一次，然后每 2 秒轮询
-      await pollJobStatus(jobId);
-      pollTimerRef.current = setInterval(() => pollJobStatus(jobId), 2000);
+      await pollPullJob(jobId);
+      pullPollTimer.current = setInterval(() => pollPullJob(jobId), 2000);
     } catch (e: unknown) {
       setPulling(false);
       toast({ title: "启动迁移失败", description: String(e), variant: "destructive" });
@@ -154,14 +197,48 @@ export function MigrationPanel() {
         headers: { "Content-Type": "application/json", "X-Admin-Key": getAdminKey() ?? "" },
         body: JSON.stringify({ source_url: sourceUrl, source_admin_key: sourceKey }),
       });
-      const data = await r.json();
-      setProbeResult(JSON.stringify(data, null, 2));
-    } catch (e: unknown) {
-      setProbeResult(`错误：${String(e)}`);
-    }
+      setProbeResult(JSON.stringify(await r.json(), null, 2));
+    } catch (e: unknown) { setProbeResult(`错误：${String(e)}`); }
   }
 
-  const totalRows = jobStatus ? Object.values(jobStatus.counts).reduce((a, b) => a + b, 0) : 0;
+  // ── 通用进度框组件 ────────────────────────────────────────────────────────
+  function JobStatusBox({ status }: { status: JobStatus }) {
+    const totalRows = Object.values(status.counts).reduce((a, b) => a + b, 0);
+    return (
+      <div className="mt-3 p-3 bg-muted rounded text-sm space-y-1">
+        <div className="flex items-center gap-2">
+          <span className={
+            status.status === "completed" ? "text-green-600 font-semibold" :
+            status.status === "failed"    ? "text-red-600 font-semibold" :
+            "text-blue-600 font-semibold"
+          }>
+            {status.status === "running"   ? "⏳ 导入中..." :
+             status.status === "completed" ? "✅ 完成" : "❌ 失败"}
+          </span>
+          <span className="text-muted-foreground">
+            {totalRows} 行 · {(status.bytes_read / 1024 / 1024).toFixed(1)} MB · {status.elapsed_sec}s
+          </span>
+        </div>
+        {status.status === "running" && status.total_file_bytes && status.total_file_bytes > 0 && (
+          <Progress value={Math.min(100, status.bytes_read / status.total_file_bytes * 100)} className="h-2" />
+        )}
+        {Object.keys(status.counts).length > 0 && (
+          <div className="text-xs text-muted-foreground">
+            {Object.entries(status.counts).map(([t, n]) => `${t}: ${n}`).join(" · ")}
+          </div>
+        )}
+        {status.error && <div className="text-red-600 text-xs">{status.error}</div>}
+        {status.errors.length > 0 && (
+          <details className="text-xs">
+            <summary className="cursor-pointer text-yellow-600">
+              {status.errors.length} 个行级错误（点击展开）
+            </summary>
+            <pre className="mt-1 overflow-auto max-h-32">{status.errors.slice(0, 20).join("\n")}</pre>
+          </details>
+        )}
+      </div>
+    );
+  }
 
   return (
     <Card>
@@ -169,6 +246,7 @@ export function MigrationPanel() {
         <CardTitle>数据迁移（流式 NDJSON）</CardTitle>
       </CardHeader>
       <CardContent className="space-y-6">
+
         {/* 块 1：下载本实例完整数据 */}
         <div>
           <h3 className="font-semibold mb-2">📥 下载本实例完整数据</h3>
@@ -191,9 +269,26 @@ export function MigrationPanel() {
             disabled={uploading}
             className="block w-full text-sm"
           />
-          <p className="text-xs text-muted-foreground mt-2">
-            {uploading ? "上传中（流式处理，不在浏览器内存累积）..." : "支持任意大小文件，浏览器流式提交"}
-          </p>
+
+          {/* 上传进度条 */}
+          {uploading && uploadPhase === "upload" && (
+            <div className="mt-3 space-y-1">
+              <div className="flex justify-between text-xs text-muted-foreground">
+                <span>正在上传...</span>
+                <span>{uploadProgress}%</span>
+              </div>
+              <Progress value={uploadProgress} className="h-2" />
+            </div>
+          )}
+
+          {/* 导入进度 */}
+          {importStatus && <JobStatusBox status={importStatus} />}
+
+          {!uploading && !importStatus && (
+            <p className="text-xs text-muted-foreground mt-2">
+              支持任意大小文件，上传后在后台批量导入，实时显示进度
+            </p>
+          )}
         </div>
 
         {/* 块 3：从源端流式拉取 */}
@@ -224,39 +319,7 @@ export function MigrationPanel() {
             </div>
           </div>
 
-          {/* 实时进度 */}
-          {jobStatus && (
-            <div className="mt-3 p-3 bg-muted rounded text-sm space-y-1">
-              <div className="flex items-center gap-2">
-                <span className={
-                  jobStatus.status === "completed" ? "text-green-600 font-semibold" :
-                  jobStatus.status === "failed"    ? "text-red-600 font-semibold" :
-                  "text-blue-600 font-semibold"
-                }>
-                  {jobStatus.status === "running"   ? "⏳ 迁移中..." :
-                   jobStatus.status === "completed" ? "✅ 完成" :
-                   "❌ 失败"}
-                </span>
-                <span className="text-muted-foreground">
-                  {totalRows} 行 · {(jobStatus.bytes_read / 1024 / 1024).toFixed(1)} MB · {jobStatus.elapsed_sec}s
-                </span>
-              </div>
-              {Object.keys(jobStatus.counts).length > 0 && (
-                <div className="text-xs text-muted-foreground">
-                  {Object.entries(jobStatus.counts).map(([t, n]) => `${t}: ${n}`).join(" · ")}
-                </div>
-              )}
-              {jobStatus.error && (
-                <div className="text-red-600 text-xs">{jobStatus.error}</div>
-              )}
-              {jobStatus.errors.length > 0 && (
-                <details className="text-xs">
-                  <summary className="cursor-pointer text-yellow-600">{jobStatus.errors.length} 个行级错误（点击展开）</summary>
-                  <pre className="mt-1 overflow-auto max-h-32">{jobStatus.errors.slice(0, 20).join("\n")}</pre>
-                </details>
-              )}
-            </div>
-          )}
+          {jobStatus && <JobStatusBox status={jobStatus} />}
 
           {probeResult && (
             <pre className="mt-3 p-3 bg-muted text-xs overflow-auto max-h-64 rounded">
@@ -264,6 +327,7 @@ export function MigrationPanel() {
             </pre>
           )}
         </div>
+
       </CardContent>
     </Card>
   );

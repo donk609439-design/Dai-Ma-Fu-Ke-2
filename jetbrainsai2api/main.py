@@ -11017,11 +11017,8 @@ async def _upsert_one_row(conn, table: str, row: dict) -> None:
 
 @app.post("/admin/db-import-stream")
 async def admin_db_import_stream(request: Request):
-    """从请求体（NDJSON 流）流式 upsert 到当前 DB。
-
-    用途：管理员手动下载 .ndjson 文件后通过浏览器上传，或脚本工具直接 PUT。
-    请求体格式同 /admin/db-export-stream 输出。
-    使用 executemany 批量插入，速度比逐行插入快 10~50 倍。
+    """接收 NDJSON 文件上传，文件收完后立刻启动后台导入任务并返回 job_id。
+    客户端通过 GET /admin/migration-job/{job_id} 轮询导入进度。
     """
     if request.headers.get("X-Admin-Key", "") != ADMIN_KEY:
         return JSONResponse(status_code=403, content={"detail": "仅完整管理员可使用数据迁移接口"})
@@ -11029,135 +11026,146 @@ async def admin_db_import_stream(request: Request):
     if not pool:
         raise HTTPException(status_code=503, detail="DB unavailable")
 
-    counts: Dict[str, int] = {}
-    errors: list = []
-    current_table: Optional[str] = None
-    bytes_read = 0
-    started_at = time.time()
-    BATCH_INSERT = 500   # 每次 executemany 的行数
-    BATCH_COMMIT = 5000  # 每次 COMMIT 的行数
+    # 接收完整文件（上传阶段，前端 XHR 可在此期间显示上传进度）
+    chunks: list = []
+    async for chunk in request.stream():
+        if chunk:
+            chunks.append(chunk)
+    data = b"".join(chunks)
+    bytes_received = len(data)
+
+    job_id = uuid.uuid4().hex[:8]
+    _migration_jobs[job_id] = {
+        "status": "running",
+        "started_at": time.time(),
+        "counts": {},
+        "bytes_read": 0,
+        "total_file_bytes": bytes_received,
+        "errors": [],
+        "finished": False,
+    }
+    print(f"[bg-import:{job_id}] 启动，文件大小={bytes_received/1024/1024:.1f}MB", flush=True)
+    asyncio.ensure_future(_run_import_bg(job_id, data))
+    return {"job_id": job_id, "bytes_received": bytes_received}
+
+
+async def _run_import_bg(job_id: str, data: bytes) -> None:
+    """后台处理 NDJSON 文件导入，进度实时写入 _migration_jobs[job_id]。"""
+    job = _migration_jobs[job_id]
+    pool = await _get_db_pool()
+    if not pool:
+        job.update({"status": "failed", "error": "DB unavailable", "finished": True})
+        return
+
+    BATCH_INSERT = 500
+    BATCH_COMMIT = 5000
 
     conn = await pool.acquire()
-    try:
-        tx_box = [conn.transaction()]
-        await tx_box[0].start()
-        rows_in_tx = [0]
-        row_buffer: list = []
+    current_table: Optional[str] = None
+    row_buffer: list = []
+    tx_box = [conn.transaction()]
+    await tx_box[0].start()
+    rows_in_tx = [0]
 
-        async def _flush_import(tbl: Optional[str]) -> None:
-            if not row_buffer or not tbl:
-                row_buffer.clear()
-                return
-            known = await _get_table_columns(conn, tbl)
-            sample = {k: v for k, v in row_buffer[0].items() if k in known}
-            cols = list(sample.keys())
-            if not cols:
-                row_buffer.clear()
-                return
-
-            conflict_col   = _TABLE_CONFLICT_COL.get(tbl)
-            conflict_multi = _TABLE_CONFLICT_MULTI.get(tbl)
-            ph = "(" + ", ".join(f"${i+1}" for i in range(len(cols))) + ")"
-            cn = ", ".join(f'"{c}"' for c in cols)
-
-            if conflict_multi and all(c in cols for c in conflict_multi):
-                target = "(" + ", ".join(f'"{c}"' for c in conflict_multi) + ")"
-                uc = [c for c in cols if c not in conflict_multi]
-                sc = ", ".join(f'"{c}"=EXCLUDED."{c}"' for c in uc)
-                sql = (f'INSERT INTO "{tbl}" ({cn}) VALUES {ph} ON CONFLICT {target} '
-                       f'DO UPDATE SET {sc}') if uc else (
-                       f'INSERT INTO "{tbl}" ({cn}) VALUES {ph} ON CONFLICT {target} DO NOTHING')
-            elif conflict_col and conflict_col in cols:
-                uc = [c for c in cols if c != conflict_col]
-                sc = ", ".join(f'"{c}"=EXCLUDED."{c}"' for c in uc)
-                sql = (f'INSERT INTO "{tbl}" ({cn}) VALUES {ph} ON CONFLICT ("{conflict_col}") '
-                       f'DO UPDATE SET {sc}') if uc else (
-                       f'INSERT INTO "{tbl}" ({cn}) VALUES {ph} ON CONFLICT ("{conflict_col}") DO NOTHING')
-            else:
-                sql = f'INSERT INTO "{tbl}" ({cn}) VALUES {ph} ON CONFLICT DO NOTHING'
-
-            args = [tuple(_coerce_json_value(r.get(c)) for c in cols) for r in row_buffer]
-            try:
-                await conn.executemany(sql, args)
-                n = len(row_buffer)
-                counts[tbl] = counts.get(tbl, 0) + n
-                rows_in_tx[0] += n
-            except Exception as ex:
-                errors.append(f"{tbl} batch({len(row_buffer)}): {type(ex).__name__}: {ex}")
-                try: await tx_box[0].rollback()
-                except Exception: pass
-                tx_box[0] = conn.transaction()
-                await tx_box[0].start()
-                rows_in_tx[0] = 0
+    async def _flush(tbl: Optional[str]) -> None:
+        if not row_buffer or not tbl:
             row_buffer.clear()
+            return
+        known = await _get_table_columns(conn, tbl)
+        sample = {k: v for k, v in row_buffer[0].items() if k in known}
+        cols = list(sample.keys())
+        if not cols:
+            row_buffer.clear()
+            return
 
-            if rows_in_tx[0] >= BATCH_COMMIT:
-                await tx_box[0].commit()
-                tx_box[0] = conn.transaction()
-                await tx_box[0].start()
-                rows_in_tx[0] = 0
+        conflict_col   = _TABLE_CONFLICT_COL.get(tbl)
+        conflict_multi = _TABLE_CONFLICT_MULTI.get(tbl)
+        ph = "(" + ", ".join(f"${i+1}" for i in range(len(cols))) + ")"
+        cn = ", ".join(f'"{c}"' for c in cols)
 
-        # 使用 bytearray 避免大文件下 bytes 反复拼接的内存开销
-        buf = bytearray()
-        async for chunk in request.stream():
-            if not chunk:
+        if conflict_multi and all(c in cols for c in conflict_multi):
+            target = "(" + ", ".join(f'"{c}"' for c in conflict_multi) + ")"
+            uc = [c for c in cols if c not in conflict_multi]
+            sc = ", ".join(f'"{c}"=EXCLUDED."{c}"' for c in uc)
+            sql = (f'INSERT INTO "{tbl}" ({cn}) VALUES {ph} ON CONFLICT {target} '
+                   f'DO UPDATE SET {sc}') if uc else (
+                   f'INSERT INTO "{tbl}" ({cn}) VALUES {ph} ON CONFLICT {target} DO NOTHING')
+        elif conflict_col and conflict_col in cols:
+            uc = [c for c in cols if c != conflict_col]
+            sc = ", ".join(f'"{c}"=EXCLUDED."{c}"' for c in uc)
+            sql = (f'INSERT INTO "{tbl}" ({cn}) VALUES {ph} ON CONFLICT ("{conflict_col}") '
+                   f'DO UPDATE SET {sc}') if uc else (
+                   f'INSERT INTO "{tbl}" ({cn}) VALUES {ph} ON CONFLICT ("{conflict_col}") DO NOTHING')
+        else:
+            sql = f'INSERT INTO "{tbl}" ({cn}) VALUES {ph} ON CONFLICT DO NOTHING'
+
+        args = [tuple(_coerce_json_value(r.get(c)) for c in cols) for r in row_buffer]
+        try:
+            await conn.executemany(sql, args)
+            n = len(row_buffer)
+            job["counts"][tbl] = job["counts"].get(tbl, 0) + n
+            rows_in_tx[0] += n
+        except Exception as ex:
+            job["errors"].append(f"{tbl} batch({len(row_buffer)}): {type(ex).__name__}: {ex}")
+            try: await tx_box[0].rollback()
+            except Exception: pass
+            tx_box[0] = conn.transaction()
+            await tx_box[0].start()
+            rows_in_tx[0] = 0
+        row_buffer.clear()
+
+        if rows_in_tx[0] >= BATCH_COMMIT:
+            await tx_box[0].commit()
+            tx_box[0] = conn.transaction()
+            await tx_box[0].start()
+            rows_in_tx[0] = 0
+
+    try:
+        for raw_line in data.split(b"\n"):
+            raw_line = raw_line.strip()
+            if not raw_line:
                 continue
-            bytes_read += len(chunk)
-            buf.extend(chunk)
-            while b"\n" in buf:
-                idx = buf.index(b"\n")
-                raw_line = bytes(buf[:idx]).strip()
-                del buf[:idx + 1]
-                if not raw_line:
-                    continue
-                try:
-                    obj = json.loads(raw_line)
-                except Exception as e:
-                    errors.append(f"JSON parse: {type(e).__name__}: {raw_line[:120]!r}")
-                    continue
-
-                if "_meta" in obj:
-                    continue
-                if "_table" in obj:
-                    await _flush_import(current_table)
-                    tbl = obj["_table"]
-                    current_table = tbl if tbl in _EXPORT_TABLES else None
-                    if current_table:
-                        counts.setdefault(current_table, 0)
-                    continue
-                if "_error" in obj:
-                    errors.append(f"source error: {obj['_error']}")
-                    continue
-                if not current_table:
-                    continue
-
-                row_buffer.append(obj)
-                if len(row_buffer) >= BATCH_INSERT:
-                    await _flush_import(current_table)
-
-        # 处理末尾残留
-        if buf.strip():
+            job["bytes_read"] += len(raw_line) + 1
             try:
-                obj = json.loads(bytes(buf).strip())
-                if "_meta" not in obj and "_error" not in obj and "_table" not in obj and current_table:
-                    row_buffer.append(obj)
+                obj = json.loads(raw_line)
             except Exception as e:
-                errors.append(f"tail line failed: {e}")
-        await _flush_import(current_table)
-        await tx_box[0].commit()
+                job["errors"].append(f"JSON parse: {type(e).__name__}: {raw_line[:80]!r}")
+                continue
 
+            if "_meta" in obj:
+                continue
+            if "_table" in obj:
+                await _flush(current_table)
+                tbl = obj["_table"]
+                current_table = tbl if tbl in _EXPORT_TABLES else None
+                if current_table:
+                    job["counts"].setdefault(current_table, 0)
+                continue
+            if "_error" in obj:
+                job["errors"].append(f"source error: {obj['_error']}")
+                continue
+            if not current_table:
+                continue
+
+            row_buffer.append(obj)
+            if len(row_buffer) >= BATCH_INSERT:
+                await _flush(current_table)
+
+        await _flush(current_table)
+        await tx_box[0].commit()
     except Exception as e:
         try: await tx_box[0].rollback()
-        except: pass
-        return JSONResponse(status_code=500, content={
+        except Exception: pass
+        job.update({
+            "status": "failed",
             "error": f"导入失败: {type(e).__name__}: {e}",
-            "imported_so_far": counts,
-            "bytes_read": bytes_read,
+            "finished": True,
+            "elapsed_sec": round(time.time() - job["started_at"], 1),
         })
+        return
     finally:
         await pool.release(conn)
 
-    # 重新加载内存
     try: await load_accounts_from_db()
     except: pass
     try: await load_keys_from_db()
@@ -11165,26 +11173,20 @@ async def admin_db_import_stream(request: Request):
     try: await load_cf_proxies_from_db()
     except: pass
 
-    if counts.get("jb_accounts", 0) > 0:
+    if job["counts"].get("jb_accounts", 0) > 0:
         try:
             async with pool.acquire() as conn2:
-                rows = await conn2.fetch(
+                rows2 = await conn2.fetch(
                     "SELECT id FROM jb_accounts WHERE COALESCE(last_quota_check, 0) = 0 LIMIT 5000"
                 )
-                _schedule_quota_checks_for_ids({r["id"] for r in rows}, label="db-import-stream入池检测")
+                _schedule_quota_checks_for_ids({r["id"] for r in rows2}, label="bg-import入池检测")
         except Exception:
             pass
 
-    return {
-        "success":  True,
-        "imported": counts,
-        "errors":   errors[:50],
-        "stats": {
-            "elapsed_sec":  round(time.time() - started_at, 1),
-            "bytes_read":   bytes_read,
-            "errors_total": len(errors),
-        },
-    }
+    total = sum(job["counts"].values())
+    elapsed = round(time.time() - job["started_at"], 1)
+    print(f"[bg-import:{job_id}] 完成：{total}行 / {elapsed}s / 错误{len(job['errors'])}个", flush=True)
+    job.update({"status": "completed", "finished": True, "elapsed_sec": elapsed})
 
 
 @app.post("/admin/import-from-source-stream")
