@@ -10929,8 +10929,30 @@ async def admin_db_export_stream(request: Request):
     )
 
 
+# 目标表列名缓存（进程级，避免每行查 pg_attribute）
+_table_columns_cache: Dict[str, set] = {}
+
+
+async def _get_table_columns(conn, table: str) -> set:
+    """查询并缓存目标表实际存在的列名集合。"""
+    if table not in _table_columns_cache:
+        rows = await conn.fetch(
+            "SELECT column_name FROM information_schema.columns WHERE table_name = $1",
+            table,
+        )
+        _table_columns_cache[table] = {r["column_name"] for r in rows}
+    return _table_columns_cache[table]
+
+
 async def _upsert_one_row(conn, table: str, row: dict) -> None:
-    """单行 upsert 核心逻辑（被 db-import-stream 和 import-from-source-stream 复用）"""
+    """单行 upsert 核心逻辑（被 db-import-stream 和 import-from-source-stream 复用）。
+    自动过滤目标表不存在的列，防止因 schema 差异导致 UndefinedColumnError。
+    """
+    # 过滤掉目标表不存在的列（源端可能有目标端尚未迁移的字段）
+    known = await _get_table_columns(conn, table)
+    if known:
+        row = {k: v for k, v in row.items() if k in known}
+
     cols = list(row.keys())
     if not cols:
         return
@@ -11029,6 +11051,14 @@ async def admin_db_import_stream(request: Request):
                     rows_in_tx += 1
                 except Exception as e:
                     errors.append(f"{current_table} row failed: {type(e).__name__}: {e}")
+                    # 事务已中止，回滚后重开，防止级联失败
+                    try:
+                        await tx.rollback()
+                    except Exception:
+                        pass
+                    tx = conn.transaction()
+                    await tx.start()
+                    rows_in_tx = 0
 
                 if rows_in_tx >= BATCH_COMMIT:
                     await tx.commit()
@@ -11283,6 +11313,14 @@ async def _run_migration_bg(job_id: str, source_url: str, source_key: str) -> No
                             rows_in_tx += 1
                         except Exception as e:
                             job["errors"].append(f"{current_table} row: {type(e).__name__}: {e}")
+                            # 事务已中止，必须回滚后重开，否则后续所有行都级联失败
+                            try:
+                                await tx.rollback()
+                            except Exception:
+                                pass
+                            tx = conn.transaction()
+                            await tx.start()
+                            rows_in_tx = 0
 
                         if rows_in_tx >= BATCH_COMMIT:
                             await tx.commit()
