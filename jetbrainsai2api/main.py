@@ -11217,6 +11217,162 @@ async def admin_import_from_source_stream(request: Request, data: dict = Body(..
     }
 
 
+# ── 后台迁移任务（绕过 Autoscale 5 分钟代理超时）────────────────────────
+_migration_jobs: Dict[str, dict] = {}
+
+
+async def _run_migration_bg(job_id: str, source_url: str, source_key: str) -> None:
+    """后台执行迁移，进度实时写入 _migration_jobs[job_id]，不占用 HTTP 连接。"""
+    job = _migration_jobs[job_id]
+    pool = await _get_db_pool()
+    if not pool:
+        job.update({"status": "failed", "error": "DB unavailable", "finished": True})
+        return
+
+    BATCH_COMMIT = 500
+    timeout = httpx.Timeout(connect=30.0, read=900.0, write=30.0, pool=300.0)
+    async with httpx.AsyncClient(verify=False, timeout=timeout) as client:
+        try:
+            async with client.stream(
+                "GET",
+                f"{source_url}/admin/db-export-stream",
+                headers={"X-Admin-Key": source_key},
+            ) as resp:
+                if resp.status_code != 200:
+                    body_preview = await resp.aread()
+                    job.update({
+                        "status": "failed",
+                        "error": f"源端返回 HTTP {resp.status_code}: {body_preview[:200].decode('utf-8', errors='replace')}",
+                        "finished": True,
+                    })
+                    return
+
+                conn = await pool.acquire()
+                current_table: Optional[str] = None
+                try:
+                    tx = conn.transaction()
+                    await tx.start()
+                    rows_in_tx = 0
+
+                    async for line in resp.aiter_lines():
+                        if not line or not line.strip():
+                            continue
+                        job["bytes_read"] += len(line) + 1
+                        try:
+                            obj = json.loads(line)
+                        except Exception as e:
+                            job["errors"].append(f"JSON parse: {type(e).__name__}: {line[:120]}")
+                            continue
+
+                        if "_meta" in obj:
+                            continue
+                        if "_table" in obj:
+                            tbl = obj["_table"]
+                            current_table = tbl if tbl in _EXPORT_TABLES else None
+                            if current_table:
+                                job["counts"].setdefault(current_table, 0)
+                            continue
+                        if "_error" in obj:
+                            job["errors"].append(f"source error: {obj['_error']}")
+                            continue
+                        if not current_table:
+                            continue
+                        try:
+                            await _upsert_one_row(conn, current_table, obj)
+                            job["counts"][current_table] = job["counts"].get(current_table, 0) + 1
+                            rows_in_tx += 1
+                        except Exception as e:
+                            job["errors"].append(f"{current_table} row: {type(e).__name__}: {e}")
+
+                        if rows_in_tx >= BATCH_COMMIT:
+                            await tx.commit()
+                            tx = conn.transaction()
+                            await tx.start()
+                            rows_in_tx = 0
+
+                    await tx.commit()
+                finally:
+                    await pool.release(conn)
+
+        except httpx.ReadTimeout:
+            job.update({
+                "status": "failed",
+                "error": "源端响应读超时（>15 分钟），数据量过大或网络中断",
+                "finished": True,
+                "elapsed_sec": round(time.time() - job["started_at"], 1),
+            })
+            return
+        except Exception as e:
+            job.update({
+                "status": "failed",
+                "error": f"流式拉取失败: {type(e).__name__}: {e}",
+                "finished": True,
+                "elapsed_sec": round(time.time() - job["started_at"], 1),
+            })
+            return
+
+    try: await load_accounts_from_db()
+    except: pass
+    try: await load_keys_from_db()
+    except: pass
+    try: await load_cf_proxies_from_db()
+    except: pass
+
+    if job["counts"].get("jb_accounts", 0) > 0:
+        try:
+            async with pool.acquire() as conn2:
+                rows = await conn2.fetch(
+                    "SELECT id FROM jb_accounts WHERE COALESCE(last_quota_check, 0) = 0 LIMIT 5000"
+                )
+                _schedule_quota_checks_for_ids({r["id"] for r in rows}, label="bg-migration入池检测")
+        except Exception:
+            pass
+
+    job.update({
+        "status": "completed",
+        "finished": True,
+        "elapsed_sec": round(time.time() - job["started_at"], 1),
+    })
+
+
+@app.post("/admin/start-migration-bg")
+async def admin_start_migration_bg(request: Request, data: dict = Body(...)):
+    """启动后台迁移，立即返回 job_id（不阻塞 HTTP 连接，绕过 5 分钟代理超时）。
+    通过 GET /admin/migration-job/{job_id} 轮询进度。
+    """
+    if request.headers.get("X-Admin-Key", "") != ADMIN_KEY:
+        return JSONResponse(status_code=403, content={"detail": "仅完整管理员可使用数据迁移接口"})
+    source_url = (data.get("source_url") or "").rstrip("/")
+    source_key = data.get("source_admin_key") or ADMIN_KEY
+    if not source_url:
+        return JSONResponse(status_code=400, content={"error": "source_url required"})
+
+    job_id = uuid.uuid4().hex[:8]
+    _migration_jobs[job_id] = {
+        "status": "running",
+        "started_at": time.time(),
+        "counts": {},
+        "bytes_read": 0,
+        "errors": [],
+        "finished": False,
+    }
+    asyncio.ensure_future(_run_migration_bg(job_id, source_url, source_key))
+    return {"job_id": job_id, "status": "started"}
+
+
+@app.get("/admin/migration-job/{job_id}")
+async def admin_migration_job_status(job_id: str, request: Request):
+    """轮询后台迁移任务进度（供前端每 2 秒调用一次）。"""
+    if request.headers.get("X-Admin-Key", "") != ADMIN_KEY:
+        return JSONResponse(status_code=403, content={"detail": "权限不足"})
+    job = _migration_jobs.get(job_id)
+    if not job:
+        return JSONResponse(status_code=404, content={"error": "任务不存在或服务已重启（状态丢失）"})
+    total_rows = sum(job["counts"].values())
+    elapsed = job.get("elapsed_sec") or round(time.time() - job["started_at"], 1)
+    return {**job, "total_rows": total_rows, "elapsed_sec": elapsed}
+
+
 @app.post("/admin/migration-probe-stream")
 async def admin_migration_probe_stream(request: Request, data: dict = Body(...)):
     """诊断模式：探测源端 /admin/db-export-stream 是否可达，仅读前 64 KB 用于排错"""
