@@ -1,7 +1,7 @@
 import { useState, useEffect } from "react";
 import { useLocation } from "wouter";
-import { Shield, LogOut, Eye, EyeOff, Loader2, UserPlus, RefreshCw } from "lucide-react";
-import { getAdminKey, setAdminKey, clearAdminKey, adminFetch, getApiBase, setAdminRole, type AdminRole } from "@/lib/admin-auth";
+import { Shield, LogOut, Eye, EyeOff, Loader2, UserPlus, RefreshCw, Settings2 } from "lucide-react";
+import { getAdminKey, setAdminKey, clearAdminKey, adminFetch, getApiBase, setApiBase, setAdminRole, type AdminRole } from "@/lib/admin-auth";
 
 interface AdminGateProps {
   children: React.ReactNode;
@@ -14,6 +14,13 @@ export default function AdminGate({ children }: AdminGateProps) {
   const [show, setShow] = useState(false);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+  const [showApiSettings, setShowApiSettings] = useState(false);
+  const [apiBaseInput, setApiBaseInput] = useState(() => {
+    const saved = typeof window !== "undefined"
+      ? (localStorage.getItem("jb_api_base") ?? "")
+      : "";
+    return saved;
+  });
   // 是否处于"有存储 key 但验证失败"的重连模式
   const [reconnecting, setReconnecting] = useState(false);
 
@@ -80,6 +87,8 @@ export default function AdminGate({ children }: AdminGateProps) {
     setLoading(true);
     setError("");
 
+    // 先把自定义 API 地址存入 localStorage，getApiBase() 随即生效
+    setApiBase(apiBaseInput.trim());
     const base = getApiBase();
 
     const tryLogin = async (retries: number): Promise<void> => {
