@@ -8,6 +8,7 @@ import queue
 import random as _random
 import re
 import secrets
+from datetime import datetime as _dt
 import time
 import uuid
 import asyncio
@@ -10932,6 +10933,21 @@ async def admin_db_export_stream(request: Request):
 # 目标表列名缓存（进程级，避免每行查 pg_attribute）
 _table_columns_cache: Dict[str, set] = {}
 
+# 时间戳字符串正则（json.dumps(default=str) 会把 datetime 转为字符串）
+_TS_RE = re.compile(r'^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}')
+
+
+def _coerce_json_value(v):
+    """将 JSON 导出中被序列化为字符串的 datetime 还原为 datetime 对象。
+    asyncpg 不接受字符串形式的时间戳，必须传真正的 datetime 实例。
+    """
+    if isinstance(v, str) and _TS_RE.match(v):
+        try:
+            return _dt.fromisoformat(v)
+        except ValueError:
+            pass
+    return v
+
 
 async def _get_table_columns(conn, table: str) -> set:
     """查询并缓存目标表实际存在的列名集合。"""
@@ -10967,7 +10983,8 @@ async def _upsert_one_row(conn, table: str, row: dict) -> None:
         return
     placeholders = ", ".join(f"${i+1}" for i in range(len(cols)))
     col_names    = ", ".join(f'"{c}"' for c in cols)
-    values       = [row[c] for c in cols]
+    # _coerce_json_value 将时间戳字符串还原为 datetime 对象（json.dumps 序列化时变为字符串）
+    values       = [_coerce_json_value(row[c]) for c in cols]
 
     conflict_col   = _TABLE_CONFLICT_COL.get(table)
     conflict_multi = _TABLE_CONFLICT_MULTI.get(table)
