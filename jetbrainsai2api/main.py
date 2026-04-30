@@ -11192,37 +11192,53 @@ async def _run_import_bg(job_id: str, data: bytes) -> None:
 # ── 分块上传三步接口（解决 Cloud Run ≤32 MB 单请求限制）────────────────────
 
 @app.post("/admin/db-import-start")
-async def admin_db_import_start(request: Request):
-    """第一步：创建上传会话，返回 session_id。"""
+async def admin_db_import_start(request: Request, compressed: Optional[str] = None):
+    """第一步：创建上传会话，返回 session_id。
+    ?compressed=gzip 时 finish 阶段自动解压。
+    """
     if request.headers.get("X-Admin-Key", "") != ADMIN_KEY:
         return JSONResponse(status_code=403, content={"detail": "forbidden"})
     session_id = uuid.uuid4().hex[:12]
-    _import_sessions[session_id] = bytearray()
+    # chunks dict 按索引存储，支持并发乱序到达
+    _import_sessions[session_id] = {"chunks": {}, "compressed": compressed}
     return {"session_id": session_id}
 
 
-@app.post("/admin/db-import-chunk/{session_id}")
-async def admin_db_import_chunk(session_id: str, request: Request):
-    """第二步（重复多次）：追加一个数据块（≤8 MB）到会话缓冲区。"""
+@app.post("/admin/db-import-chunk/{session_id}/{chunk_index}")
+async def admin_db_import_chunk(session_id: str, chunk_index: int, request: Request):
+    """第二步（多个块可并发发送）：按索引存储数据块，无需串行等待。"""
     if request.headers.get("X-Admin-Key", "") != ADMIN_KEY:
         return JSONResponse(status_code=403, content={"detail": "forbidden"})
-    if session_id not in _import_sessions:
+    sess = _import_sessions.get(session_id)
+    if sess is None:
         return JSONResponse(status_code=404, content={"error": "session not found (server may have restarted)"})
+    pieces: list = []
     async for chunk in request.stream():
         if chunk:
-            _import_sessions[session_id].extend(chunk)
-    return {"session_id": session_id, "buffered_bytes": len(_import_sessions[session_id])}
+            pieces.append(chunk)
+    sess["chunks"][chunk_index] = b"".join(pieces)
+    total_buf = sum(len(v) for v in sess["chunks"].values())
+    return {"session_id": session_id, "chunk_index": chunk_index, "buffered_bytes": total_buf}
 
 
 @app.post("/admin/db-import-finish/{session_id}")
 async def admin_db_import_finish(session_id: str, request: Request):
-    """第三步：所有块上传完毕，启动后台导入任务，返回 job_id。"""
+    """第三步：所有块上传完毕后调用。按索引重组数据，可选 gzip 解压，启动后台导入。"""
     if request.headers.get("X-Admin-Key", "") != ADMIN_KEY:
         return JSONResponse(status_code=403, content={"detail": "forbidden"})
-    buf = _import_sessions.pop(session_id, None)
-    if buf is None:
+    sess = _import_sessions.pop(session_id, None)
+    if sess is None:
         return JSONResponse(status_code=404, content={"error": "session not found"})
-    data_bytes = bytes(buf)
+    chunks_dict: dict = sess["chunks"]
+    # 按块索引顺序重组
+    data_bytes = b"".join(chunks_dict[i] for i in sorted(chunks_dict.keys()))
+    # 按需解压
+    if sess.get("compressed") == "gzip":
+        import gzip as _gzip
+        try:
+            data_bytes = _gzip.decompress(data_bytes)
+        except Exception as gz_err:
+            return JSONResponse(status_code=400, content={"error": f"gzip decompress failed: {gz_err}"})
     job_id = uuid.uuid4().hex[:8]
     _migration_jobs[job_id] = {
         "status": "running",
@@ -11233,7 +11249,8 @@ async def admin_db_import_finish(session_id: str, request: Request):
         "errors": [],
         "finished": False,
     }
-    print(f"[bg-import:{job_id}] session={session_id} 启动，{len(data_bytes)/1024/1024:.1f}MB", flush=True)
+    print(f"[bg-import:{job_id}] session={session_id} {len(chunks_dict)}块 "
+          f"{len(data_bytes)/1024/1024:.1f}MB compressed={sess.get('compressed')}", flush=True)
     asyncio.ensure_future(_run_import_bg(job_id, data_bytes))
     return {"job_id": job_id, "bytes": len(data_bytes)}
 

@@ -27,7 +27,7 @@ export function MigrationPanel() {
   const [downloading,     setDownloading]     = useState(false);
   const [uploading,       setUploading]       = useState(false);
   const [uploadProgress,  setUploadProgress]  = useState(0);
-  const [uploadPhase,     setUploadPhase]     = useState<"upload"|"import"|null>(null);
+  const [uploadPhase,     setUploadPhase]     = useState<"compress"|"upload"|"import"|null>(null);
   const [importStatus,    setImportStatus]    = useState<JobStatus | null>(null);
 
   const [pulling,         setPulling]         = useState(false);
@@ -62,7 +62,8 @@ export function MigrationPanel() {
   }
 
   // ── 上传文件导入 ──────────────────────────────────────────────────────────
-  const CHUNK_SIZE = 8 * 1024 * 1024; // 8 MB，小于 Cloud Run 32 MB 限制
+  const CHUNK_SIZE  = 16 * 1024 * 1024; // 16 MB（压缩后通常 <2 MB，远低于 Cloud Run 32 MB 限制）
+  const CONCURRENCY = 4;                // 4 路并发上传
 
   function stopUploadPoll() {
     if (uploadPollTimer.current) { clearInterval(uploadPollTimer.current); uploadPollTimer.current = null; }
@@ -88,51 +89,32 @@ export function MigrationPanel() {
     } catch { /* 网络抖动静默重试 */ }
   }
 
-  /** 将 File 按 \n 行边界切成 ≤ CHUNK_SIZE 的 Blob 数组 */
-  async function splitIntoChunks(file: File): Promise<Blob[]> {
-    const buf = await file.arrayBuffer();
-    const bytes = new Uint8Array(buf);
+  /** gzip 压缩 Blob（使用浏览器原生 CompressionStream） */
+  async function gzipBlob(blob: Blob): Promise<Blob> {
+    const cs = new CompressionStream("gzip");
+    const compressed = blob.stream().pipeThrough(cs);
+    return new Response(compressed).blob();
+  }
+
+  /** 将 Blob 按字节偏移切成 ≤ CHUNK_SIZE 的 Blob 数组（压缩后数据无行边界要求） */
+  function splitIntoChunks(blob: Blob): Blob[] {
     const chunks: Blob[] = [];
-    let start = 0;
-    while (start < bytes.length) {
-      let end = Math.min(start + CHUNK_SIZE, bytes.length);
-      // 若不是最后一块，向后找最近的 \n（0x0a）作为切割点
-      if (end < bytes.length) {
-        let nl = end;
-        while (nl > start && bytes[nl] !== 0x0a) nl--;
-        if (nl > start) end = nl + 1; // 含 \n
-      }
-      chunks.push(new Blob([bytes.subarray(start, end)]));
-      start = end;
+    for (let start = 0; start < blob.size; start += CHUNK_SIZE) {
+      chunks.push(blob.slice(start, start + CHUNK_SIZE));
     }
     return chunks;
   }
 
-  /** XHR 上传单个 Blob，返回解析后的 JSON */
-  function xhrPost(url: string, body: Blob | null, onProgress?: (pct: number) => void): Promise<unknown> {
-    return new Promise((resolve, reject) => {
-      const xhr = new XMLHttpRequest();
-      if (onProgress) {
-        xhr.upload.onprogress = (e) => {
-          if (e.lengthComputable) onProgress(Math.round(e.loaded / e.total * 100));
-        };
-      }
-      xhr.onload = () => {
-        if (xhr.status >= 200 && xhr.status < 300) {
-          try { resolve(JSON.parse(xhr.responseText)); }
-          catch { resolve(xhr.responseText); }
-        } else {
-          const text = xhr.responseText.slice(0, 300).replace(/<[^>]+>/g, " ").trim();
-          reject(new Error(`HTTP ${xhr.status}: ${text}`));
-        }
-      };
-      xhr.onerror   = () => reject(new Error("网络错误"));
-      xhr.ontimeout = () => reject(new Error("请求超时"));
-      xhr.open("POST", url);
-      xhr.setRequestHeader("X-Admin-Key", getAdminKey() ?? "");
-      if (body) xhr.setRequestHeader("Content-Type", "application/octet-stream");
-      xhr.send(body);
-    });
+  /** fetch POST 单个 Blob，返回解析后的 JSON（简单封装，利于 Promise.all） */
+  async function postChunk(url: string, body: Blob | null): Promise<unknown> {
+    const headers: Record<string, string> = { "X-Admin-Key": getAdminKey() ?? "" };
+    if (body) headers["Content-Type"] = "application/octet-stream";
+    const r = await fetch(url, { method: "POST", headers, body });
+    if (!r.ok) {
+      const text = (await r.text()).slice(0, 300).replace(/<[^>]+>/g, " ").trim();
+      throw new Error(`HTTP ${r.status}: ${text}`);
+    }
+    return r.json();
   }
 
   async function handleUpload(file: File) {
@@ -140,35 +122,41 @@ export function MigrationPanel() {
 
     setUploading(true);
     setUploadProgress(0);
-    setUploadPhase("upload");
+    setUploadPhase("compress");
     setImportStatus(null);
 
     try {
-      // Step 1: 创建会话
-      const startData = await xhrPost("/admin/db-import-start", null) as { session_id: string };
+      // Step 0: gzip 压缩（NDJSON 文本压缩率约 10:1，大幅减少传输量）
+      const compressed = await gzipBlob(file);
+      setUploadPhase("upload");
+      const compMB = (compressed.size / 1024 / 1024).toFixed(1);
+      const origMB = (file.size / 1024 / 1024).toFixed(1);
+      console.log(`[upload] gzip ${origMB}MB → ${compMB}MB`);
+
+      // Step 1: 创建会话（告知服务端数据已 gzip 压缩）
+      const startData = await postChunk("/admin/db-import-start?compressed=gzip", null) as { session_id: string };
       const sessionId = startData.session_id;
 
-      // Step 2: 切块并逐块上传
-      const chunks = await splitIntoChunks(file);
+      // Step 2: 切块并 4 路并发上传
+      const chunks = splitIntoChunks(compressed);
       const total = chunks.length;
-      for (let i = 0; i < total; i++) {
-        await xhrPost(
-          `/admin/db-import-chunk/${sessionId}`,
-          chunks[i],
-          (pct) => setUploadProgress(Math.round((i / total + pct / 100 / total) * 100)),
+      let done = 0;
+      for (let i = 0; i < total; i += CONCURRENCY) {
+        const batch = chunks.slice(i, i + CONCURRENCY);
+        await Promise.all(
+          batch.map((chunk, j) => postChunk(`/admin/db-import-chunk/${sessionId}/${i + j}`, chunk))
         );
-        setUploadProgress(Math.round((i + 1) / total * 100));
+        done = Math.min(i + CONCURRENCY, total);
+        setUploadProgress(Math.round(done / total * 100));
       }
 
-      // Step 3: 通知服务端上传完毕，启动后台导入
+      // Step 3: 通知服务端组装 + 启动后台导入
       setUploadPhase("import");
-      setUploadProgress(100);
-      const finishData = await xhrPost(`/admin/db-import-finish/${sessionId}`, null) as { job_id: string };
-      const jobId = finishData.job_id;
+      const finishData = await postChunk(`/admin/db-import-finish/${sessionId}`, null) as { job_id: string };
 
       // Step 4: 轮询导入进度
-      await pollImportJob(jobId);
-      uploadPollTimer.current = setInterval(() => pollImportJob(jobId), 2000);
+      await pollImportJob(finishData.job_id);
+      uploadPollTimer.current = setInterval(() => pollImportJob(finishData.job_id), 2000);
     } catch (e: unknown) {
       setUploading(false);
       setUploadPhase(null);
@@ -311,11 +299,16 @@ export function MigrationPanel() {
             className="block w-full text-sm"
           />
 
-          {/* 上传进度条 */}
+          {/* 三阶段进度显示 */}
+          {uploading && uploadPhase === "compress" && (
+            <div className="mt-3 text-xs text-muted-foreground animate-pulse">
+              ⚙️ 正在 gzip 压缩（通常压缩到原大小 1/10）...
+            </div>
+          )}
           {uploading && uploadPhase === "upload" && (
             <div className="mt-3 space-y-1">
               <div className="flex justify-between text-xs text-muted-foreground">
-                <span>正在上传（分块传输，每块 ≤8 MB）...</span>
+                <span>🚀 正在上传（4 路并发，压缩后传输）</span>
                 <span>{uploadProgress}%</span>
               </div>
               <Progress value={uploadProgress} className="h-2" />
