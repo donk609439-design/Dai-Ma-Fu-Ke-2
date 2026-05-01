@@ -3762,6 +3762,16 @@ def _convert_openai_messages_to_jetbrains(
     if not jetbrains_messages:
         # 防御性兜底：所有输入消息都是空白时，不把空 messages 发给上游
         jetbrains_messages.append({"type": "user_message", "content": "继续"})
+
+    # JetBrains 要求对话最后一条必须是 user_message；
+    # 如果客户端发来末尾 assistant 消息（prefill 技巧），直接移除，防止 400。
+    while jetbrains_messages and jetbrains_messages[-1].get("type") == "assistant_message":
+        jetbrains_messages.pop()
+
+    # 移除后若列表为空，补一条 user 消息兜底
+    if not jetbrains_messages:
+        jetbrains_messages.append({"type": "user_message", "content": "继续"})
+
     return jetbrains_messages
 
 
