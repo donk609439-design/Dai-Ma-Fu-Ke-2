@@ -2825,19 +2825,23 @@ async def _retry_pending_nc_lids():
                 async with httpx.AsyncClient(timeout=20) as hc:
                     r = await hc.post(req_url, json={"licenseId": lid}, headers=hdrs)
                 body_txt = r.text
-                # 若通过代理且得到 492，做一次直连对比验证
-                # 只有直连返回 200（真正 trusted）才覆盖；429/492/其他均以代理结果为准
+                # 若通过代理且得到 492，做一次直连对比验证（直连结果最权威）
                 if via_proxy and r.status_code == 492:
                     try:
                         direct_hdrs = {"Authorization": f"Bearer {id_token}",
                                        "User-Agent": "ktor-client", "Content-Type": "application/json"}
                         async with httpx.AsyncClient(timeout=20) as hc2:
                             r2 = await hc2.post(AI_URL, json={"licenseId": lid}, headers=direct_hdrs)
+                        direct_body = r2.text[:300].replace("\n", " ")
                         if r2.status_code == 200:
-                            # 直连拿到 trusted 结果，以直连为准
-                            _log(f"  [probe] {lid[:8]} 代理 492 但直连 200 trusted，以直连为准", "info")
+                            _log(f"  [probe] {lid[:8]} 代理492 直连200 trusted，以直连为准", "info")
                             return {"lid": lid, "status": 200, "body": r2.text}
-                        # 直连 429/492 等均正常，保持代理的 492 结果继续等待
+                        # 直连非200：打印真实返回，以直连结果为准
+                        _log(
+                            f"  [probe] {lid[:8]} 代理492 直连{r2.status_code}  直连body={direct_body!r}",
+                            "warn",
+                        )
+                        return {"lid": lid, "status": r2.status_code, "body": r2.text}
                     except Exception as de:
                         _log(f"  [probe] {lid[:8]} 直连对比失败: {de}", "warn")
                 return {"lid": lid, "status": r.status_code, "body": body_txt}
