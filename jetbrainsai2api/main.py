@@ -2367,6 +2367,14 @@ async def _make_jetbrains_raw_stream(account: dict, payload: dict, extra_headers
                     yield f"data: {err}\n\n"
                     yield "data: [DONE]\n\n"
                     return
+                if status == 413:
+                    body = await response.aread()
+                    body_str = body.decode("utf-8", errors="replace")
+                    print(f"[413] Account {acc_id} payload too large: {body_str[:300]}")
+                    err = json.dumps({"error": {"message": "请求内容过长，超出 JetBrains AI 单次请求限制，请缩短对话历史或 prompt 后重试", "type": "invalid_request_error", "code": "413"}})
+                    yield f"data: {err}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
                 response.raise_for_status()
                 async for line in response.aiter_lines():
                     yield line
@@ -2405,6 +2413,14 @@ async def _make_jetbrains_raw_stream(account: dict, payload: dict, extra_headers
                 body = getattr(e.response, "_content", b"")
                 body_str = body.decode("utf-8", errors="replace")
                 err = json.dumps({"error": {"message": f"JetBrains API 拒绝请求 (400): {body_str}", "type": "invalid_request_error", "code": "400"}})
+                yield f"data: {err}\n\n"
+                yield "data: [DONE]\n\n"
+                return
+            if code == 413:
+                body = getattr(e.response, "_content", b"")
+                body_str = body.decode("utf-8", errors="replace")
+                print(f"[413] Account {acc_id} payload too large (except): {body_str[:300]}")
+                err = json.dumps({"error": {"message": "请求内容过长，超出 JetBrains AI 单次请求限制，请缩短对话历史或 prompt 后重试", "type": "invalid_request_error", "code": "413"}})
                 yield f"data: {err}\n\n"
                 yield "data: [DONE]\n\n"
                 return
