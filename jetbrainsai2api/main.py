@@ -11083,13 +11083,23 @@ async def _run_import_bg(job_id: str, data: bytes) -> None:
             return
 
         # ── pokeball_members 特殊处理：用 ball_key JOIN 查目标库 id，避免跨环境 id 不一致 ──
-        if tbl == "pokeball_members" and row_buffer and "ball_key" in row_buffer[0]:
-            sql_pm = (
-                "INSERT INTO pokeball_members (pokeball_id, member_key)"
-                " SELECT p.id, $2 FROM pokeballs p WHERE p.ball_key = $1"
-                " ON CONFLICT (pokeball_id, member_key) DO NOTHING"
-            )
-            pm_args = [(r.get("ball_key"), r.get("member_key")) for r in row_buffer]
+        if tbl == "pokeball_members":
+            if "ball_key" in row_buffer[0]:
+                # 新格式：用 ball_key 解析目标库 pokeball_id（最安全）
+                sql_pm = (
+                    "INSERT INTO pokeball_members (pokeball_id, member_key)"
+                    " SELECT p.id, $2 FROM pokeballs p WHERE p.ball_key = $1"
+                    " ON CONFLICT (pokeball_id, member_key) DO NOTHING"
+                )
+                pm_args = [(r.get("ball_key"), r.get("member_key")) for r in row_buffer]
+            else:
+                # 旧格式：跳过 id 列（避免 PK 冲突），直接用 pokeball_id + member_key
+                sql_pm = (
+                    "INSERT INTO pokeball_members (pokeball_id, member_key)"
+                    " VALUES ($1, $2)"
+                    " ON CONFLICT (pokeball_id, member_key) DO NOTHING"
+                )
+                pm_args = [(r.get("pokeball_id"), r.get("member_key")) for r in row_buffer]
             try:
                 await conn.executemany(sql_pm, pm_args)
                 n = len(row_buffer)
@@ -11474,13 +11484,22 @@ async def _run_migration_bg(job_id: str, source_url: str, source_key: str) -> No
                         return
 
                     # ── pokeball_members 特殊处理：用 ball_key JOIN 查目标库 id ──
-                    if tbl == "pokeball_members" and "ball_key" in row_buffer[0]:
-                        sql_pm = (
-                            "INSERT INTO pokeball_members (pokeball_id, member_key)"
-                            " SELECT p.id, $2 FROM pokeballs p WHERE p.ball_key = $1"
-                            " ON CONFLICT (pokeball_id, member_key) DO NOTHING"
-                        )
-                        pm_args = [(r.get("ball_key"), r.get("member_key")) for r in row_buffer]
+                    if tbl == "pokeball_members":
+                        if "ball_key" in row_buffer[0]:
+                            sql_pm = (
+                                "INSERT INTO pokeball_members (pokeball_id, member_key)"
+                                " SELECT p.id, $2 FROM pokeballs p WHERE p.ball_key = $1"
+                                " ON CONFLICT (pokeball_id, member_key) DO NOTHING"
+                            )
+                            pm_args = [(r.get("ball_key"), r.get("member_key")) for r in row_buffer]
+                        else:
+                            # 旧格式：跳过 id 列（避免 PK 冲突）
+                            sql_pm = (
+                                "INSERT INTO pokeball_members (pokeball_id, member_key)"
+                                " VALUES ($1, $2)"
+                                " ON CONFLICT (pokeball_id, member_key) DO NOTHING"
+                            )
+                            pm_args = [(r.get("pokeball_id"), r.get("member_key")) for r in row_buffer]
                         try:
                             await conn.executemany(sql_pm, pm_args)
                             n = len(row_buffer)
