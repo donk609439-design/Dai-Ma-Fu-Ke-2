@@ -5896,6 +5896,21 @@ async def admin_user_items_export(request: Request):
     ]
 
 
+@app.post("/admin/reset-sequences")
+async def admin_reset_sequences(request: Request):
+    """一次性修复：重置所有 SERIAL 序列，解决迁移后新行 id 冲突问题。"""
+    if request.headers.get("X-Admin-Key", "") != ADMIN_KEY:
+        return JSONResponse(status_code=403, content={"error": "forbidden"})
+    pool = await _get_db_pool()
+    if not pool:
+        return JSONResponse(status_code=503, content={"error": "DB unavailable"})
+    async with pool.acquire() as conn:
+        msgs = await _reset_serial_sequences(conn)
+    for m in msgs:
+        print(m, flush=True)
+    return {"ok": True, "results": msgs}
+
+
 @app.get("/admin/pokeballs-export")
 async def admin_pokeballs_export(request: Request):
     """批量导出宝可梦球及成员（供跨环境迁移使用）"""
@@ -11059,6 +11074,39 @@ async def admin_db_import_stream(request: Request):
     return {"job_id": job_id, "bytes_received": bytes_received}
 
 
+_SERIAL_TABLES: list[tuple[str, str]] = [
+    ("user_items",                "id"),
+    ("pokeballs",                 "id"),
+    ("pokeball_members",          "id"),
+    ("account_contributions",     "id"),
+    ("partner_precheck_rejections","id"),
+    ("partner_api_audit",         "id"),
+    ("partner_idempotency",       "id"),
+    ("saint_donations",           "id"),
+    ("self_register_jobs",        "id"),
+]
+
+async def _reset_serial_sequences(conn) -> list[str]:
+    """导入完成后重置所有 SERIAL 序列，防止新行 id 冲突。返回执行日志。"""
+    msgs: list[str] = []
+    for tbl, col in _SERIAL_TABLES:
+        try:
+            row = await conn.fetchrow(
+                f'SELECT COALESCE(MAX("{col}"), 0) AS mx FROM "{tbl}"'
+            )
+            mx = row["mx"]
+            seq_row = await conn.fetchrow(
+                "SELECT pg_get_serial_sequence($1, $2) AS seq", tbl, col
+            )
+            seq = seq_row["seq"] if seq_row else None
+            if seq:
+                await conn.execute(f"SELECT setval('{seq}', $1, true)", max(mx, 1))
+                msgs.append(f"[seq-reset] {tbl}.{col} → {mx}")
+        except Exception as ex:
+            msgs.append(f"[seq-reset] {tbl}.{col} 跳过: {ex}")
+    return msgs
+
+
 async def _run_import_bg(job_id: str, data: bytes) -> None:
     """后台处理 NDJSON 文件导入，进度实时写入 _migration_jobs[job_id]。"""
     job = _migration_jobs[job_id]
@@ -11202,6 +11250,11 @@ async def _run_import_bg(job_id: str, data: bytes) -> None:
 
         await _flush(current_table)
         await tx_box[0].commit()
+        # 重置所有 SERIAL 序列，防止新行与已导入数据 id 冲突
+        seq_msgs = await _reset_serial_sequences(conn)
+        for m in seq_msgs:
+            print(m, flush=True)
+        job["errors"] = [e for e in job.get("errors", []) if not e.startswith("[seq-reset]")]
     except Exception as e:
         try: await tx_box[0].rollback()
         except Exception: pass
@@ -11605,6 +11658,10 @@ async def _run_migration_bg(job_id: str, source_url: str, source_key: str) -> No
 
                     await _flush(current_table)
                     await tx_box[0].commit()
+                    # 重置所有 SERIAL 序列，防止新行与已导入数据 id 冲突
+                    seq_msgs = await _reset_serial_sequences(conn)
+                    for m in seq_msgs:
+                        print(m, flush=True)
                 finally:
                     await pool.release(conn)
 
