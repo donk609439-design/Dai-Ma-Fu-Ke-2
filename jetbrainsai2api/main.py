@@ -6393,6 +6393,33 @@ async def admin_pending_nc_list_low(request: Request):
     }
 
 
+@app.delete("/admin/pending-nc")
+async def admin_pending_nc_clear_all(request: Request, is_low: Optional[int] = None):
+    """一键清空所有排队记录（is_low=1 只清 LOW 用户；is_low=0 只清普通用户；省略清全部）"""
+    if request.headers.get("X-Admin-Key", "") != ADMIN_KEY:
+        raise HTTPException(status_code=403, detail="无权限")
+    db = await _get_db_pool()
+    if not db:
+        raise HTTPException(status_code=503, detail="DB 不可用")
+    async with db.acquire() as conn:
+        if is_low is None:
+            result = await conn.execute(
+                "UPDATE jb_accounts SET pending_nc_lids=NULL, pending_nc_key=NULL, "
+                "pending_nc_bound_ids=NULL, pending_nc_enqueued_at=0 "
+                "WHERE pending_nc_lids IS NOT NULL AND pending_nc_lids != '[]'"
+            )
+        else:
+            result = await conn.execute(
+                "UPDATE jb_accounts SET pending_nc_lids=NULL, pending_nc_key=NULL, "
+                "pending_nc_bound_ids=NULL, pending_nc_enqueued_at=0 "
+                "WHERE pending_nc_lids IS NOT NULL AND pending_nc_lids != '[]' "
+                "AND COALESCE(pending_nc_low_admin, FALSE) = $1",
+                bool(is_low)
+            )
+    cleared = int(result.split()[-1]) if result else 0
+    return {"ok": True, "cleared": cleared}
+
+
 @app.delete("/admin/pending-nc/{row_id}")
 async def admin_pending_nc_delete(row_id: str, request: Request):
     """手动清除某条排队记录（重置 pending_nc_lids 为空）"""
