@@ -10836,8 +10836,8 @@ _EXPORT_TABLES = [
     "saint_points",
     "saint_donations",
     "donated_jb_accounts",
-    "pokeball_members",
     "pokeballs",
+    "pokeball_members",
     "user_items",
     "lottery_prizes",
     "cf_proxy_pool",            # ★ CF 代理池（含 owner='admin' 主池 + owner='low_admin' LOW 子池）
@@ -10864,7 +10864,8 @@ _TABLE_CONFLICT_COL: dict[str, str] = {
 
 # 复合唯一键表（db-import 时需要多列 ON CONFLICT 表达式）
 _TABLE_CONFLICT_MULTI: dict[str, list] = {
-    "cf_proxy_pool": ["url", "owner", "owner_discord_id"],
+    "cf_proxy_pool":      ["url", "owner", "owner_discord_id"],
+    "pokeball_members":   ["pokeball_id", "member_key"],
 }
 
 
@@ -10907,7 +10908,16 @@ async def admin_db_export_stream(request: Request):
                 # asyncpg cursor 必须在 transaction 内
                 async with pool.acquire() as conn:
                     async with conn.transaction():
-                        async for row in conn.cursor(f'SELECT * FROM "{table}"', prefetch=1000):
+                        # pokeball_members 附带 ball_key 以便跨环境 id 映射
+                        if table == "pokeball_members":
+                            _export_q = (
+                                "SELECT pm.id, pm.pokeball_id, pm.member_key, p.ball_key"
+                                " FROM pokeball_members pm"
+                                " JOIN pokeballs p ON p.id = pm.pokeball_id"
+                            )
+                        else:
+                            _export_q = f'SELECT * FROM "{table}"'
+                        async for row in conn.cursor(_export_q, prefetch=1000):
                             yield (json.dumps(
                                 dict(row),
                                 default=str,        # datetime/Decimal 自动转 str
@@ -11071,6 +11081,35 @@ async def _run_import_bg(job_id: str, data: bytes) -> None:
         if not row_buffer or not tbl:
             row_buffer.clear()
             return
+
+        # ── pokeball_members 特殊处理：用 ball_key JOIN 查目标库 id，避免跨环境 id 不一致 ──
+        if tbl == "pokeball_members" and row_buffer and "ball_key" in row_buffer[0]:
+            sql_pm = (
+                "INSERT INTO pokeball_members (pokeball_id, member_key)"
+                " SELECT p.id, $2 FROM pokeballs p WHERE p.ball_key = $1"
+                " ON CONFLICT (pokeball_id, member_key) DO NOTHING"
+            )
+            pm_args = [(r.get("ball_key"), r.get("member_key")) for r in row_buffer]
+            try:
+                await conn.executemany(sql_pm, pm_args)
+                n = len(row_buffer)
+                job["counts"][tbl] = job["counts"].get(tbl, 0) + n
+                rows_in_tx[0] += n
+            except Exception as ex:
+                job["errors"].append(f"{tbl} batch({len(row_buffer)}): {type(ex).__name__}: {ex}")
+                try: await tx_box[0].rollback()
+                except Exception: pass
+                tx_box[0] = conn.transaction()
+                await tx_box[0].start()
+                rows_in_tx[0] = 0
+            row_buffer.clear()
+            if rows_in_tx[0] >= BATCH_COMMIT:
+                await tx_box[0].commit()
+                tx_box[0] = conn.transaction()
+                await tx_box[0].start()
+                rows_in_tx[0] = 0
+            return
+
         known = await _get_table_columns(conn, tbl)
         sample = {k: v for k, v in row_buffer[0].items() if k in known}
         cols = list(sample.keys())
@@ -11433,6 +11472,35 @@ async def _run_migration_bg(job_id: str, source_url: str, source_key: str) -> No
                     if not row_buffer or not tbl:
                         row_buffer.clear()
                         return
+
+                    # ── pokeball_members 特殊处理：用 ball_key JOIN 查目标库 id ──
+                    if tbl == "pokeball_members" and "ball_key" in row_buffer[0]:
+                        sql_pm = (
+                            "INSERT INTO pokeball_members (pokeball_id, member_key)"
+                            " SELECT p.id, $2 FROM pokeballs p WHERE p.ball_key = $1"
+                            " ON CONFLICT (pokeball_id, member_key) DO NOTHING"
+                        )
+                        pm_args = [(r.get("ball_key"), r.get("member_key")) for r in row_buffer]
+                        try:
+                            await conn.executemany(sql_pm, pm_args)
+                            n = len(row_buffer)
+                            job["counts"][tbl] = job["counts"].get(tbl, 0) + n
+                            rows_in_tx[0] += n
+                        except Exception as ex:
+                            job["errors"].append(f"{tbl} batch({len(row_buffer)}): {type(ex).__name__}: {ex}")
+                            try: await tx_box[0].rollback()
+                            except Exception: pass
+                            tx_box[0] = conn.transaction()
+                            await tx_box[0].start()
+                            rows_in_tx[0] = 0
+                        row_buffer.clear()
+                        if rows_in_tx[0] >= BATCH_COMMIT:
+                            await tx_box[0].commit()
+                            tx_box[0] = conn.transaction()
+                            await tx_box[0].start()
+                            rows_in_tx[0] = 0
+                        return
+
                     known = await _get_table_columns(conn, tbl)
                     # 用第一行确定列集合（所有行过滤到相同 known 列）
                     sample = {k: v for k, v in row_buffer[0].items() if k in known}
