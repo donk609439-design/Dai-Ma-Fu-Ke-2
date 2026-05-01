@@ -2780,6 +2780,11 @@ async def _retry_pending_nc_lids():
     # 全局 proxy 轮询计数器（线程安全不需要，asyncio 单线程）
     _pnc_proxy_counter = 0
 
+    # id_token 内存缓存：避免每轮都重新登录触发 JetBrains 限速
+    # 格式：{email: {"token": str, "cached_at": float}}
+    _id_token_cache: dict = {}
+    _TOKEN_TTL = 55 * 60  # 55 分钟，JetBrains id_token 通常 1 小时有效
+
     def _log(msg: str, level: str = "info", is_low=None, low_msg: str = None):
         """
         is_low: None=全局事件（写主日志） / True=LOW 行事件（仅写 LOW 日志） / False=主行事件（仅写主日志）
@@ -2922,14 +2927,21 @@ async def _retry_pending_nc_lids():
                     )
                     return None
                 short_email = email[:email.index("@")] + "@..." if "@" in email else email
+
+                # ── 优先使用缓存的 id_token，避免频繁登录触发限速 ──
+                cached = _id_token_cache.get(email)
+                if cached and (time.time() - cached["cached_at"]) < _TOKEN_TTL:
+                    return (row, cached["token"], short_email)
+
                 def _relogin():
                     try:
                         jb_mod = importlib.import_module("jb_activate")
-                        # ★ 关键：把当前行的 LOW + Discord 子池上下文写到 thread-local，
-                        # 避免 jba_login/oauth_pkce 内部走主池
                         jb_mod._set_proxy_pool_context(row_is_low, row_dc_id)
                         try:
                             s, _ = jb_mod.jba_login(email, password)
+                            if s is None:
+                                print(f"[pending-nc] {email} 重登录失败: jba_login 返回 None session")
+                                return None
                             id_token, _ = jb_mod.oauth_pkce(s)
                             return id_token
                         finally:
@@ -2944,6 +2956,8 @@ async def _retry_pending_nc_lids():
                         low_msg=f"❌ {short_email} 账号登录失败，稍后会自动重试",
                     )
                     return None
+                # 缓存成功获取的 id_token
+                _id_token_cache[email] = {"token": id_token, "cached_at": time.time()}
                 _log(
                     f"🔑 {short_email} 登录成功", "info", is_low=row_is_low,
                     low_msg=f"✓ {short_email} 账号登录成功",
@@ -3100,6 +3114,16 @@ async def _retry_pending_nc_lids():
                     _log(
                         f"⚠ {lid} → 429 限流，保留下次重试", "warn", is_low=row_is_low,
                         low_msg=f"⏳ {_se} 系统繁忙，稍后会自动重试",
+                    )
+                elif status_code == 401:
+                    # token 过期，清除缓存，保留 lid 等下一轮重新登录
+                    row_email = meta["row"]["pending_nc_email"] if "row" in meta else ""
+                    if row_email and row_email in _id_token_cache:
+                        del _id_token_cache[row_email]
+                    row_results[row_id]["still"].append(lid)
+                    _log(
+                        f"⚠ {lid} → 401 token 已过期，已清除缓存，下一轮重新登录", "warn", is_low=row_is_low,
+                        low_msg=f"⏳ {_se} 账号重新验证中，请稍候",
                     )
                 else:
                     _log(
