@@ -145,6 +145,22 @@ export default function PendingQueue() {
     },
   });
 
+  const clearAllMutation = useMutation({
+    mutationFn: async (isLow: boolean | null) => {
+      const qs = isLow === null ? "" : `?is_low=${isLow ? 1 : 0}`;
+      const res = await adminFetch(`/admin/pending-nc${qs}`, { method: "DELETE" });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return res.json() as Promise<{ ok: boolean; cleared: number }>;
+    },
+    onSuccess: (data) => {
+      queryClient.invalidateQueries({ queryKey: ["admin-pending-nc"] });
+      toast({ title: `已清空 ${data.cleared} 条排队记录` });
+    },
+    onError: (e: any) => {
+      toast({ title: "清空失败", description: e.message, variant: "destructive" });
+    },
+  });
+
   // 全部记录：按 is_low_admin 分流
   const allRecords = data?.records ?? [];
   const mainRecords = useMemo(() => allRecords.filter((r) => !r.is_low_admin), [allRecords]);
@@ -169,14 +185,51 @@ export default function PendingQueue() {
             </span>
           )}
         </div>
-        <button
-          onClick={() => refetch()}
-          disabled={isFetching}
-          className="flex items-center gap-1.5 px-3 py-1.5 rounded-md border border-border text-xs text-muted-foreground hover:bg-muted/30 transition-colors disabled:opacity-50"
-        >
-          <RefreshCw className={`w-3.5 h-3.5 ${isFetching ? "animate-spin" : ""}`} />
-          刷新
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => refetch()}
+            disabled={isFetching}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-md border border-border text-xs text-muted-foreground hover:bg-muted/30 transition-colors disabled:opacity-50"
+          >
+            <RefreshCw className={`w-3.5 h-3.5 ${isFetching ? "animate-spin" : ""}`} />
+            刷新
+          </button>
+
+          {records.length > 0 && (
+            <AlertDialog>
+              <AlertDialogTrigger asChild>
+                <button
+                  disabled={clearAllMutation.isPending}
+                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-md border border-red-500/40 text-xs text-red-400 hover:bg-red-500/10 transition-colors disabled:opacity-50"
+                >
+                  {clearAllMutation.isPending
+                    ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    : <Trash2 className="w-3.5 h-3.5" />
+                  }
+                  清空{tab === "low" ? " LOW" : ""}全部
+                </button>
+              </AlertDialogTrigger>
+              <AlertDialogContent>
+                <AlertDialogHeader>
+                  <AlertDialogTitle>确认清空排队记录？</AlertDialogTitle>
+                  <AlertDialogDescription>
+                    将清空当前「{tab === "low" ? "LOW 用户" : "普通用户"}」队列中全部 <strong>{records.length}</strong> 条排队记录，操作不可恢复。
+                    关联的预签 API 密钥将保留，但额度不会再自动升级。
+                  </AlertDialogDescription>
+                </AlertDialogHeader>
+                <AlertDialogFooter>
+                  <AlertDialogCancel>取消</AlertDialogCancel>
+                  <AlertDialogAction
+                    onClick={() => clearAllMutation.mutate(tab === "low" ? true : false)}
+                    className="bg-red-600 hover:bg-red-700 text-white"
+                  >
+                    确认清空
+                  </AlertDialogAction>
+                </AlertDialogFooter>
+              </AlertDialogContent>
+            </AlertDialog>
+          )}
+        </div>
       </div>
 
       {/* 主 / LOW 切换 Tab */}
