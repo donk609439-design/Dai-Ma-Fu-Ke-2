@@ -335,9 +335,12 @@ export default async (req: Request): Promise<Response> => {
     );
   }
 
-  // ---- Auth: Bearer <PROXY_SECRET> ----
+  // ---- Auth: Bearer <PROXY_SECRET> (FAIL-CLOSED) ----
   const expected = Deno.env.get("PROXY_SECRET");
-  if (expected) {
+  if (!expected) {
+    return jsonError(503, "PROXY_SECRET not configured on this site; refusing to serve");
+  }
+  {
     const auth = req.headers.get("authorization") ?? "";
     if (auth !== `Bearer ${expected}`) {
       return new Response(
