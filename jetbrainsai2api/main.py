@@ -2618,7 +2618,7 @@ async def _stream_with_account_fallback(
                 and _pool_account_ready(a)
             ]
             if pool_candidates:
-                _random.shuffle(pool_candidates)
+                # 按 JETBRAINS_ACCOUNTS 加载顺序（created_at 升序）取第一个
                 next_acc = pool_candidates[0]
             else:
                 # 池内候选用尽，走完整路径再选（含 key 绑定逻辑）
@@ -3819,13 +3819,15 @@ async def _run_pool_maintenance():
     _pool_task_state["maintenance_kicked"]  = 0
     try:
         pool_ids_snapshot = set(POLLING_POOL)
-        targets = [a for a in JETBRAINS_ACCOUNTS if _account_id(a) in pool_ids_snapshot]
+        # 按 JETBRAINS_ACCOUNTS 加载顺序（created_at 升序）取前 500 个池内账号
+        # fallback 选号同样按此顺序从前往后选，维护前 500 覆盖最常被用到的账号
+        targets = [a for a in JETBRAINS_ACCOUNTS if _account_id(a) in pool_ids_snapshot][:500]
         _pool_task_state["maintenance_total"] = len(targets)
         if not targets:
             print("[pool-maintenance] 轮询池为空，跳过维护")
             return
 
-        print(f"[pool-maintenance] 开始：重检池内 {len(targets)} 个账号")
+        print(f"[pool-maintenance] 开始：重检池内前 {len(targets)} 个账号（按入库时间顺序）")
         # licenseId 账号需要 JWT 刷新才能准确判断配额，用 _check_quota（含刷新，strict=True）
         # 并发限制为 5，避免打爆 auth 端点（实测 15 仍触发 429）；无 licenseId 的账号用 fast 加速
         semaphore_full = asyncio.Semaphore(5)    # 带 JWT 刷新（严格模式）
