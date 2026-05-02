@@ -466,3 +466,9 @@ NDJSON 协议（version 3）：
 - 实测 sonnet/opus 调用扣 credits 系数（用于本地余额估算）
 - admin-panel 改造：账号池表 schema 重命名 + UI（沿用 JB 项目的池化 + 调度框架）
 - api-server 改造：上游路由从 `localhost:python` 切到 Netlify site 池
+
+### Netlify proxy 已知坑：Claude 4.x temperature ⊕ top_p 互斥
+
+Claude 4.x 上游对 `temperature` 和 `top_p` 同时存在的请求会返 400 `invalid_request_error: temperature and top_p cannot both be specified`。许多客户端（包括 Cherry Studio 等）默认会把两者都填上，导致代理直通后被上游拒。
+
+修复（`netlify-claude-proxy/netlify/edge-functions/chat.ts` `openaiToAnthropic`）：当 `temperature !== undefined` 时，把 `top_p` 强制置 `undefined`。即"两者择一保 temperature"。客户端无需改动。

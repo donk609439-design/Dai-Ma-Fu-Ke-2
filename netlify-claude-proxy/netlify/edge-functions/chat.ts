@@ -126,8 +126,10 @@ function openaiToAnthropic(req: OpenAIRequest): AnthropicRequest {
     system: systemParts.length > 0 ? systemParts.join("\n\n") : undefined,
     messages: merged,
     max_tokens: req.max_tokens ?? req.max_completion_tokens ?? 4096,
+    // Claude 4.x rejects requests with BOTH temperature and top_p set.
+    // Prefer temperature (more commonly used); drop top_p when both are present.
     temperature: req.temperature,
-    top_p: req.top_p,
+    top_p: req.temperature !== undefined ? undefined : req.top_p,
     stream: req.stream,
     stop_sequences: req.stop
       ? Array.isArray(req.stop) ? req.stop : [req.stop]
