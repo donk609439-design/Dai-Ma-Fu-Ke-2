@@ -1989,7 +1989,7 @@ async def _check_quota(account: dict):
             "grazie-agent": '{"name":"aia:pycharm","version":"251.26094.80.13:251.26094.141"}',
             "grazie-authenticate-jwt": account["jwt"],
         }
-        response = await http_client.post(
+        response = await _cf_async_post(
             "https://api.jetbrains.ai/user/v5/quota/get", headers=headers, timeout=10.0
         )
 
@@ -2024,7 +2024,7 @@ async def _check_quota(account: dict):
             new_jwt = account.get("jwt")
             if new_jwt and new_jwt != old_jwt:
                 headers["grazie-authenticate-jwt"] = new_jwt
-                response = await http_client.post(
+                response = await _cf_async_post(
                     "https://api.jetbrains.ai/user/v5/quota/get", headers=headers, timeout=10.0
                 )
             else:
@@ -2116,7 +2116,7 @@ async def _check_quota_fast(account: dict) -> bool:
         }
         for _attempt in range(2):
             try:
-                response = await http_client.post(
+                response = await _cf_async_post(
                     "https://api.jetbrains.ai/user/v5/quota/get", headers=headers, timeout=8.0
                 )
             except Exception as req_e:
@@ -2179,14 +2179,15 @@ async def _check_quota_fast(account: dict) -> bool:
         _quota_check_in_progress.discard(acc_id)
 
 
-_jwt_cf_proxy_counter = 0  # JWT 刷新 CF 代理轮询游标
+_cf_async_proxy_counter = 0  # CF 代理轮询游标（配额查询 + JWT 刷新共用）
 
-async def _jwt_cf_post(url: str, *, headers: dict, json: dict | None = None,
-                       timeout: float = DEFAULT_REQUEST_TIMEOUT):
-    """JWT 刷新专用异步 POST：优先走 CF 代理池，无代理则直连。
-    协议：将真实目标写入 x-target-url header，请求发往代理 URL。
+async def _cf_async_post(url: str, *, headers: dict, json: dict | None = None,
+                         timeout: float = DEFAULT_REQUEST_TIMEOUT):
+    """通用异步 POST：优先走 CF 代理池，无代理则直连。
+    适用于所有 api.jetbrains.ai 请求（配额查询、JWT 刷新等）。
+    协议：真实目标写入 x-target-url header，请求发往代理 URL。
     """
-    global _jwt_cf_proxy_counter
+    global _cf_async_proxy_counter
     if not http_client:
         raise HTTPException(status_code=500, detail="HTTP 客户端未初始化")
     try:
@@ -2196,8 +2197,8 @@ async def _jwt_cf_post(url: str, *, headers: dict, json: dict | None = None,
         pool = []
 
     if pool:
-        idx = _jwt_cf_proxy_counter % len(pool)
-        _jwt_cf_proxy_counter += 1
+        idx = _cf_async_proxy_counter % len(pool)
+        _cf_async_proxy_counter += 1
         proxy_url = pool[idx]
         proxied_headers = dict(headers)
         proxied_headers["x-target-url"] = url
@@ -2240,7 +2241,7 @@ async def _refresh_jetbrains_jwt(account: dict):
             is_free_tier = bool(stored_lid) and not stored_lid.startswith("AIP")
             if not is_free_tier:
                 # grazie.individual.lite / AIP 账号：先 obtain/grazie-lite 确认最新 licenseId
-                lite_response = await _jwt_cf_post(_lite_url, headers=headers, timeout=DEFAULT_REQUEST_TIMEOUT)
+                lite_response = await _cf_async_post(_lite_url, headers=headers, timeout=DEFAULT_REQUEST_TIMEOUT)
                 if lite_response.status_code == 200:
                     lite_data = lite_response.json()
                     lite_lic = lite_data.get("license", {})
@@ -2251,11 +2252,11 @@ async def _refresh_jetbrains_jwt(account: dict):
                 print(f"  [refresh] free-tier 账号，直接使用存储 licenseId={actual_license_id}")
 
             payload = {"licenseId": actual_license_id}
-            response = await _jwt_cf_post(_jwt_url, headers=headers, json=payload, timeout=DEFAULT_REQUEST_TIMEOUT)
+            response = await _cf_async_post(_jwt_url, headers=headers, json=payload, timeout=DEFAULT_REQUEST_TIMEOUT)
             # 429 限流：等待后重试一次
             if response.status_code == 429:
                 await asyncio.sleep(3 + (hash(license_id) % 5))   # 3~7s 抖动，避免雷同账号同时重试
-                response = await _jwt_cf_post(_jwt_url, headers=headers, json=payload, timeout=DEFAULT_REQUEST_TIMEOUT)
+                response = await _cf_async_post(_jwt_url, headers=headers, json=payload, timeout=DEFAULT_REQUEST_TIMEOUT)
             response.raise_for_status()
 
             data = response.json()
@@ -3806,8 +3807,8 @@ async def startup():
         # 池等待 30 秒（应对突发流量排队，比直接 PoolTimeout 友好）
         timeout=httpx.Timeout(connect=15.0, read=900.0, write=15.0, pool=30.0),
         limits=httpx.Limits(
-            max_connections=500,
-            max_keepalive_connections=100,
+            max_connections=2000,
+            max_keepalive_connections=200,
             keepalive_expiry=60,
         ),
     )
