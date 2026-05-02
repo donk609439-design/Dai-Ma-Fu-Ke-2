@@ -1995,13 +1995,25 @@ async def _check_quota(account: dict):
         )
 
         if response.status_code == 401 and account.get("licenseId"):
-            # 若本轮已尝试过刷新（无论成功/429/其他失败），不再二次尝试，直接标记无配额
+            # 若本轮已尝试过刷新（无论成功/429/其他失败），不再二次尝试
             if pre_refresh_attempted:
-                print(f"Account {account.get('licenseId')} quota API 401 after JWT refresh attempt, marking no quota.")
-                account["has_quota"] = False
-                account["quota_status_reason"] = "jwt_401_after_refresh_attempt"
-                if account.get("daily_total"):
-                    account["daily_used"] = account["daily_total"]
+                # JWT刷新失败 + quota API 401 ≠ 配额耗尽
+                # 可能是 auth 端点临时异常（批量 401 通常是服务端问题而非账号问题）
+                # 策略：不更新 has_quota，保留现状；若账号有 JWT，给一次实际 API 调用的机会
+                # 实际 API 返回 477 才是真正无配额；401 可在 _make_jetbrains_raw_stream 里重试
+                old_has_quota = account.get("has_quota")
+                if account.get("jwt"):
+                    # 有现存 JWT → 标记为"待验证"（True），让实际 API 调用做最终裁定
+                    account["has_quota"] = True
+                    account["quota_status_reason"] = "jwt_401_indeterminate_has_jwt"
+                    print(f"Account {account.get('licenseId')} quota API 401 after JWT refresh, "
+                          f"has existing JWT → set has_quota=True (was {old_has_quota}), "
+                          f"will verify on next real API call")
+                else:
+                    # 无 JWT 且刷新失败，确实无法使用
+                    account["has_quota"] = False
+                    account["quota_status_reason"] = "jwt_401_no_jwt"
+                    print(f"Account {account.get('licenseId')} quota API 401 after JWT refresh, no JWT → marking no quota")
                 return
             # JWT 仍新鲜（未触发预刷新），但 quota API 返回 401 → JWT 在远端已过期，立即刷新一次
             print(f"JWT for {account['licenseId']} expired (still fresh locally), refreshing...")
@@ -2286,9 +2298,15 @@ async def get_next_jetbrains_account(client_key: Optional[str] = None) -> dict:
                             try:
                                 await _refresh_jetbrains_jwt(account)
                             except Exception as _e:
-                                print(f"账号 {account.get('licenseId')} JWT 刷新失败，跳过: {_e}")
-                                account["has_quota"] = False
-                                return False
+                                print(f"账号 {account.get('licenseId')} JWT 刷新失败: {_e}")
+                                # JWT 刷新失败 ≠ 配额耗尽；若有现存 JWT 仍可尝试使用，
+                                # 避免 auth 端点临时故障时误伤整个账号池。
+                                # 更新 last_updated 防止本次请求内再次触发刷新。
+                                if account.get("jwt"):
+                                    account["last_updated"] = time.time()
+                                    print(f"账号 {account.get('licenseId')} 使用现有 JWT 继续（刷新失败但 JWT 存在）")
+                                else:
+                                    return False
 
                 if not account.get("has_quota"):
                     await _check_quota(account)
