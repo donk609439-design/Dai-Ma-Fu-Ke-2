@@ -5544,7 +5544,7 @@ async def admin_recheck_cancel():
 
 
 @app.post("/admin/accounts/turbo-recheck")
-async def admin_turbo_recheck(concurrency: int = 120, delete_empty: bool = True):
+async def admin_turbo_recheck(concurrency: int = 120, delete_empty: bool = False):
     """极速全量配额重检。
 
     与 reset-quota-all 的区别：

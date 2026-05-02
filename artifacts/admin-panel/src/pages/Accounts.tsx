@@ -386,7 +386,7 @@ export default function Accounts() {
 
   const turboRecheckMutation = useMutation({
     mutationFn: async () => {
-      const res = await adminFetch("/admin/accounts/turbo-recheck?concurrency=120&delete_empty=true", { method: "POST" });
+      const res = await adminFetch("/admin/accounts/turbo-recheck?concurrency=120&delete_empty=false", { method: "POST" });
       if (!res.ok) throw new Error("触发失败");
       return res.json();
     },
