@@ -2179,9 +2179,35 @@ async def _check_quota_fast(account: dict) -> bool:
         _quota_check_in_progress.discard(acc_id)
 
 
+_jwt_cf_proxy_counter = 0  # JWT 刷新 CF 代理轮询游标
+
+async def _jwt_cf_post(url: str, *, headers: dict, json: dict | None = None,
+                       timeout: float = DEFAULT_REQUEST_TIMEOUT):
+    """JWT 刷新专用异步 POST：优先走 CF 代理池，无代理则直连。
+    协议：将真实目标写入 x-target-url header，请求发往代理 URL。
+    """
+    global _jwt_cf_proxy_counter
+    if not http_client:
+        raise HTTPException(status_code=500, detail="HTTP 客户端未初始化")
+    try:
+        jb_mod = importlib.import_module("jb_activate")
+        pool: list = getattr(jb_mod, "CF_PROXY_POOL", []) or []
+    except Exception:
+        pool = []
+
+    if pool:
+        idx = _jwt_cf_proxy_counter % len(pool)
+        _jwt_cf_proxy_counter += 1
+        proxy_url = pool[idx]
+        proxied_headers = dict(headers)
+        proxied_headers["x-target-url"] = url
+        return await http_client.post(proxy_url, headers=proxied_headers, json=json, timeout=timeout)
+    return await http_client.post(url, headers=headers, json=json, timeout=timeout)
+
+
 async def _refresh_jetbrains_jwt(account: dict):
     async with _jwt_refresh_sem:
-        """使用 licenseId 和 authorization 刷新 JWT"""
+        """使用 licenseId 和 authorization 刷新 JWT（通过 CF 代理池）"""
         if not http_client:
             raise HTTPException(status_code=500, detail="HTTP 客户端未初始化")
 
@@ -2214,7 +2240,7 @@ async def _refresh_jetbrains_jwt(account: dict):
             is_free_tier = bool(stored_lid) and not stored_lid.startswith("AIP")
             if not is_free_tier:
                 # grazie.individual.lite / AIP 账号：先 obtain/grazie-lite 确认最新 licenseId
-                lite_response = await http_client.post(_lite_url, headers=headers, timeout=DEFAULT_REQUEST_TIMEOUT)
+                lite_response = await _jwt_cf_post(_lite_url, headers=headers, timeout=DEFAULT_REQUEST_TIMEOUT)
                 if lite_response.status_code == 200:
                     lite_data = lite_response.json()
                     lite_lic = lite_data.get("license", {})
@@ -2225,11 +2251,11 @@ async def _refresh_jetbrains_jwt(account: dict):
                 print(f"  [refresh] free-tier 账号，直接使用存储 licenseId={actual_license_id}")
 
             payload = {"licenseId": actual_license_id}
-            response = await http_client.post(_jwt_url, json=payload, headers=headers, timeout=DEFAULT_REQUEST_TIMEOUT)
+            response = await _jwt_cf_post(_jwt_url, headers=headers, json=payload, timeout=DEFAULT_REQUEST_TIMEOUT)
             # 429 限流：等待后重试一次
             if response.status_code == 429:
                 await asyncio.sleep(3 + (hash(license_id) % 5))   # 3~7s 抖动，避免雷同账号同时重试
-                response = await http_client.post(_jwt_url, json=payload, headers=headers, timeout=DEFAULT_REQUEST_TIMEOUT)
+                response = await _jwt_cf_post(_jwt_url, headers=headers, json=payload, timeout=DEFAULT_REQUEST_TIMEOUT)
             response.raise_for_status()
 
             data = response.json()
