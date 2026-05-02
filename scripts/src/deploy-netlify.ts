@@ -81,9 +81,23 @@ async function setEnvVar(
   });
 }
 
-async function getAccountSlug(token: string): Promise<string> {
-  const accounts = await api<Array<{ slug: string }>>(token, "/accounts");
+async function getAccountSlug(token: string, preferred?: string): Promise<string> {
+  const accounts = await api<Array<{ slug: string; name: string }>>(token, "/accounts");
   if (!accounts.length) throw new Error("no accounts found for this PAT");
+  if (preferred) {
+    const hit = accounts.find((a) => a.slug === preferred || a.name === preferred);
+    if (!hit) {
+      const list = accounts.map((a) => `${a.slug} (${a.name})`).join(", ");
+      throw new Error(`account "${preferred}" not found; available: ${list}`);
+    }
+    return hit.slug;
+  }
+  if (accounts.length > 1) {
+    const list = accounts.map((a) => `${a.slug} (${a.name})`).join(", ");
+    throw new Error(
+      `PAT has access to multiple accounts; pass NETLIFY_ACCOUNT=<slug> env var. Available: ${list}`,
+    );
+  }
   return accounts[0].slug;
 }
 
@@ -142,7 +156,7 @@ async function waitForDeploy(token: string, siteId: string, deployId: string) {
 
 async function cmdDeploy(token: string, siteName?: string) {
   console.error("Step 1/5: getting account slug...");
-  const accountSlug = await getAccountSlug(token);
+  const accountSlug = await getAccountSlug(token, process.env.NETLIFY_ACCOUNT);
   console.error(`  account: ${accountSlug}`);
 
   console.error("Step 2/5: creating site...");

@@ -188,7 +188,8 @@ async function* parseAnthropicSSE(body: ReadableStream<Uint8Array>): AsyncGenera
   while (true) {
     const { value, done } = await reader.read();
     if (done) break;
-    buffer += decoder.decode(value, { stream: true });
+    // Normalize CRLF → LF so the \n\n splitter works on either style.
+    buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
 
     let nlIdx;
     while ((nlIdx = buffer.indexOf("\n\n")) !== -1) {
@@ -242,6 +243,7 @@ async function streamAnthropicToOpenAI(
   const encoder = new TextEncoder();
   const id = `chatcmpl-${crypto.randomUUID()}`;
   let openedRole = false;
+  let sawError = false;
 
   const stream = new ReadableStream({
     async start(controller) {
@@ -281,14 +283,17 @@ async function streamAnthropicToOpenAI(
           } else if (evt.type === "message_stop") {
             // emitted below as [DONE]
           } else if (evt.type === "error") {
+            sawError = true;
             controller.enqueue(
               encoder.encode(
                 `data: ${JSON.stringify({ error: evt.error ?? evt })}\n\n`,
               ),
             );
+            // Do NOT emit [DONE] — surface failure clearly to the client.
+            break;
           }
         }
-        if (!openedRole) {
+        if (!sawError && !openedRole) {
           controller.enqueue(
             encoder.encode(
               `data: ${JSON.stringify(
@@ -297,7 +302,9 @@ async function streamAnthropicToOpenAI(
             ),
           );
         }
-        controller.enqueue(encoder.encode(`data: [DONE]\n\n`));
+        if (!sawError) {
+          controller.enqueue(encoder.encode(`data: [DONE]\n\n`));
+        }
         controller.close();
       } catch (err) {
         controller.error(err);
@@ -338,7 +345,10 @@ export default async (req: Request): Promise<Response> => {
   // ---- Auth: Bearer <PROXY_SECRET> (FAIL-CLOSED) ----
   const expected = Deno.env.get("PROXY_SECRET");
   if (!expected) {
-    return jsonError(503, "PROXY_SECRET not configured on this site; refusing to serve");
+    return new Response(
+      JSON.stringify({ error: { message: "PROXY_SECRET not configured on this site; refusing to serve" } }),
+      { status: 503, headers: { "content-type": "application/json" } },
+    );
   }
   {
     const auth = req.headers.get("authorization") ?? "";

@@ -10,9 +10,15 @@ const MODELS = [
 ];
 
 export default async (req: Request) => {
-  const auth = req.headers.get("authorization") ?? "";
   const expected = Deno.env.get("PROXY_SECRET");
-  if (expected && auth !== `Bearer ${expected}`) {
+  if (!expected) {
+    return new Response(
+      JSON.stringify({ error: { message: "PROXY_SECRET not configured on this site; refusing to serve" } }),
+      { status: 503, headers: { "content-type": "application/json" } },
+    );
+  }
+  const auth = req.headers.get("authorization") ?? "";
+  if (auth !== `Bearer ${expected}`) {
     return new Response(JSON.stringify({ error: { message: "unauthorized" } }), {
       status: 401,
       headers: { "content-type": "application/json" },
