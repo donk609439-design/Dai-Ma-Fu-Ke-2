@@ -2608,18 +2608,20 @@ async def _stream_with_account_fallback(
             return  # 成功
         except _AccountFailed as af:
             print(f"[fallback] {af}，尝试下一个账号（已试 {len(tried_ids)} 个）")
-            # 从剩余账号中挑一个有配额的（不再经过 lock + JWT 刷新，快速切换）
-            # 从 current_account_index 开始迭代，配合全局轮询分散负载
+            # 从轮询池随机挑一个未尝试过、且 _pool_account_ready 的账号（零网络调用）
             next_acc = None
-            async with account_rotation_lock:
-                _n = len(JETBRAINS_ACCOUNTS)
-                for _i in range(_n):
-                    _acc = JETBRAINS_ACCOUNTS[(current_account_index + _i) % _n]
-                    if _account_id(_acc) not in tried_ids and _acc.get("has_quota", True) and _acc.get("jwt"):
-                        next_acc = _acc
-                        break
-            if next_acc is None:
-                # 所有快速候选用尽，尝试走完整路径再选一次
+            pool_ids_snap = set(POLLING_POOL)
+            pool_candidates = [
+                a for a in JETBRAINS_ACCOUNTS
+                if _account_id(a) not in tried_ids
+                and _account_id(a) in pool_ids_snap
+                and _pool_account_ready(a)
+            ]
+            if pool_candidates:
+                _random.shuffle(pool_candidates)
+                next_acc = pool_candidates[0]
+            else:
+                # 池内候选用尽，走完整路径再选（含 key 绑定逻辑）
                 try:
                     next_acc = await get_next_jetbrains_account(client_key=client_key)
                     if _account_id(next_acc) in tried_ids:
