@@ -51,6 +51,7 @@ export default function ApiKeys() {
   const [lowAdminExpanded, setLowAdminExpanded] = useState(false);
   const [lowAdminGroupExpanded, setLowAdminGroupExpanded] = useState<Record<string, boolean>>({});
   const [banConfirmKey, setBanConfirmKey] = useState<string | null>(null);
+  const [deleteAllConfirm, setDeleteAllConfirm] = useState<"normal" | "pending" | "multi" | "lowadmin" | null>(null);
   const [adjustOpen, setAdjustOpen] = useState(false);
   const [fromMin, setFromMin] = useState("0");
   const [fromMax, setFromMax] = useState("100");
@@ -176,6 +177,28 @@ export default function ApiKeys() {
       qc.invalidateQueries({ queryKey: ["admin-status"] });
     },
     onError: () => toast({ title: "一键解封失败", variant: "destructive" }),
+  });
+
+  const deleteAllMutation = useMutation({
+    mutationFn: async (keys: string[]) => {
+      const res = await adminFetch("/admin/keys/bulk", {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ keys }),
+      });
+      if (!res.ok) throw new Error("批量删除失败");
+      return res.json();
+    },
+    onSuccess: (data) => {
+      toast({ title: "删除完成", description: `已删除 ${data.deleted} 个密钥，剩余 ${data.remaining} 个` });
+      setDeleteAllConfirm(null);
+      qc.invalidateQueries({ queryKey: ["admin-keys"] });
+      qc.invalidateQueries({ queryKey: ["admin-status"] });
+    },
+    onError: () => {
+      toast({ title: "批量删除失败", variant: "destructive" });
+      setDeleteAllConfirm(null);
+    },
   });
 
   const cleanupPendingMutation = useMutation({
@@ -728,6 +751,41 @@ export default function ApiKeys() {
         </DialogContent>
       </Dialog>
 
+      {/* 批量删除确认弹框 */}
+      {(() => {
+        const infoMap = {
+          normal: { label: "正常密钥", keys: normalKeys },
+          pending: { label: "等待返回参数", keys: pendingKeys },
+          multi: { label: "多账号 key", keys: multiKeys },
+          lowadmin: { label: "次级管理员 key", keys: lowAdminKeys },
+        } as const;
+        const info = deleteAllConfirm ? infoMap[deleteAllConfirm] : null;
+        return (
+          <AlertDialog open={!!deleteAllConfirm} onOpenChange={(o) => { if (!o) setDeleteAllConfirm(null); }}>
+            <AlertDialogContent>
+              <AlertDialogHeader>
+                <AlertDialogTitle>确认删除全部「{info?.label}」？</AlertDialogTitle>
+                <AlertDialogDescription>
+                  此操作将永久删除当前分类下的 <span className="font-semibold text-foreground">{info?.keys.length ?? 0}</span> 个密钥，无法撤销。
+                  <br /><br />
+                  持有这些密钥的用户将立即无法访问 API。
+                </AlertDialogDescription>
+              </AlertDialogHeader>
+              <AlertDialogFooter>
+                <AlertDialogCancel>取消</AlertDialogCancel>
+                <AlertDialogAction
+                  className="bg-destructive hover:bg-destructive/90"
+                  onClick={() => info && deleteAllMutation.mutate(info.keys.map((k) => k.key))}
+                  disabled={deleteAllMutation.isPending}
+                >
+                  {deleteAllMutation.isPending ? "删除中…" : `确认删除全部 ${info?.keys.length ?? 0} 个`}
+                </AlertDialogAction>
+              </AlertDialogFooter>
+            </AlertDialogContent>
+          </AlertDialog>
+        );
+      })()}
+
       {/* 封禁确认弹框 */}
       <AlertDialog open={!!banConfirmKey} onOpenChange={(o) => { if (!o) setBanConfirmKey(null); }}>
         <AlertDialogContent>
@@ -902,21 +960,33 @@ export default function ApiKeys() {
         <div className="space-y-4">
           {/* 正常密钥区域 */}
           <div className="space-y-2">
-            <button
-              onClick={() => setNormalExpanded(!normalExpanded)}
-              className="w-full flex items-center justify-between px-1 py-1.5 text-sm font-medium text-foreground hover:text-primary transition-colors group"
-            >
-              <div className="flex items-center gap-2">
+            <div className="flex items-center justify-between px-1 py-1.5">
+              <button
+                onClick={() => setNormalExpanded(!normalExpanded)}
+                className="flex items-center gap-2 text-sm font-medium text-foreground hover:text-primary transition-colors group"
+              >
                 <ShieldCheck className="w-4 h-4 text-emerald-400" />
                 <span>正常密钥</span>
                 <span className="text-xs text-muted-foreground font-normal">（{normalKeys.length} 个）</span>
-              </div>
-              {normalExpanded ? (
-                <ChevronDown className="w-4 h-4 text-muted-foreground group-hover:text-primary" />
-              ) : (
-                <ChevronRight className="w-4 h-4 text-muted-foreground group-hover:text-primary" />
+                {normalExpanded ? (
+                  <ChevronDown className="w-4 h-4 text-muted-foreground group-hover:text-primary" />
+                ) : (
+                  <ChevronRight className="w-4 h-4 text-muted-foreground group-hover:text-primary" />
+                )}
+              </button>
+              {normalKeys.length > 0 && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setDeleteAllConfirm("normal")}
+                  disabled={deleteAllMutation.isPending}
+                  className="h-7 px-2.5 text-xs border-destructive/40 text-destructive hover:text-destructive hover:bg-destructive/10 hover:border-destructive/60"
+                >
+                  <Trash2 className="w-3.5 h-3.5 mr-1.5" />
+                  删除全部
+                </Button>
               )}
-            </button>
+            </div>
 
             {normalExpanded && (
               normalKeys.length === 0 ? (
@@ -949,16 +1019,30 @@ export default function ApiKeys() {
                     <ChevronRight className="w-4 h-4 text-muted-foreground group-hover:text-amber-400" />
                   )}
                 </button>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() => cleanupPendingMutation.mutate()}
-                  disabled={cleanupPendingMutation.isPending}
-                  className="h-7 px-2.5 text-xs border-amber-500/40 text-amber-500 hover:text-amber-400 hover:bg-amber-500/10 hover:border-amber-500/60"
-                >
-                  <Eraser className="w-3.5 h-3.5 mr-1.5" />
-                  {cleanupPendingMutation.isPending ? "清理中…" : "清除无效等待 key"}
-                </Button>
+                <div className="flex items-center gap-2">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => cleanupPendingMutation.mutate()}
+                    disabled={cleanupPendingMutation.isPending}
+                    className="h-7 px-2.5 text-xs border-amber-500/40 text-amber-500 hover:text-amber-400 hover:bg-amber-500/10 hover:border-amber-500/60"
+                  >
+                    <Eraser className="w-3.5 h-3.5 mr-1.5" />
+                    {cleanupPendingMutation.isPending ? "清理中…" : "清除无效等待 key"}
+                  </Button>
+                  {pendingKeys.length > 0 && (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => setDeleteAllConfirm("pending")}
+                      disabled={deleteAllMutation.isPending}
+                      className="h-7 px-2.5 text-xs border-destructive/40 text-destructive hover:text-destructive hover:bg-destructive/10 hover:border-destructive/60"
+                    >
+                      <Trash2 className="w-3.5 h-3.5 mr-1.5" />
+                      删除全部
+                    </Button>
+                  )}
+                </div>
               </div>
 
               {pendingExpanded && (
@@ -976,24 +1060,36 @@ export default function ApiKeys() {
           {/* 多账号 key 区域 */}
           {(multiKeys.length > 0 || !search) && (
             <div className="space-y-2">
-              <button
-                onClick={() => setMultiExpanded(!multiExpanded)}
-                className="w-full flex items-center justify-between px-1 py-1.5 text-sm font-medium text-foreground hover:text-violet-400 transition-colors group"
-              >
-                <div className="flex items-center gap-2">
+              <div className="flex items-center justify-between px-1 py-1.5">
+                <button
+                  onClick={() => setMultiExpanded(!multiExpanded)}
+                  className="flex items-center gap-2 text-sm font-medium text-foreground hover:text-violet-400 transition-colors group"
+                >
                   <Users className="w-4 h-4 text-violet-400" />
                   <span>多账号 key</span>
                   <span className="text-xs text-muted-foreground font-normal">（{multiKeys.length} 个）</span>
                   <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-violet-500/15 text-violet-400 border border-violet-500/25 font-normal">
                     绑定 2+ 个账号
                   </span>
-                </div>
-                {multiExpanded ? (
-                  <ChevronDown className="w-4 h-4 text-muted-foreground group-hover:text-violet-400" />
-                ) : (
-                  <ChevronRight className="w-4 h-4 text-muted-foreground group-hover:text-violet-400" />
+                  {multiExpanded ? (
+                    <ChevronDown className="w-4 h-4 text-muted-foreground group-hover:text-violet-400" />
+                  ) : (
+                    <ChevronRight className="w-4 h-4 text-muted-foreground group-hover:text-violet-400" />
+                  )}
+                </button>
+                {multiKeys.length > 0 && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setDeleteAllConfirm("multi")}
+                    disabled={deleteAllMutation.isPending}
+                    className="h-7 px-2.5 text-xs border-destructive/40 text-destructive hover:text-destructive hover:bg-destructive/10 hover:border-destructive/60"
+                  >
+                    <Trash2 className="w-3.5 h-3.5 mr-1.5" />
+                    删除全部
+                  </Button>
                 )}
-              </button>
+              </div>
 
               {multiExpanded && (
                 multiKeys.length === 0 ? (
@@ -1010,11 +1106,11 @@ export default function ApiKeys() {
           {/* 次级管理员 key 区域 */}
           {(lowAdminKeys.length > 0 || !search) && (
             <div className="space-y-2">
-              <button
-                onClick={() => setLowAdminExpanded(!lowAdminExpanded)}
-                className="w-full flex items-center justify-between px-1 py-1.5 text-sm font-medium text-foreground hover:text-orange-400 transition-colors group"
-              >
-                <div className="flex items-center gap-2">
+              <div className="flex items-center justify-between px-1 py-1.5">
+                <button
+                  onClick={() => setLowAdminExpanded(!lowAdminExpanded)}
+                  className="flex items-center gap-2 text-sm font-medium text-foreground hover:text-orange-400 transition-colors group"
+                >
                   <UserCog className="w-4 h-4 text-orange-400" />
                   <span>次级管理员 key</span>
                   <span className="text-xs text-muted-foreground font-normal">
@@ -1023,13 +1119,25 @@ export default function ApiKeys() {
                   <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-orange-500/15 text-orange-400 border border-orange-500/25 font-normal">
                     LOW_ADMIN 创建
                   </span>
-                </div>
-                {lowAdminExpanded ? (
-                  <ChevronDown className="w-4 h-4 text-muted-foreground group-hover:text-orange-400" />
-                ) : (
-                  <ChevronRight className="w-4 h-4 text-muted-foreground group-hover:text-orange-400" />
+                  {lowAdminExpanded ? (
+                    <ChevronDown className="w-4 h-4 text-muted-foreground group-hover:text-orange-400" />
+                  ) : (
+                    <ChevronRight className="w-4 h-4 text-muted-foreground group-hover:text-orange-400" />
+                  )}
+                </button>
+                {lowAdminKeys.length > 0 && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setDeleteAllConfirm("lowadmin")}
+                    disabled={deleteAllMutation.isPending}
+                    className="h-7 px-2.5 text-xs border-destructive/40 text-destructive hover:text-destructive hover:bg-destructive/10 hover:border-destructive/60"
+                  >
+                    <Trash2 className="w-3.5 h-3.5 mr-1.5" />
+                    删除全部
+                  </Button>
                 )}
-              </button>
+              </div>
 
               {lowAdminExpanded && (
                 lowAdminGroups.length === 0 ? (

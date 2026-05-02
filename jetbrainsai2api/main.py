@@ -5854,6 +5854,36 @@ async def admin_set_key_limit(key: str, request: Request):
     return {"success": True, "key": key[:8] + "***", "usage_limit": new_limit}
 
 
+@app.delete("/admin/keys/bulk")
+async def admin_delete_keys_bulk(request: Request):
+    """批量删除指定密钥列表"""
+    global VALID_CLIENT_KEYS
+    body = await request.json()
+    keys_to_delete = body.get("keys", [])
+    if not isinstance(keys_to_delete, list) or not keys_to_delete:
+        raise HTTPException(status_code=400, detail="keys 必须为非空数组")
+    deleted = []
+    for k in keys_to_delete:
+        if k in VALID_CLIENT_KEYS:
+            del VALID_CLIENT_KEYS[k]
+            deleted.append(k)
+    if deleted:
+        if DB_POOL:
+            try:
+                async with DB_POOL.acquire() as conn:
+                    await conn.execute(
+                        "DELETE FROM jb_client_keys WHERE key = ANY($1::text[])",
+                        deleted,
+                    )
+            except Exception as e:
+                print(f"批量删除密钥时出错: {e}")
+        else:
+            await _save_keys_to_db()
+    print(f"[批量删除] 已删除 {len(deleted)} 个密钥，剩余 {len(VALID_CLIENT_KEYS)} 个")
+    _admin_cache_invalidate("keys", "status")
+    return {"success": True, "deleted": len(deleted), "remaining": len(VALID_CLIENT_KEYS)}
+
+
 @app.delete("/admin/keys/{key}")
 async def admin_delete_key(key: str):
     """删除客户端 API 密钥"""
