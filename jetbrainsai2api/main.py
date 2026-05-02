@@ -1651,11 +1651,32 @@ async def load_accounts_from_db():
                     acc["authorization"] = row["auth_token"]
                 return acc
             JETBRAINS_ACCOUNTS = [_row_to_account(row) for row in rows]
-            # 从加载的账号中重建 POLLING_POOL
-            POLLING_POOL = {
-                row["id"] for row in rows if row["in_pool"]
-            }
-            print(f"从数据库加载 {len(JETBRAINS_ACCOUNTS)} 个账户，其中 {len(POLLING_POOL)} 个在轮询池")
+            # 优先从 in_pool=True 重建
+            db_pool_ids = {row["id"] for row in rows if row["in_pool"]}
+            if db_pool_ids:
+                POLLING_POOL = db_pool_ids
+                print(f"从数据库加载 {len(JETBRAINS_ACCOUNTS)} 个账户，其中 {len(POLLING_POOL)} 个在轮询池")
+            else:
+                # 全新部署或第一次启用轮询池：DB 中 in_pool 全为 False。
+                # 以 has_quota=True（或从未检测过）的账号预填充池，让服务立即可用；
+                # 后台维护任务会在 5.5 分钟后精确重检并踢出真正无配额的账号。
+                POLLING_POOL = {
+                    row["id"] for row in rows
+                    if row["has_quota"] is not False and row["jwt"] is not None
+                }
+                # 同步写回 in_pool 字段（不阻塞启动，fire-and-forget）
+                async def _sync_pool_flags():
+                    try:
+                        flagged = [a for a in JETBRAINS_ACCOUNTS if _account_id(a) in POLLING_POOL]
+                        for a in flagged:
+                            a["in_pool"] = True
+                        await _batch_save_accounts_to_db(flagged)
+                        print(f"[启动池预填] 已将 {len(flagged)} 个账号的 in_pool 写回数据库")
+                    except Exception as _e:
+                        print(f"[启动池预填] 写回 DB 失败（不影响运行）: {_e}")
+                asyncio.ensure_future(_sync_pool_flags())
+                print(f"从数据库加载 {len(JETBRAINS_ACCOUNTS)} 个账户，"
+                      f"池为空→预填充 {len(POLLING_POOL)} 个有配额账号，后台任务将精确维护")
             # 迁移旧格式 ID（jwt:前16字符）→ 新格式（jwt:SHA256哈希）
             old_ids = [
                 row["id"] for row in rows
@@ -2033,8 +2054,9 @@ async def _check_quota(account: dict):
                 old_has_quota = account.get("has_quota")
                 if account.get("jwt"):
                     # 有现存 JWT → 标记为"待验证"（True），让实际 API 调用做最终裁定
+                    # 注意：reason 故意不以 jwt_ 开头，避免触发 _check_quota_fast 的误标保护
                     account["has_quota"] = True
-                    account["quota_status_reason"] = "jwt_401_indeterminate_has_jwt"
+                    account["quota_status_reason"] = "auth_401_indeterminate"
                     print(f"Account {account.get('licenseId')} quota API 401 after JWT refresh, "
                           f"has existing JWT → set has_quota=True (was {old_has_quota}), "
                           f"will verify on next real API call")
@@ -3779,20 +3801,33 @@ async def _run_pool_maintenance():
             return
 
         print(f"[pool-maintenance] 开始：重检池内 {len(targets)} 个账号")
-        semaphore    = asyncio.Semaphore(300)
+        # licenseId 账号需要 JWT 刷新才能准确判断配额，用 _check_quota（含刷新）
+        # 并发限制为 15，避免打爆 auth 端点；无 licenseId 的账号用 _check_quota_fast 加速
+        semaphore_full = asyncio.Semaphore(15)   # 带 JWT 刷新
+        semaphore_fast = asyncio.Semaphore(300)  # 不刷新，纯配额查询
         kicked_count = 0
         done_count   = 0
         save_batch: list = []
 
         async def _maint_one(acc: dict):
             nonlocal kicked_count, done_count, save_batch
-            async with semaphore:
-                try:
-                    await _check_quota_fast(acc)
-                except asyncio.CancelledError:
-                    raise
-                except Exception as e:
-                    print(f"[pool-maintenance] 账号 {_account_id(acc)} 检测失败: {e}")
+            has_license = bool(acc.get("licenseId") and acc.get("authorization"))
+            if has_license:
+                async with semaphore_full:
+                    try:
+                        await _check_quota(acc)   # 含 JWT 刷新，精准判断
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        print(f"[pool-maintenance] 账号 {_account_id(acc)} 检测失败: {e}")
+            else:
+                async with semaphore_fast:
+                    try:
+                        await _check_quota_fast(acc)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        print(f"[pool-maintenance] 账号 {_account_id(acc)} 检测失败: {e}")
             done_count += 1
             _pool_task_state["maintenance_done"] = done_count
             if not acc.get("has_quota", True):
