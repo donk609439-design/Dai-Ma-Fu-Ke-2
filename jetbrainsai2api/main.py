@@ -2066,6 +2066,89 @@ async def _check_quota(account: dict):
             print(f"[后台] 保存账户配额状态到数据库时出错: {e}")
 
 
+async def _check_quota_fast(account: dict) -> bool:
+    """极速配额检查：跳过 JWT 刷新，直接用现有 JWT 查询 /quota/get。
+
+    与 _check_quota 的区别：
+    - 不触发 JWT 刷新（省去 1-2 个额外 HTTP 往返）
+    - 不调用 _save_account_to_db（由调用方批量写库）
+    - 429 限流时：原地等待 2s 后重试一次，仍 429 则保留现有 has_quota 不变
+    - 401 时：仅标记 has_quota=False，不尝试 JWT 刷新（由下次正常请求懒刷新）
+    适用场景：全量快速扫描，对 JWT 新鲜度要求低。
+    """
+    acc_id = _account_id(account)
+    if acc_id in _quota_check_in_progress:
+        return account.get("has_quota", True)
+
+    jwt_val = account.get("jwt")
+    if not jwt_val:
+        account["has_quota"] = False
+        account["last_quota_check"] = time.time()
+        return False
+
+    _quota_check_in_progress.add(acc_id)
+    try:
+        headers = {
+            "User-Agent": "ktor-client",
+            "Content-Length": "0",
+            "Accept-Charset": "UTF-8",
+            "grazie-agent": '{"name":"aia:pycharm","version":"251.26094.80.13:251.26094.141"}',
+            "grazie-authenticate-jwt": jwt_val,
+        }
+        for _attempt in range(2):
+            try:
+                response = await http_client.post(
+                    "https://api.jetbrains.ai/user/v5/quota/get", headers=headers, timeout=8.0
+                )
+            except Exception as req_e:
+                print(f"[fast-recheck] {acc_id} 网络异常: {req_e}")
+                account["last_quota_check"] = time.time()
+                return account.get("has_quota", True)
+
+            sc = response.status_code
+            if sc == 429:
+                if _attempt == 0:
+                    await asyncio.sleep(2.0)
+                    continue
+                # 二次仍 429：保留现有状态，不做任何修改
+                account["last_quota_check"] = time.time()
+                return account.get("has_quota", True)
+            if sc == 401:
+                account["has_quota"] = False
+                account["last_quota_check"] = time.time()
+                return False
+            if sc != 200:
+                # 其他非预期状态码：保留现有状态
+                account["last_quota_check"] = time.time()
+                return account.get("has_quota", True)
+
+            try:
+                data = response.json()
+            except Exception:
+                account["last_quota_check"] = time.time()
+                return account.get("has_quota", True)
+
+            quota_obj = data.get("current", {})
+            tariff = quota_obj.get("tariffQuota", {})
+            tariff_total     = float(tariff.get("maximum",   {}).get("amount", 0) or 0)
+            tariff_available = float(tariff.get("available", {}).get("amount", 0) or 0)
+            tariff_used      = float(tariff.get("current",   {}).get("amount", 0) or 0)
+            has_q = (tariff_total == 0) or (tariff_available > 0)
+            account["has_quota"]   = has_q
+            account["daily_used"]  = int(tariff_total - tariff_available) if tariff_total > 0 else 0
+            account["daily_total"] = int(tariff_total)
+            account["last_quota_check"] = time.time()
+            return has_q
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        print(f"[fast-recheck] {acc_id} 异常: {e}")
+        account["last_quota_check"] = time.time()
+        return account.get("has_quota", True)
+    finally:
+        _quota_check_in_progress.discard(acc_id)
+
+
 async def _refresh_jetbrains_jwt(account: dict):
     async with _jwt_refresh_sem:
         """使用 licenseId 和 authorization 刷新 JWT"""
@@ -5459,6 +5542,127 @@ async def admin_recheck_cancel():
         task.cancel()
     return {"success": True, "message": "取消信号已发送"}
 
+
+@app.post("/admin/accounts/turbo-recheck")
+async def admin_turbo_recheck(concurrency: int = 120, delete_empty: bool = True):
+    """极速全量配额重检。
+
+    与 reset-quota-all 的区别：
+    - 跳过 JWT 刷新（用现有 JWT 直查 /quota/get，省去 1-2 个额外 HTTP 往返）
+    - 并发默认 120（原来 8），可通过 ?concurrency=N 调节，最大 300
+    - 每 500 账号批量写一次 DB（原来每账号单独写）
+    - 401 账号标记 has_quota=False 但不从内存池删除（等扫完后统一清理）
+    - delete_empty=true（默认）：扫完后从内存+DB 删除确认无配额的账号
+    预计完成时间：~5-10 分钟（62K 账号）
+    """
+    global _bulk_recheck_state
+
+    _concurrency = max(1, min(concurrency, 300))
+
+    # 若已有任务在跑，先取消
+    if _bulk_recheck_state["running"] and _bulk_recheck_state["task"]:
+        old_task = _bulk_recheck_state["task"]
+        old_task.cancel()
+        await asyncio.wait({old_task}, timeout=3.0)
+
+    total = len(JETBRAINS_ACCOUNTS)
+    if total == 0:
+        return {"success": True, "message": "当前没有账号，无需重检", "total": 0}
+
+    _bulk_recheck_state.update({"running": True, "total": total, "done": 0, "task": None})
+    _t_start = time.time()
+
+    async def _bg_turbo():
+        global current_account_index
+        semaphore = asyncio.Semaphore(_concurrency)
+        _BATCH_SAVE = 500   # 每满 500 个账号批量写 DB 一次
+        pending_save: list = []
+        _done_count = 0
+        _429_count  = 0
+
+        async def _one(acc: dict):
+            nonlocal pending_save, _done_count, _429_count
+            async with semaphore:
+                try:
+                    result = await _check_quota_fast(acc)
+                    if not result:
+                        pass  # has_quota 已在函数内更新
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    print(f"[turbo-recheck] 账号 {_account_id(acc)} 异常: {e}")
+                pending_save.append(acc)
+                _done_count += 1
+                _bulk_recheck_state["done"] = _done_count
+                if len(pending_save) >= _BATCH_SAVE:
+                    batch, pending_save = pending_save[:], []
+                    try:
+                        await _batch_save_accounts_to_db(batch)
+                    except Exception as e:
+                        print(f"[turbo-recheck] 批量写 DB 失败: {e}")
+
+        try:
+            snapshot = list(JETBRAINS_ACCOUNTS)
+            await asyncio.gather(*[_one(acc) for acc in snapshot])
+            # 写入剩余未满一批的账号
+            if pending_save:
+                try:
+                    await _batch_save_accounts_to_db(pending_save)
+                except Exception as e:
+                    print(f"[turbo-recheck] 最终批量写 DB 失败: {e}")
+
+            elapsed = time.time() - _t_start
+            has_q   = sum(1 for a in JETBRAINS_ACCOUNTS if a.get("has_quota"))
+            no_q    = total - has_q
+            print(f"[turbo-recheck] 完成：{has_q} 有配额，{no_q} 无配额，耗时 {elapsed:.0f}s")
+
+            # 可选：删除确认无配额的账号（内存 + DB）
+            if delete_empty and no_q > 0:
+                no_q_accs = [a for a in JETBRAINS_ACCOUNTS if not a.get("has_quota")]
+                no_q_ids  = [_account_id(a) for a in no_q_accs]
+                try:
+                    for a in no_q_accs:
+                        a["_deleted"] = True
+                    await _batch_delete_accounts_from_db(no_q_ids)
+                    delete_set = set(no_q_ids)
+                    async with account_rotation_lock:
+                        JETBRAINS_ACCOUNTS[:] = [
+                            a for a in JETBRAINS_ACCOUNTS if _account_id(a) not in delete_set
+                        ]
+                        if JETBRAINS_ACCOUNTS and current_account_index >= len(JETBRAINS_ACCOUNTS):
+                            current_account_index = 0
+                    print(f"[turbo-recheck] 已从内存+DB 删除 {len(no_q_ids)} 个无配额账号，"
+                          f"剩余 {len(JETBRAINS_ACCOUNTS)} 个")
+                except Exception as e:
+                    print(f"[turbo-recheck] 删除无配额账号失败: {e}")
+
+        except asyncio.CancelledError:
+            print(f"[turbo-recheck] 已取消（已完成 {_bulk_recheck_state['done']}/{total}）")
+            if pending_save:
+                try:
+                    await _batch_save_accounts_to_db(pending_save)
+                except Exception:
+                    pass
+        finally:
+            _bulk_recheck_state["running"] = False
+            _bulk_recheck_state["task"] = None
+
+    task = asyncio.create_task(_bg_turbo())
+    _bulk_recheck_state["task"] = task
+    eta_minutes = round(total / _concurrency * 0.8 / 60, 1)
+    return {
+        "success": True,
+        "message": (
+            f"已启动极速重检：{total} 个账号，并发 {_concurrency}，"
+            f"预计 {eta_minutes} 分钟完成。"
+            f"通过 /admin/accounts/recheck-progress 查询进度，"
+            f"/admin/accounts/recheck-cancel 取消。"
+        ),
+        "total": total,
+        "concurrency": _concurrency,
+        "eta_minutes": eta_minutes,
+        "delete_empty": delete_empty,
+    }
 
 
 @app.get("/admin/keys")

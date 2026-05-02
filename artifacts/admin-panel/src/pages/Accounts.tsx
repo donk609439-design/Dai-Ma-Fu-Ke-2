@@ -384,6 +384,23 @@ export default function Accounts() {
     onError: () => toast({ title: "启动重检失败", variant: "destructive" }),
   });
 
+  const turboRecheckMutation = useMutation({
+    mutationFn: async () => {
+      const res = await adminFetch("/admin/accounts/turbo-recheck?concurrency=120&delete_empty=true", { method: "POST" });
+      if (!res.ok) throw new Error("触发失败");
+      return res.json();
+    },
+    onSuccess: (data) => {
+      toast({
+        title: "⚡ 极速重检已启动",
+        description: `${data.total} 个账号，并发 ${data.concurrency}，预计 ${data.eta_minutes} 分钟完成`,
+      });
+      setIsRechecking(true);
+      qc.invalidateQueries({ queryKey: ["admin-accounts"] });
+    },
+    onError: () => toast({ title: "极速重检启动失败", variant: "destructive" }),
+  });
+
   const deleteExhaustedMutation = useMutation({
     mutationFn: async () => {
       const res = await adminFetch("/admin/accounts/exhausted", { method: "DELETE" });
@@ -520,7 +537,21 @@ export default function Accounts() {
             className={isRechecking ? "border-amber-500/50 text-amber-400" : ""}
           >
             <ListChecks className={`w-4 h-4 mr-2 ${(recheckAllMutation.isPending || isRechecking) ? "animate-pulse" : ""}`} />
-            {isRechecking ? "检测中…" : "全量重检配额"}
+            {isRechecking ? "检测中…" : "全量重检"}
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => turboRecheckMutation.mutate()}
+            disabled={turboRecheckMutation.isPending || isRechecking}
+            className={
+              isRechecking && turboRecheckMutation.isSuccess
+                ? "border-yellow-500/50 text-yellow-400"
+                : "border-yellow-500/30 text-yellow-400 hover:border-yellow-400 hover:bg-yellow-400/10"
+            }
+          >
+            <ListChecks className={`w-4 h-4 mr-2 ${(turboRecheckMutation.isPending || (isRechecking && turboRecheckMutation.isSuccess)) ? "animate-pulse" : ""}`} />
+            ⚡ 极速重检
           </Button>
           <Button
             variant="outline"
