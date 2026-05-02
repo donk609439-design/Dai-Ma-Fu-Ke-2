@@ -12,8 +12,6 @@
  * and secret so you can record them in your account-pool database.
  */
 
-import { mkdtempSync, readFileSync, statSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { randomBytes } from "node:crypto";
 import { execSync } from "node:child_process";
@@ -21,6 +19,7 @@ import { execSync } from "node:child_process";
 const API = "https://api.netlify.com/api/v1";
 const PROJECT_ROOT = resolve(import.meta.dirname, "..", "..");
 const TEMPLATE_DIR = join(PROJECT_ROOT, "netlify-claude-proxy");
+const NETLIFY_CLI = resolve(import.meta.dirname, "..", "node_modules", ".bin", "netlify");
 
 interface NetlifySite {
   id: string;
@@ -71,10 +70,11 @@ async function setEnvVar(
   return api(token, `/accounts/${accountSlug}/env?site_id=${siteId}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
+    // Free tier rejects explicit scopes ("Upgrade your Netlify account...").
+    // Omitting scopes => Netlify defaults to all scopes, which is what we want.
     body: JSON.stringify([
       {
         key,
-        scopes: ["builds", "functions", "runtime", "post-processing"],
         values: [{ context: "all", value }],
       },
     ]),
@@ -101,80 +101,58 @@ async function getAccountSlug(token: string, preferred?: string): Promise<string
   return accounts[0].slug;
 }
 
-function buildZip(srcDir: string): string {
-  const tmp = mkdtempSync(join(tmpdir(), "netlify-deploy-"));
-  const zipPath = join(tmp, "site.zip");
-  // Use Python's stdlib zipfile (the system `zip` binary segfaults on this NixOS).
-  const py = `
-import zipfile, os, sys
-src = sys.argv[1]
-out = sys.argv[2]
-exclude = ('.git', 'node_modules', '.netlify')
-with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED) as zf:
-    for root, dirs, files in os.walk(src):
-        dirs[:] = [d for d in dirs if d not in exclude]
-        for f in files:
-            full = os.path.join(root, f)
-            arc = os.path.relpath(full, src)
-            zf.write(full, arc)
-`;
-  execSync(`python3 -c ${JSON.stringify(py)} ${JSON.stringify(srcDir)} ${JSON.stringify(zipPath)}`, {
-    stdio: "inherit",
-  });
-  console.error(`zip built: ${zipPath} (${statSync(zipPath).size} bytes)`);
-  return zipPath;
-}
-
-async function deployZip(token: string, siteId: string, zipPath: string): Promise<{ id: string; ssl_url: string; state: string }> {
-  const body = readFileSync(zipPath);
-  const res = await fetch(`${API}/sites/${siteId}/deploys`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/zip",
+// Deploy via Netlify CLI — required for edge functions, since the raw zip
+// REST API treats uploads as static publish content and ignores netlify.toml
+// + edge_functions/. CLI invokes @netlify/edge-bundler properly.
+function deployViaCLI(token: string, siteId: string, srcDir: string) {
+  execSync(
+    `${JSON.stringify(NETLIFY_CLI)} deploy --prod --site=${JSON.stringify(siteId)} --auth=${JSON.stringify(token)} --message="auto-deploy"`,
+    {
+      stdio: "inherit",
+      cwd: srcDir,
+      env: { ...process.env, NETLIFY_AUTH_TOKEN: token },
     },
-    body,
-  });
-  if (!res.ok) {
-    throw new Error(`deploy upload failed ${res.status}: ${await res.text()}`);
-  }
-  return (await res.json()) as { id: string; ssl_url: string; state: string };
-}
-
-async function waitForDeploy(token: string, siteId: string, deployId: string) {
-  for (let i = 0; i < 60; i++) {
-    const d = await api<{ state: string; error_message?: string; ssl_url?: string }>(
-      token,
-      `/sites/${siteId}/deploys/${deployId}`,
-    );
-    if (d.state === "ready") return d;
-    if (d.state === "error") throw new Error(`deploy failed: ${d.error_message}`);
-    await new Promise((r) => setTimeout(r, 2000));
-  }
-  throw new Error("deploy timed out after 120s");
+  );
 }
 
 async function cmdDeploy(token: string, siteName?: string) {
-  console.error("Step 1/5: getting account slug...");
+  const reuseSiteId = process.env.NETLIFY_SITE_ID;
+  const reuseSecret = process.env.NETLIFY_REUSE_SECRET;
+
+  console.error("Step 1/4: getting account slug...");
   const accountSlug = await getAccountSlug(token, process.env.NETLIFY_ACCOUNT);
   console.error(`  account: ${accountSlug}`);
 
-  console.error("Step 2/5: creating site...");
-  const site = await createSite(token, siteName);
-  console.error(`  site_id: ${site.id}`);
-  console.error(`  url:     ${site.ssl_url}`);
+  let site: NetlifySite;
+  let secret: string;
 
-  console.error("Step 3/5: setting PROXY_SECRET...");
-  const secret = randomBytes(32).toString("hex");
-  await setEnvVar(token, accountSlug, site.id, "PROXY_SECRET", secret);
-  console.error("  PROXY_SECRET set");
+  if (reuseSiteId) {
+    console.error(`Step 2/4: reusing existing site ${reuseSiteId}...`);
+    site = await getSite(token, reuseSiteId);
+    console.error(`  url:     ${site.ssl_url}`);
+    if (reuseSecret) {
+      secret = reuseSecret;
+      console.error("  reusing existing PROXY_SECRET (provided via env)");
+    } else {
+      secret = randomBytes(32).toString("hex");
+      console.error("Step 3/4: rotating PROXY_SECRET...");
+      await setEnvVar(token, accountSlug, site.id, "PROXY_SECRET", secret);
+      console.error("  PROXY_SECRET rotated");
+    }
+  } else {
+    console.error("Step 2/4: creating site...");
+    site = await createSite(token, siteName);
+    console.error(`  site_id: ${site.id}`);
+    console.error(`  url:     ${site.ssl_url}`);
 
-  console.error("Step 4/5: building deploy zip...");
-  const zipPath = buildZip(TEMPLATE_DIR);
+    console.error("Step 3/4: setting PROXY_SECRET...");
+    secret = randomBytes(32).toString("hex");
+    await setEnvVar(token, accountSlug, site.id, "PROXY_SECRET", secret);
+    console.error("  PROXY_SECRET set");
+  }
 
-  console.error("Step 5/5: uploading + waiting for ready...");
-  const deploy = await deployZip(token, site.id, zipPath);
-  await waitForDeploy(token, site.id, deploy.id);
+  console.error("Step 4/4: deploying via Netlify CLI (bundles edge functions)...");
+  deployViaCLI(token, site.id, TEMPLATE_DIR);
   console.error("  deploy ready");
 
   // Final summary on stdout (machine-readable JSON) so you can pipe to a DB.
