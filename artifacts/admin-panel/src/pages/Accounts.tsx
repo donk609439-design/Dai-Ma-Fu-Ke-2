@@ -369,7 +369,7 @@ export default function Accounts() {
 
   const recheckAllMutation = useMutation({
     mutationFn: async () => {
-      const res = await adminFetch("/admin/accounts/reset-quota-all", { method: "POST" });
+      const res = await adminFetch("/admin/accounts/reset-quota-all?concurrency=1000", { method: "POST" });
       if (!res.ok) throw new Error("触发失败");
       return res.json();
     },

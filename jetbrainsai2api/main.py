@@ -6007,9 +6007,11 @@ async def admin_reset_account_quota(index: int):
     return diag
 
 @app.post("/admin/accounts/reset-quota-all")
-async def admin_reset_all_quota():
-    """重置所有账户的配额状态并在后台分批重新检查（立即返回，可通过 /recheck-progress 查询进度）"""
+async def admin_reset_all_quota(concurrency: int = 1000):
+    """重置所有账户的配额状态并在后台并发重新检查（立即返回，可通过 /recheck-progress 查询进度）"""
     global _bulk_recheck_state
+
+    _concurrency = max(1, min(concurrency, 2000))
 
     # 若已有任务在跑，先取消并等待其 finally 执行完毕（最多 3 秒）
     if _bulk_recheck_state["running"] and _bulk_recheck_state["task"]:
@@ -6025,14 +6027,17 @@ async def admin_reset_all_quota():
         account["last_quota_check"] = 0
 
     _bulk_recheck_state.update({"running": True, "total": total, "done": 0, "task": None})
+    _t_start = time.time()
 
     async def _bg_recheck_all():
-        """分块并发检查，每块完成后批量写 DB，全程让出事件循环给正常请求"""
-        _CHUNK = 50        # 每块账号数：控制同时创建的协程数量
-        _CONCURRENCY = 8   # 块内最大并发 HTTP 请求数
-        semaphore = asyncio.Semaphore(_CONCURRENCY)
+        """信号量并发检查，每满 500 个批量写 DB"""
+        semaphore = asyncio.Semaphore(_concurrency)
+        _BATCH_SAVE = 500
+        pending_save: list = []
+        _done_count = 0
 
         async def _check_one(acc: dict):
+            nonlocal pending_save, _done_count
             async with semaphore:
                 try:
                     await _check_quota(acc)
@@ -6040,20 +6045,28 @@ async def admin_reset_all_quota():
                     raise
                 except Exception as e:
                     print(f"[批量重检] 账号 {_account_id(acc)} 检测出错: {e}")
-            _bulk_recheck_state["done"] += 1
+            pending_save.append(acc)
+            _done_count += 1
+            _bulk_recheck_state["done"] = _done_count
+            if len(pending_save) >= _BATCH_SAVE:
+                batch, pending_save = pending_save[:], []
+                try:
+                    await _batch_save_accounts_to_db(batch)
+                except Exception as e:
+                    print(f"[批量重检] 批量写 DB 失败: {e}")
 
         try:
             snapshot = list(JETBRAINS_ACCOUNTS)
-            for chunk_start in range(0, len(snapshot), _CHUNK):
-                chunk = snapshot[chunk_start: chunk_start + _CHUNK]
-                await asyncio.gather(*[_check_one(acc) for acc in chunk])
-                # 每块完成后批量写 DB（一次连接代替 N 次单独写入）
-                await _batch_save_accounts_to_db(chunk)
-                # 让出事件循环，避免长时间霸占调度器
-                await asyncio.sleep(0)
+            await asyncio.gather(*[_check_one(acc) for acc in snapshot])
+            if pending_save:
+                try:
+                    await _batch_save_accounts_to_db(pending_save)
+                except Exception as e:
+                    print(f"[批量重检] 最终批量写 DB 失败: {e}")
 
+            elapsed = time.time() - _t_start
             has_q = sum(1 for a in JETBRAINS_ACCOUNTS if a.get("has_quota"))
-            print(f"[批量重检] 完成：{has_q}/{total} 个账号有配额")
+            print(f"[批量重检] 完成：{has_q}/{total} 个账号有配额，耗时 {elapsed:.0f}s")
         except asyncio.CancelledError:
             print(f"[批量重检] 已取消（已完成 {_bulk_recheck_state['done']}/{total}）")
         finally:
@@ -6064,7 +6077,7 @@ async def admin_reset_all_quota():
     _bulk_recheck_state["task"] = task
     return {
         "success": True,
-        "message": f"已在后台启动对 {total} 个账号的配额重检，可通过 /admin/accounts/recheck-progress 查询进度",
+        "message": f"已在后台启动对 {total} 个账号的配额重检（并发 {_concurrency}），可通过 /admin/accounts/recheck-progress 查询进度",
         "total": total,
     }
 
