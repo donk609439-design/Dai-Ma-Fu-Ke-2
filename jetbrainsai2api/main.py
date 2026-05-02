@@ -2396,9 +2396,11 @@ async def get_next_jetbrains_account(client_key: Optional[str] = None) -> dict:
                     if await _try_account(acc):
                         return acc
 
-    # ── 2. 从轮询池随机选号（无网络调用）──────────────────────────────────────
+    # ── 2. 从轮询池前500个账号顺序选号（无网络调用）─────────────────────────
+    # 维护任务、fallback选号、主选号三者均操作同一批账号（按created_at升序前500个），
+    # 保证维护覆盖范围与实际请求所用账号完全对齐。
     pool_ids_snapshot = set(POLLING_POOL)   # CPython set 副本，读取原子
-    pool_accs = [a for a in JETBRAINS_ACCOUNTS if _account_id(a) in pool_ids_snapshot]
+    pool_accs = [a for a in JETBRAINS_ACCOUNTS if _account_id(a) in pool_ids_snapshot][:500]
 
     if not pool_accs:
         raise HTTPException(
@@ -2406,14 +2408,13 @@ async def get_next_jetbrains_account(client_key: Optional[str] = None) -> dict:
             detail="轮询池当前为空，后台正在补充有配额账号，请稍后重试",
         )
 
-    _random.shuffle(pool_accs)
     for acc in pool_accs:
         if _pool_account_ready(acc):
             return acc
 
     raise HTTPException(
         status_code=429,
-        detail="轮询池中所有账号当前均不可用，后台正在维护，请稍后重试",
+        detail="轮询池前500个账号当前均不可用，后台正在维护，请稍后重试",
     )
 
 
