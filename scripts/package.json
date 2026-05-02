@@ -5,7 +5,11 @@
   "type": "module",
   "scripts": {
     "hello": "tsx ./src/hello.ts",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "netlify:deploy": "tsx ./src/deploy-netlify.ts deploy",
+    "netlify:list": "tsx ./src/deploy-netlify.ts list",
+    "netlify:status": "tsx ./src/deploy-netlify.ts status",
+    "netlify:verify": "tsx ./src/deploy-netlify.ts verify"
   },
   "devDependencies": {
     "@types/node": "catalog:",

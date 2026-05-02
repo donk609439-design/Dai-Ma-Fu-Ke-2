@@ -1,0 +1,19 @@
+[build]
+  command = "echo 'no build needed'"
+  publish = "public"
+
+[functions]
+  node_bundler = "esbuild"
+
+# Edge function path mapping — exposes /v1/chat/completions and /v1/models directly
+[[edge_functions]]
+  function = "chat"
+  path = "/v1/chat/completions"
+
+[[edge_functions]]
+  function = "models"
+  path = "/v1/models"
+
+[[edge_functions]]
+  function = "health"
+  path = "/healthz"

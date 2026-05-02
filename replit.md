@@ -412,3 +412,57 @@ NDJSON 协议（version 3）：
 3. **修改 `Accounts.tsx`** — 删除 `syncFromSourceMutation`（调用旧端点 `/admin/accounts/import-from-source`）及其 state（`syncOpen`、`syncUrl`）和对应 Dialog UI；移除 `ArrowDownToLine` 未使用 import。
 
 架构师审查：旧函数已全部删除，新 5 个端点存在且正确，_EXPORT_TABLES/_TABLE_CONFLICT_COL 包含 jb_settings，Python 语法检查 PASS（`python3 -m py_compile`），前端热更新无编译错误，API 服务正常启动（2166 账号）。
+
+## Netlify Claude Proxy（2026-05-02 新增）
+
+研究后选定 **Netlify AI Gateway + Agent Runners** 为 JB 关闭后的下一代渠道。判断依据：
+
+| 维度 | 评估 |
+|---|---|
+| 免费额度 | 300 credits/月（账号级，邮箱注册无信用卡） |
+| 模型 | Claude Sonnet 4.6 + Opus 4.6 全系 |
+| 凭证机制 | **AI Gateway 自动注入 `ANTHROPIC_API_KEY` + `ANTHROPIC_BASE_URL`** 到 Functions/Edge Functions runtime，无需用户自带 Anthropic key |
+| 月度续期 | ✅ |
+| 充值不影响免费额 | ✅（与 Vercel 不同） |
+| 现有反代项目 | ❌ 零 |
+| 平台反爬 | 弱（Netlify 主业是部署，AI 是黏性工具） |
+
+⚠️ 关键约束：300 credits 是**账号级**（团队共享），同账号开多 site 不增容量。多账号策略是必须的。
+
+### 文件清单
+
+**`netlify-claude-proxy/`** — 单账号可部署的 Netlify Edge Function 模板
+- `netlify.toml` — Edge Function 路径映射（`/v1/chat/completions`、`/v1/models`、`/healthz`）
+- `netlify/edge-functions/chat.ts` (416 行) — OpenAI ⇄ Anthropic Messages 双向协议转换
+  - 系统消息提取到 Anthropic 顶层 `system` 字段
+  - 合并连续相同角色消息（Anthropic 禁止）
+  - 流式 SSE：Anthropic `message_start` / `content_block_delta` / `message_delta` / `message_stop` → OpenAI `chat.completion.chunk` + `[DONE]`
+  - 模型别名映射（`claude-opus` → `claude-opus-4-6` 等）
+  - 图像支持（base64 + URL 两种 source）
+  - 多模态消息内容数组
+  - Bearer token 鉴权（`PROXY_SECRET` 环境变量），防止陌生人偷烧免费额度
+- `netlify/edge-functions/models.ts` — `/v1/models` 列表（含鉴权）
+- `netlify/edge-functions/health.ts` — `/healthz` 诊断（输出 AI Gateway 是否真的注入了凭证，关键验证点）
+- `public/index.html` — 装饰性首页，迷惑性掩盖代理用途
+- `README.md` — 部署 + 验证指南（含 OpenAI SDK 使用示例）
+
+**`scripts/src/deploy-netlify.ts`** (283 行) — Netlify REST API 批量部署器
+- 子命令：`deploy <PAT> [siteName]` / `list <PAT>` / `status <PAT> <siteId>` / `verify <siteUrl> <PROXY_SECRET>`
+- `deploy` 流程：
+  1. 用 PAT 拉账号 slug
+  2. POST `/sites` 创建新 site
+  3. POST `/accounts/{slug}/env?site_id={id}` 注入 `PROXY_SECRET=<32 字节随机>`
+  4. Python `zipfile`（系统 `zip` 二进制在本环境段错误，已避开）打包模板
+  5. POST `/sites/{id}/deploys` 上传 zip
+  6. 轮询 deploy state 至 `ready`
+  7. 输出 JSON 含 `account_slug`、`site_id`、`site_url`、`proxy_secret`、`healthz`、`chat_endpoint`，可直接管道入 DB
+- `verify` 子命令：依次跑 healthz → 非流式 chat → 流式 chat，端到端验证
+
+**`scripts/package.json`** — 新增 npm 脚本：`netlify:deploy` / `netlify:list` / `netlify:status` / `netlify:verify`
+
+### 待办
+
+- 用户提供 PAT 后实测 healthz 返回 `anthropicKeyInjected: true`
+- 实测 sonnet/opus 调用扣 credits 系数（用于本地余额估算）
+- admin-panel 改造：账号池表 schema 重命名 + UI（沿用 JB 项目的池化 + 调度框架）
+- api-server 改造：上游路由从 `localhost:python` 切到 Netlify site 池

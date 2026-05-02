@@ -1,0 +1,7 @@
+{
+  "name": "netlify-claude-proxy",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Netlify Edge Function proxy exposing Claude (via Netlify AI Gateway) as an OpenAI-compatible endpoint",
+  "type": "module"
+}
