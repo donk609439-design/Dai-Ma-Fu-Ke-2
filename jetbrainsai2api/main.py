@@ -6051,12 +6051,15 @@ async def admin_reset_all_quota(concurrency: int = 1000):
     for account in JETBRAINS_ACCOUNTS:
         account["has_quota"] = True
         account["last_quota_check"] = 0
+        account.pop("last_jwt_fail", None)   # 清除 JWT 冷却，让账号立即参与检测
 
     _bulk_recheck_state.update({"running": True, "total": total, "done": 0, "task": None})
     _t_start = time.time()
 
     async def _bg_recheck_all():
-        """信号量并发检查，每满 500 个批量写 DB"""
+        """信号量并发检查（用 _check_quota_fast，跳过 JWT 刷新保持极速），每满 500 个批量写 DB。
+        JWT 刷新不在批量扫描中触发，而是在实际 API 调用时懒刷新，避免 auth 端点被打爆。
+        """
         semaphore = asyncio.Semaphore(_concurrency)
         _BATCH_SAVE = 500
         pending_save: list = []
@@ -6066,7 +6069,7 @@ async def admin_reset_all_quota(concurrency: int = 1000):
             nonlocal pending_save, _done_count
             async with semaphore:
                 try:
-                    await _check_quota(acc)
+                    await _check_quota_fast(acc)
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
