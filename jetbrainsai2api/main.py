@@ -2134,8 +2134,9 @@ async def _check_quota_fast(account: dict) -> bool:
                 return account.get("has_quota", True)
 
             if sc == 401:
-                # JWT 已过期；若未尝试过刷新，先尝试一次
-                if not _jwt_refreshed and account.get("licenseId"):
+                # 仅对因 JWT 问题被误标的账号才尝试刷新（其余保持快速路径）
+                _is_jwt_mismarked = str(account.get("quota_status_reason", "")).startswith("jwt_")
+                if not _jwt_refreshed and _is_jwt_mismarked and account.get("licenseId"):
                     _jwt_refreshed = True
                     try:
                         await _refresh_jetbrains_jwt(account)
@@ -2149,12 +2150,12 @@ async def _check_quota_fast(account: dict) -> bool:
                             print(f"[fast-recheck] {acc_id} JWT 刷新未更新（state=NONE）")
                     except Exception as _re:
                         print(f"[fast-recheck] {acc_id} JWT 刷新失败: {_re}")
-                    # 刷新失败或 JWT 未变化：若仍有 JWT，保留 has_quota（不能确认配额耗尽）
+                    # 刷新失败或 JWT 未变化：若仍有旧 JWT，保留 has_quota（无法确认配额耗尽）
                     if account.get("jwt"):
                         account["quota_status_reason"] = "fast_recheck_401_jwt_refresh_failed"
                         account["last_quota_check"] = time.time()
                         return account.get("has_quota", True)
-                # 无法恢复（无 licenseId / 已刷新仍 401 / 无 JWT）→ 确认无配额
+                # 普通账号 401 / 无法恢复 → 确认无配额
                 account["has_quota"] = False
                 account["last_quota_check"] = time.time()
                 return False
