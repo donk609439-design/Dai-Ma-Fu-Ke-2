@@ -38,8 +38,7 @@ JETBRAINS_ACCOUNTS: list = []
 current_account_index: int = 0
 account_rotation_lock = asyncio.Lock()
 # JWT 刷新全局节流：防止高并发时 grazie auth 接口被击穿
-# 即使 _first_ready 给每个请求做了批内并发限制（8），多个用户同时请求时累积仍会超过上游能承受的速率。
-_jwt_refresh_sem = asyncio.Semaphore(20)
+_jwt_refresh_sem = asyncio.Semaphore(500)
 # 每个账号 ID 对应一把 JWT 刷新锁，防止并发请求重复刷新同一账号
 _jwt_refresh_locks: Dict[str, asyncio.Lock] = {}
 # 当前正在进行 _check_quota 的账号 ID 集合（防止同一账号并发重入）
