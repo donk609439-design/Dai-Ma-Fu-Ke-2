@@ -2268,6 +2268,11 @@ async def get_next_jetbrains_account(client_key: Optional[str] = None) -> dict:
         - 配额重查窗口缩短至 120 秒（原 300 秒），更快感知账号恢复
         - JWT 刷新使用每账号独立锁，防止并发请求重复发起刷新（刷新后双重检查）
         """
+        # ── JWT 冷却期检查：401-jwt-cooldown 后 300s 内直接跳过 ──
+        last_jwt_fail = float(account.get("last_jwt_fail") or 0)
+        if last_jwt_fail and time.time() - last_jwt_fail < 300:
+            return False
+
         if not account.get("has_quota"):
             last_check = account.get("last_quota_check", 0)
             if time.time() - last_check >= 120:   # 缩短至 2 分钟，更快恢复
@@ -2321,9 +2326,15 @@ async def get_next_jetbrains_account(client_key: Optional[str] = None) -> dict:
         if n == 0:
             raise HTTPException(status_code=503, detail="服务不可用: 未配置 JetBrains 账户")
 
+        # 主组：has_quota=True（或未检测过）的账号，优先处理，无需网络调用即可判断可用性
         group1: list = []  # 绑定了本次请求 key 的账号（最高优先）
         group2: list = []  # 没有任何 key 绑定的账号（公共池）
         group3: list = []  # 有其他 key 绑定的账号（兜底）
+        # 重检组：has_quota=False 但 last_quota_check 已超 120s 的账号（可能已恢复）
+        # 仅在主组全部耗尽时才进入，避免每次请求都触发大量 _check_quota 网络调用
+        retry1: list = []
+        retry2: list = []
+        retry3: list = []
 
         # 预构建「所有已绑定账号 ID」集合：O(keys) 一次，避免 O(accounts×keys)
         bound_account_ids: set = set()
@@ -2332,12 +2343,32 @@ async def get_next_jetbrains_account(client_key: Optional[str] = None) -> dict:
             bound_account_ids.update(x.strip() for x in _raw.split(",") if x.strip())
 
         now_ts = time.time()
+        _JWT_COOLDOWN = 300  # 与 _try_account 保持一致
         for i in range(n):
             idx = (current_account_index + i) % n
             acc = JETBRAINS_ACCOUNTS[idx]
-            if not acc.get("has_quota"):
-                if now_ts - acc.get("last_quota_check", 0) < 120:   # 对齐 _try_account 窗口
+
+            # 跳过 JWT 冷却期内的账号（_try_account 也会跳过，提前过滤节省并发槽）
+            _last_jwt_fail = float(acc.get("last_jwt_fail") or 0)
+            if _last_jwt_fail and now_ts - _last_jwt_fail < _JWT_COOLDOWN:
+                continue
+
+            is_confirmed_no_quota = acc.get("has_quota") is False
+            if is_confirmed_no_quota:
+                # 近期已确认无配额 → 完全跳过
+                if now_ts - acc.get("last_quota_check", 0) < 120:
                     continue
+                # 超过 120s 的无配额账号 → 进入重检组（仅兜底使用）
+                acc_id = _account_id(acc)
+                if preferred_account_ids and acc_id in preferred_account_ids:
+                    retry1.append((idx, acc))
+                elif acc_id not in bound_account_ids:
+                    retry2.append((idx, acc))
+                else:
+                    retry3.append((idx, acc))
+                continue
+
+            # has_quota=True 或 None（从未检测过）→ 进入主组
             acc_id = _account_id(acc)
             if preferred_account_ids and acc_id in preferred_account_ids:
                 group1.append((idx, acc))
@@ -2346,11 +2377,16 @@ async def get_next_jetbrains_account(client_key: Optional[str] = None) -> dict:
             else:
                 group3.append((idx, acc))
 
-        candidates = group1 + group2 + group3
+        # 主组候选优先；重检组只在主组全部失败后才处理
+        primary_candidates = group1 + group2 + group3
+        retry_candidates = retry1 + retry2 + retry3
+        candidates = primary_candidates + retry_candidates
 
         # 关键：立即推进索引到第一候选位，后续并发请求从下一个账号开始，分散负载
-        if candidates:
-            current_account_index = (candidates[0][0] + 1) % n
+        if primary_candidates:
+            current_account_index = (primary_candidates[0][0] + 1) % n
+        elif retry_candidates:
+            current_account_index = (retry_candidates[0][0] + 1) % n
 
     if not candidates:
         raise HTTPException(status_code=429, detail="所有 JetBrains 账户均已超出配额或无效")
@@ -2401,7 +2437,14 @@ async def get_next_jetbrains_account(client_key: Optional[str] = None) -> dict:
             # 该批全部失败（remaining 在 finally 里降到 0 触发 done_event）→ 进入下一批
         return None
 
+    # 先处理主组（has_quota=True），按 key 绑定优先级；主组全部失败才尝试重检组
     for grp in (group1, group2, group3):
+        chosen = await _first_ready(grp)
+        if chosen:
+            return chosen
+
+    # 主组无可用账号 → 尝试重检组（has_quota=False 但超过 120s，可能已恢复）
+    for grp in (retry1, retry2, retry3):
         chosen = await _first_ready(grp)
         if chosen:
             return chosen
@@ -2505,11 +2548,13 @@ async def _make_jetbrains_raw_stream(account: dict, payload: dict, extra_headers
                         raise
                     except Exception as _re:
                         print(f"[401] JWT 刷新失败 ({acc_id}): {_re}")
-                # 兜底：401 无法恢复（attempt=1 / 无 authorization / refresh 失败）→ 切换账号
-                account["has_quota"] = False
-                account["last_quota_check"] = time.time()
+                # 兜底：401 无法恢复（attempt=1 / 无 authorization / refresh 失败）
+                # 401 = JWT 失效，不等于配额耗尽；不标 has_quota=False，
+                # 改为打一个 JWT 冷却标记（300 秒内跳过此账号），避免误伤整个池子。
+                account["last_jwt_fail"] = time.time()
                 asyncio.create_task(_save_account_to_db(account))
-                raise _AccountFailed(f"401-no-recovery:{acc_id}") from e
+                print(f"[401] 账号 {acc_id} JWT 失效，进入 300s 冷却（不标无配额）")
+                raise _AccountFailed(f"401-jwt-cooldown:{acc_id}") from e
             if code == 400:
                 body = getattr(e.response, "_content", b"")
                 body_str = body.decode("utf-8", errors="replace")
