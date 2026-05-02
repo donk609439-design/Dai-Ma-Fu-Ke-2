@@ -1998,8 +1998,16 @@ async def authenticate_anthropic_client(
 
 
 
-async def _check_quota(account: dict):
+async def _check_quota(account: dict, strict_jwt: bool = False):
     """检查指定账户的配额。
+
+    参数：
+    - strict_jwt=False（默认，用于实时请求/发现任务）：
+        JWT 刷新失败时若还有旧 JWT，保留 has_quota=True，给一次实际 API 调用机会。
+    - strict_jwt=True（用于维护任务）：
+        JWT 刷新返回 401（authorization 永久失效）→ 直接标记 has_quota=False 踢出池；
+        JWT 刷新返回 429（速率限制，暂时故障）→ 保留现状，留待下次维护周期重试。
+
     - 重入保护：同一账号已有检测在运行时直接跳过，防止并发重复刷新 JWT
     - JWT 刷新节流：仅在 JWT 缺失或超过 _JWT_REFRESH_INTERVAL_SECS 时才刷新
     """
@@ -2017,6 +2025,7 @@ async def _check_quota(account: dict):
         # pre_refresh_attempted=True 表示本次检测前已经尝试过刷新（无论结果），
         # 若 quota API 之后仍返回 401，不再二次刷新（避免 429→旧JWT→401→429 循环）
         pre_refresh_attempted = False
+        _jwt_refresh_err: Optional[str] = None   # 记录刷新失败类型："401" / "429" / "other"
         if account.get("licenseId") and account.get("authorization"):
             jwt_missing = not account.get("jwt")
             last_upd = float(account.get("last_updated") or 0)
@@ -2026,7 +2035,21 @@ async def _check_quota(account: dict):
                 try:
                     await _refresh_jetbrains_jwt(account)
                 except Exception as _e:
+                    _err_str = str(_e)
                     print(f"检查配额时 JWT 刷新失败（将用现有 JWT 继续）: {_e}")
+                    if _err_str.startswith("401:"):
+                        _jwt_refresh_err = "401"
+                    elif _err_str.startswith("429:"):
+                        _jwt_refresh_err = "429"
+                    else:
+                        _jwt_refresh_err = "other"
+                    # strict_jwt 模式：authorization 永久失效（401）→ 直接踢出，无需查配额
+                    if strict_jwt and _jwt_refresh_err == "401":
+                        account["has_quota"] = False
+                        account["quota_status_reason"] = "auth_token_invalid"
+                        account["last_quota_check"] = time.time()
+                        print(f"[strict] 账号 {acc_id} JWT 刷新 401（authorization 永久失效），踢出池")
+                        return
 
         if not account.get("jwt"):
             print(f"账号 {account.get('licenseId', '?')} 无 JWT，无法查询配额")
@@ -2047,14 +2070,14 @@ async def _check_quota(account: dict):
         if response.status_code == 401 and account.get("licenseId"):
             # 若本轮已尝试过刷新（无论成功/429/其他失败），不再二次尝试
             if pre_refresh_attempted:
-                # JWT刷新失败 + quota API 401 ≠ 配额耗尽
-                # 可能是 auth 端点临时异常（批量 401 通常是服务端问题而非账号问题）
-                # 策略：不更新 has_quota，保留现状；若账号有 JWT，给一次实际 API 调用的机会
-                # 实际 API 返回 477 才是真正无配额；401 可在 _make_jetbrains_raw_stream 里重试
                 old_has_quota = account.get("has_quota")
                 if account.get("jwt"):
-                    # 有现存 JWT → 标记为"待验证"（True），让实际 API 调用做最终裁定
-                    # 注意：reason 故意不以 jwt_ 开头，避免触发 _check_quota_fast 的误标保护
+                    # 有现存 JWT。
+                    # strict_jwt 模式（维护任务）：
+                    #   - 刷新 401 已在上方 early-return 处理（不会走到此处）
+                    #   - 刷新 429/other + quota API 401 → 保留现状，下次维护再试
+                    # 非 strict 模式（实时请求）：
+                    #   - 保留 has_quota=True，给一次实际 API 调用机会
                     account["has_quota"] = True
                     account["quota_status_reason"] = "auth_401_indeterminate"
                     print(f"Account {account.get('licenseId')} quota API 401 after JWT refresh, "
@@ -3801,9 +3824,9 @@ async def _run_pool_maintenance():
             return
 
         print(f"[pool-maintenance] 开始：重检池内 {len(targets)} 个账号")
-        # licenseId 账号需要 JWT 刷新才能准确判断配额，用 _check_quota（含刷新）
-        # 并发限制为 15，避免打爆 auth 端点；无 licenseId 的账号用 _check_quota_fast 加速
-        semaphore_full = asyncio.Semaphore(15)   # 带 JWT 刷新
+        # licenseId 账号需要 JWT 刷新才能准确判断配额，用 _check_quota（含刷新，strict=True）
+        # 并发限制为 5，避免打爆 auth 端点（实测 15 仍触发 429）；无 licenseId 的账号用 fast 加速
+        semaphore_full = asyncio.Semaphore(5)    # 带 JWT 刷新（严格模式）
         semaphore_fast = asyncio.Semaphore(300)  # 不刷新，纯配额查询
         kicked_count = 0
         done_count   = 0
@@ -3815,7 +3838,7 @@ async def _run_pool_maintenance():
             if has_license:
                 async with semaphore_full:
                     try:
-                        await _check_quota(acc)   # 含 JWT 刷新，精准判断
+                        await _check_quota(acc, strict_jwt=True)   # 含 JWT 刷新，严格踢出
                     except asyncio.CancelledError:
                         raise
                     except Exception as e:
