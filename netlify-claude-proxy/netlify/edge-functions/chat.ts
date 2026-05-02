@@ -182,13 +182,39 @@ function anthropicToOpenAI(resp: AnthropicResponse, requestedModel: string) {
 }
 
 // ---------- Anthropic SSE → OpenAI SSE ----------
+// Per-read upstream timeout: if no bytes arrive within this window, give up
+// gracefully instead of hanging forever. Anthropic's longest "thinking" phases
+// rarely exceed this; AI Gateway hiccups should resolve faster too.
+const UPSTREAM_READ_TIMEOUT_MS = 90_000;
+
 async function* parseAnthropicSSE(body: ReadableStream<Uint8Array>): AsyncGenerator<any> {
   const reader = body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
 
   while (true) {
-    const { value, done } = await reader.read();
+    let chunk: ReadableStreamReadResult<Uint8Array>;
+    try {
+      chunk = await Promise.race([
+        reader.read(),
+        new Promise<never>((_, reject) =>
+          setTimeout(
+            () => reject(new Error(`upstream read timeout after ${UPSTREAM_READ_TIMEOUT_MS}ms`)),
+            UPSTREAM_READ_TIMEOUT_MS,
+          ),
+        ),
+      ]);
+    } catch (err) {
+      // Surface as a synthetic error event so the consumer ends the stream cleanly.
+      yield { type: "error", error: { message: (err as Error).message, type: "upstream_timeout" } };
+      try {
+        await reader.cancel();
+      } catch {
+        /* ignore */
+      }
+      return;
+    }
+    const { value, done } = chunk;
     if (done) break;
     // Normalize CRLF → LF so the \n\n splitter works on either style.
     buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
@@ -249,6 +275,18 @@ async function streamAnthropicToOpenAI(
 
   const stream = new ReadableStream({
     async start(controller) {
+      // SSE keepalive: emit a comment line every 10s so intermediate proxies /
+      // CDNs / clients don't drop the idle TCP connection during long upstream
+      // pauses (Anthropic "thinking" phases, AI Gateway hiccups). Comment lines
+      // start with `:` per the SSE spec — clients ignore them.
+      const heartbeat = setInterval(() => {
+        try {
+          controller.enqueue(encoder.encode(`: keepalive ${Date.now()}\n\n`));
+        } catch {
+          /* controller closed; interval will be cleared in finally */
+        }
+      }, 10_000);
+
       try {
         for await (const evt of parseAnthropicSSE(upstream.body!)) {
           if (evt.type === "message_start") {
@@ -310,6 +348,8 @@ async function streamAnthropicToOpenAI(
         controller.close();
       } catch (err) {
         controller.error(err);
+      } finally {
+        clearInterval(heartbeat);
       }
     },
   });
