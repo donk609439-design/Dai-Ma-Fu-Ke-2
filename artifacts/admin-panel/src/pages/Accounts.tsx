@@ -1,10 +1,9 @@
 import { useState, useEffect, useRef, useMemo } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { Plus, Trash2, CheckCircle, XCircle, RefreshCw, Users, ShieldCheck, Copy, Check, RotateCcw, ListChecks, Eraser, ChevronDown, ChevronRight, KeyRound, Unlink, Search, X } from "lucide-react";
+import { Plus, RefreshCw, Users, Copy, Check, ChevronDown, ChevronRight, KeyRound, Unlink, Search, X, Zap, Activity, ListChecks, Eraser } from "lucide-react";
 import { adminFetch } from "@/lib/admin-auth";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
-import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger, DialogFooter, DialogDescription } from "@/components/ui/dialog";
@@ -23,6 +22,26 @@ interface Account {
   last_quota_check: number;
   account_id: string;
   quota_status_reason: string | null;
+  in_pool: boolean;
+}
+
+interface PoolStatus {
+  pool_size: number;
+  total_accounts: number;
+  discovery: {
+    running: boolean;
+    done: number;
+    total: number;
+    added: number;
+    last_at: number;
+  };
+  maintenance: {
+    running: boolean;
+    done: number;
+    total: number;
+    kicked: number;
+    last_at: number;
+  };
 }
 
 const QUOTA_REASON_LABELS: Record<string, string> = {
@@ -40,6 +59,12 @@ function fmtTokens(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
   if (n >= 1_000) return `${Math.round(n / 1_000)}K`;
   return String(n);
+}
+
+function fmtTime(ts: number): string {
+  if (!ts) return "从未";
+  const d = new Date(ts * 1000);
+  return d.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 }
 
 function CreditsDisplay({ daily_used, daily_total, has_quota, last_quota_check }: {
@@ -98,89 +123,60 @@ function AccountCard({
     <Card className={`border-card-border transition-all ${account.has_quota ? "glow-green" : "glow-red"}`}>
       <CardContent className="flex items-center gap-4 py-4">
         <div className="flex items-center gap-2 shrink-0">
-          {account.has_quota ? (
-            <CheckCircle className="w-5 h-5 text-emerald-400" />
-          ) : (
-            <XCircle className="w-5 h-5 text-destructive" />
-          )}
-          <span className="text-sm font-medium text-muted-foreground">#{account.index + 1}</span>
-        </div>
-
-        <div className="flex-1 min-w-0 space-y-1.5">
-          <div className="flex items-center gap-2 flex-wrap">
-            {account.licenseId && (
-              <Badge variant="outline" className="text-xs border-blue-500/30 text-blue-400">
-                <ShieldCheck className="w-3 h-3 mr-1" />
-                {account.licenseId}
-              </Badge>
-            )}
-            {account.jwt_preview && (
-              <code className="text-xs text-muted-foreground font-mono bg-muted px-2 py-0.5 rounded">
-                JWT: {account.jwt_preview}
-              </code>
-            )}
-            {account.auth_preview && (
-              <code className="text-xs text-muted-foreground font-mono bg-muted px-2 py-0.5 rounded">
-                Auth: {account.auth_preview}
-              </code>
-            )}
-          </div>
-          <div className="flex items-center gap-3">
-            <span className="text-xs text-muted-foreground shrink-0">
-              {account.licenseId ? "自动刷新" : "静态 JWT"}
-            </span>
-            <span className="text-xs text-muted-foreground/40">·</span>
-            <span className="text-xs text-muted-foreground shrink-0">AI Credits</span>
-            <CreditsDisplay
-              daily_used={account.daily_used}
-              daily_total={account.daily_total}
-              has_quota={account.has_quota}
-              last_quota_check={account.last_quota_check}
-            />
-          </div>
-        </div>
-
-        <Badge className={`shrink-0 ${account.has_quota ? "bg-emerald-500/20 text-emerald-400 border-emerald-500/30" : "bg-destructive/20 text-destructive border-destructive/30"}`}>
           {account.has_quota
-            ? "正常"
-            : (account.quota_status_reason && QUOTA_REASON_LABELS[account.quota_status_reason])
-              || "超限"}
-        </Badge>
-
-        {account.has_jwt && (
-          <Button variant="ghost" size="sm" className="text-muted-foreground hover:text-primary shrink-0"
-            onClick={() => copyJwt(account.index)} title="复制 JWT">
-            {copiedIndex === account.index
-              ? <Check className="w-4 h-4 text-emerald-400" />
-              : <Copy className="w-4 h-4" />}
-          </Button>
-        )}
-
-        <Button variant="ghost" size="sm" className="text-muted-foreground hover:text-amber-400 shrink-0"
-          onClick={() => resetQuotaMutation.mutate(account.index)}
-          disabled={resetQuotaMutation.isPending}
-          title="重置配额（立即重新检查）">
-          <RotateCcw className={`w-4 h-4 ${resetQuotaMutation.isPending ? "animate-spin" : ""}`} />
-        </Button>
-
-        <Button variant="ghost" size="sm" className="text-muted-foreground hover:text-destructive shrink-0"
-          onClick={() => deleteMutation.mutate(account.index)} disabled={deleteMutation.isPending}>
-          <Trash2 className="w-4 h-4" />
-        </Button>
+            ? <span className="w-2 h-2 rounded-full bg-emerald-400 shrink-0" />
+            : <span className="w-2 h-2 rounded-full bg-destructive shrink-0" />}
+        </div>
+        <div className="flex-1 min-w-0 grid grid-cols-[1fr_auto] gap-x-4 gap-y-1">
+          <div className="flex items-center gap-2 min-w-0">
+            <code className="text-xs font-mono text-muted-foreground truncate">
+              {account.licenseId || account.jwt_preview || account.account_id}
+            </code>
+            {account.quota_status_reason && !account.has_quota && (
+              <span className="text-xs bg-destructive/20 text-destructive border border-destructive/30 px-1.5 py-0.5 rounded-full shrink-0">
+                {QUOTA_REASON_LABELS[account.quota_status_reason] ?? account.quota_status_reason}
+              </span>
+            )}
+          </div>
+          <div className="row-span-2 flex items-center gap-2 shrink-0">
+            <button
+              className="text-xs text-muted-foreground hover:text-foreground transition-colors p-1"
+              onClick={() => copyJwt(account.index)}
+              title="复制 JWT"
+            >
+              {copiedIndex === account.index ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
+            </button>
+            <button
+              className="text-xs text-muted-foreground hover:text-amber-400 transition-colors p-1"
+              onClick={() => resetQuotaMutation.mutate(account.index)}
+              disabled={resetQuotaMutation.isPending}
+              title="重置配额"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${resetQuotaMutation.isPending ? "animate-spin" : ""}`} />
+            </button>
+            <button
+              className="text-xs text-muted-foreground hover:text-destructive transition-colors p-1"
+              onClick={() => deleteMutation.mutate(account.index)}
+              disabled={deleteMutation.isPending}
+              title="删除账号"
+            >
+              <X className="w-3.5 h-3.5" />
+            </button>
+          </div>
+          <CreditsDisplay
+            daily_used={account.daily_used}
+            daily_total={account.daily_total}
+            has_quota={account.has_quota}
+            last_quota_check={account.last_quota_check}
+          />
+        </div>
       </CardContent>
     </Card>
   );
 }
 
 function SectionHeader({
-  icon,
-  label,
-  count,
-  expanded,
-  onToggle,
-  iconClass,
-  hoverClass,
-  badge,
+  icon, label, count, expanded, onToggle, iconClass, hoverClass, badge,
 }: {
   icon: React.ReactNode;
   label: string;
@@ -194,9 +190,9 @@ function SectionHeader({
   return (
     <button
       onClick={onToggle}
-      className={`w-full flex items-center justify-between px-1 py-1.5 text-sm font-medium text-foreground transition-colors group ${hoverClass ?? "hover:text-primary"}`}
+      className={`w-full flex items-center gap-2 py-2 px-1 rounded-lg text-sm font-medium text-muted-foreground transition-colors hover:bg-muted/40 ${hoverClass ?? ""}`}
     >
-      <div className="flex items-center gap-2">
+      <div className="flex items-center gap-2 flex-1">
         <span className={iconClass}>{icon}</span>
         <span>{label}</span>
         <span className="text-xs text-muted-foreground font-normal">（{count} 个）</span>
@@ -223,6 +219,7 @@ export default function Accounts() {
   const [showExistingKeys, setShowExistingKeys] = useState(false);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const [boundExpanded, setBoundExpanded] = useState(false);
+  const [poolExpanded, setPoolExpanded] = useState(true);
   const [unboundExpanded, setUnboundExpanded] = useState(false);
   const [searchQ, setSearchQ] = useState("");
 
@@ -240,7 +237,7 @@ export default function Accounts() {
               qc.invalidateQueries({ queryKey: ["admin-status"] });
             }
           }
-        } catch { /* ignore */ }
+        } catch { }
         qc.invalidateQueries({ queryKey: ["admin-accounts"] });
       }, 2000);
       return () => {
@@ -285,6 +282,16 @@ export default function Accounts() {
       if (!res.ok) throw new Error("获取账户失败");
       return res.json();
     },
+  });
+
+  const { data: poolData, refetch: refetchPool } = useQuery<PoolStatus>({
+    queryKey: ["admin-pool-status"],
+    queryFn: async () => {
+      const res = await adminFetch("/admin/accounts/pool-status");
+      if (!res.ok) throw new Error("获取轮询池状态失败");
+      return res.json();
+    },
+    refetchInterval: 5000,
   });
 
   const { data: keysData } = useQuery<{ keys_with_meta: KeyMeta[] }>({
@@ -374,31 +381,11 @@ export default function Accounts() {
       return res.json();
     },
     onSuccess: (data) => {
-      toast({
-        title: "全量重检已启动",
-        description: `正在后台检测 ${data.total} 个账号，列表将自动刷新…`,
-      });
+      toast({ title: "全量重检已启动", description: `正在后台检测 ${data.total} 个账号…` });
       setIsRechecking(true);
       qc.invalidateQueries({ queryKey: ["admin-accounts"] });
     },
     onError: () => toast({ title: "启动重检失败", variant: "destructive" }),
-  });
-
-  const turboRecheckMutation = useMutation({
-    mutationFn: async () => {
-      const res = await adminFetch("/admin/accounts/turbo-recheck?concurrency=120&delete_empty=false", { method: "POST" });
-      if (!res.ok) throw new Error("触发失败");
-      return res.json();
-    },
-    onSuccess: (data) => {
-      toast({
-        title: "⚡ 极速重检已启动",
-        description: `${data.total} 个账号，并发 ${data.concurrency}，预计 ${data.eta_minutes} 分钟完成`,
-      });
-      setIsRechecking(true);
-      qc.invalidateQueries({ queryKey: ["admin-accounts"] });
-    },
-    onError: () => toast({ title: "极速重检启动失败", variant: "destructive" }),
   });
 
   const deleteExhaustedMutation = useMutation({
@@ -418,6 +405,40 @@ export default function Accounts() {
     onError: () => toast({ title: "清理失败", variant: "destructive" }),
   });
 
+  const triggerDiscoveryMutation = useMutation({
+    mutationFn: async () => {
+      const res = await adminFetch("/admin/accounts/pool/trigger-discovery", { method: "POST" });
+      if (!res.ok) throw new Error("触发失败");
+      return res.json();
+    },
+    onSuccess: (data) => {
+      if (data.success) {
+        toast({ title: "发现任务已启动", description: "正在后台检测未入池账号并补充轮询池" });
+        refetchPool();
+      } else {
+        toast({ title: data.message, variant: "destructive" });
+      }
+    },
+    onError: () => toast({ title: "触发失败", variant: "destructive" }),
+  });
+
+  const triggerMaintenanceMutation = useMutation({
+    mutationFn: async () => {
+      const res = await adminFetch("/admin/accounts/pool/trigger-maintenance", { method: "POST" });
+      if (!res.ok) throw new Error("触发失败");
+      return res.json();
+    },
+    onSuccess: (data) => {
+      if (data.success) {
+        toast({ title: "维护任务已启动", description: "正在重检池内账号，无配额的将被踢出" });
+        refetchPool();
+      } else {
+        toast({ title: data.message, variant: "destructive" });
+      }
+    },
+    onError: () => toast({ title: "触发失败", variant: "destructive" }),
+  });
+
   const accounts = data?.accounts ?? [];
 
   const boundAccountIds = useMemo(() => {
@@ -434,7 +455,7 @@ export default function Accounts() {
     return ids;
   }, [keysData]);
 
-  const { boundAccounts, unboundAccounts } = useMemo(() => {
+  const { boundAccounts, poolAccounts, unboundAccounts } = useMemo(() => {
     const q = searchQ.trim().toLowerCase();
     const match = (a: Account) =>
       !q ||
@@ -443,15 +464,17 @@ export default function Accounts() {
       a.jwt_preview.toLowerCase().includes(q);
     return {
       boundAccounts: accounts.filter(a => boundAccountIds.has(a.account_id) && match(a)),
-      unboundAccounts: accounts.filter(a => !boundAccountIds.has(a.account_id) && match(a)),
+      poolAccounts: accounts.filter(a => !boundAccountIds.has(a.account_id) && a.in_pool && match(a)),
+      unboundAccounts: accounts.filter(a => !boundAccountIds.has(a.account_id) && !a.in_pool && match(a)),
     };
   }, [accounts, boundAccountIds, searchQ]);
 
   const cardProps = { copiedIndex, copyJwt, resetQuotaMutation, deleteMutation };
 
+  const poolRunning = poolData?.discovery.running || poolData?.maintenance.running;
+
   return (
     <div className="p-6 space-y-6">
-      {/* 已存在账号的密钥弹窗 */}
       <Dialog open={showExistingKeys} onOpenChange={setShowExistingKeys}>
         <DialogContent className="sm:max-w-lg">
           <DialogHeader>
@@ -494,7 +517,7 @@ export default function Accounts() {
         </DialogContent>
       </Dialog>
 
-      <div className="flex items-center justify-between">
+      <div className="flex items-center justify-between flex-wrap gap-3">
         <div>
           <h1 className="text-2xl font-bold text-foreground">账户管理</h1>
           <p className="text-sm text-muted-foreground mt-1">
@@ -507,7 +530,7 @@ export default function Accounts() {
             )}
           </p>
         </div>
-        <div className="flex items-center gap-3">
+        <div className="flex items-center gap-2 flex-wrap">
           <div className="relative">
             <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-muted-foreground pointer-events-none" />
             <Input
@@ -538,20 +561,6 @@ export default function Accounts() {
           >
             <ListChecks className={`w-4 h-4 mr-2 ${(recheckAllMutation.isPending || isRechecking) ? "animate-pulse" : ""}`} />
             {isRechecking ? "检测中…" : "全量重检"}
-          </Button>
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => turboRecheckMutation.mutate()}
-            disabled={turboRecheckMutation.isPending || isRechecking}
-            className={
-              isRechecking && turboRecheckMutation.isSuccess
-                ? "border-yellow-500/50 text-yellow-400"
-                : "border-yellow-500/30 text-yellow-400 hover:border-yellow-400 hover:bg-yellow-400/10"
-            }
-          >
-            <ListChecks className={`w-4 h-4 mr-2 ${(turboRecheckMutation.isPending || (isRechecking && turboRecheckMutation.isSuccess)) ? "animate-pulse" : ""}`} />
-            ⚡ 极速重检
           </Button>
           <Button
             variant="outline"
@@ -644,6 +653,85 @@ export default function Accounts() {
         </div>
       )}
 
+      {/* 轮询池状态卡片 */}
+      {poolData && (
+        <div className="rounded-xl border border-card-border bg-card/60 p-4 space-y-3">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <Activity className={`w-4 h-4 ${poolRunning ? "text-emerald-400 animate-pulse" : "text-primary"}`} />
+              <span className="text-sm font-semibold text-foreground">轮询池</span>
+              <span className="text-xs text-muted-foreground">（每 10 分钟自动发现 + 维护）</span>
+            </div>
+            <div className="flex items-center gap-2">
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-7 px-2.5 text-xs border-emerald-500/30 text-emerald-400 hover:border-emerald-400 hover:bg-emerald-400/10"
+                onClick={() => triggerDiscoveryMutation.mutate()}
+                disabled={triggerDiscoveryMutation.isPending || poolData.discovery.running}
+              >
+                <Zap className="w-3 h-3 mr-1" />
+                {poolData.discovery.running ? "发现中…" : "立即发现"}
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-7 px-2.5 text-xs border-amber-500/30 text-amber-400 hover:border-amber-400 hover:bg-amber-400/10"
+                onClick={() => triggerMaintenanceMutation.mutate()}
+                disabled={triggerMaintenanceMutation.isPending || poolData.maintenance.running}
+              >
+                <RefreshCw className={`w-3 h-3 mr-1 ${poolData.maintenance.running ? "animate-spin" : ""}`} />
+                {poolData.maintenance.running ? "维护中…" : "立即维护"}
+              </Button>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-3 gap-3">
+            <div className="rounded-lg bg-muted/40 border border-border px-3 py-2 text-center">
+              <div className="text-2xl font-bold text-emerald-400">{poolData.pool_size.toLocaleString()}</div>
+              <div className="text-xs text-muted-foreground mt-0.5">池内账号</div>
+            </div>
+            <div className="rounded-lg bg-muted/40 border border-border px-3 py-2 text-center">
+              <div className="text-2xl font-bold text-foreground">{poolData.total_accounts.toLocaleString()}</div>
+              <div className="text-xs text-muted-foreground mt-0.5">总账号数</div>
+            </div>
+            <div className="rounded-lg bg-muted/40 border border-border px-3 py-2 text-center">
+              <div className="text-2xl font-bold text-primary">
+                {poolData.total_accounts > 0 ? Math.round(poolData.pool_size / poolData.total_accounts * 100) : 0}%
+              </div>
+              <div className="text-xs text-muted-foreground mt-0.5">入池率</div>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 gap-2 text-xs text-muted-foreground">
+            <div className="rounded-lg bg-muted/20 px-3 py-2 space-y-1">
+              <div className="flex items-center gap-1.5 text-emerald-400 font-medium">
+                <Zap className="w-3 h-3" />
+                发现任务
+                {poolData.discovery.running && <span className="text-xs bg-emerald-500/20 text-emerald-400 rounded px-1">运行中</span>}
+              </div>
+              {poolData.discovery.running ? (
+                <div>{poolData.discovery.done}/{poolData.discovery.total} 已检测，新增 {poolData.discovery.added} 个</div>
+              ) : (
+                <div>上次运行：{fmtTime(poolData.discovery.last_at)}，新增 {poolData.discovery.added} 个</div>
+              )}
+            </div>
+            <div className="rounded-lg bg-muted/20 px-3 py-2 space-y-1">
+              <div className="flex items-center gap-1.5 text-amber-400 font-medium">
+                <RefreshCw className={`w-3 h-3 ${poolData.maintenance.running ? "animate-spin" : ""}`} />
+                维护任务
+                {poolData.maintenance.running && <span className="text-xs bg-amber-500/20 text-amber-400 rounded px-1">运行中</span>}
+              </div>
+              {poolData.maintenance.running ? (
+                <div>{poolData.maintenance.done}/{poolData.maintenance.total} 已检测，踢出 {poolData.maintenance.kicked} 个</div>
+              ) : (
+                <div>上次运行：{fmtTime(poolData.maintenance.last_at)}，踢出 {poolData.maintenance.kicked} 个</div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
       {isLoading ? (
         <div className="flex items-center justify-center h-48 text-muted-foreground">
           <RefreshCw className="w-5 h-5 animate-spin mr-2" />
@@ -683,7 +771,38 @@ export default function Accounts() {
             )}
           </div>
 
-          {/* 无绑定密钥的账户 */}
+          {/* 轮询池账户 */}
+          <div className="space-y-2">
+            <SectionHeader
+              icon={<Activity className="w-4 h-4" />}
+              label="轮询池"
+              count={poolAccounts.length}
+              expanded={poolExpanded}
+              onToggle={() => setPoolExpanded(v => !v)}
+              iconClass="text-primary"
+              hoverClass="hover:text-primary"
+              badge={
+                poolAccounts.length > 0 ? (
+                  <span className="text-xs bg-primary/20 text-primary border border-primary/30 px-1.5 py-0.5 rounded-full">
+                    有配额
+                  </span>
+                ) : undefined
+              }
+            />
+            {poolExpanded && (
+              poolAccounts.length === 0 ? (
+                <p className="text-xs text-muted-foreground pl-6 py-2">轮询池为空，后台发现任务将自动补充有配额账号</p>
+              ) : (
+                <div className="space-y-3">
+                  {poolAccounts.map(account => (
+                    <AccountCard key={account.index} account={account} {...cardProps} />
+                  ))}
+                </div>
+              )
+            )}
+          </div>
+
+          {/* 无绑定密钥的账户（不在池中） */}
           <div className="space-y-2">
             <SectionHeader
               icon={<Unlink className="w-4 h-4" />}
@@ -691,19 +810,19 @@ export default function Accounts() {
               count={unboundAccounts.length}
               expanded={unboundExpanded}
               onToggle={() => setUnboundExpanded(v => !v)}
-              iconClass="text-amber-400"
-              hoverClass="hover:text-amber-400"
+              iconClass="text-muted-foreground"
+              hoverClass="hover:text-muted-foreground"
               badge={
                 unboundAccounts.length > 0 ? (
-                  <span className="text-xs bg-amber-500/20 text-amber-400 border border-amber-500/30 px-1.5 py-0.5 rounded-full">
-                    未分配
+                  <span className="text-xs bg-muted/40 text-muted-foreground border border-border px-1.5 py-0.5 rounded-full">
+                    待发现
                   </span>
                 ) : undefined
               }
             />
             {unboundExpanded && (
               unboundAccounts.length === 0 ? (
-                <p className="text-xs text-muted-foreground pl-6 py-2">所有账户都已绑定密钥</p>
+                <p className="text-xs text-muted-foreground pl-6 py-2">所有无绑定账户均已在轮询池中</p>
               ) : (
                 <div className="space-y-3">
                   {unboundAccounts.map(account => (

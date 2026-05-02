@@ -103,6 +103,26 @@ _ADMIN_CACHE_TTL: Dict[str, float] = {
     "prizes":      30.0,  # /key/prizes            —— 奖品列表每 30s 刷新
 }
 
+# ==================== 轮询池 ====================
+# 存储已确认有配额的账号 ID，供用户请求时随机选号。
+# 由后台 _pool_discovery_loop / _pool_maintenance_loop 自动维护：
+#   发现任务：每 10 分钟随机取 500 个未入池账号，刷新 JWT + 检查配额，有配额的加入池。
+#   维护任务：每 10 分钟重检池内所有账号（快速版，无 JWT 刷新），无配额的踢出。
+POLLING_POOL: set = set()            # 账号 ID 集合（CPython set 读取原子性，写操作受 _pool_lock 保护）
+_pool_lock = asyncio.Lock()          # 保护 POLLING_POOL 批量写操作
+_pool_task_state: dict = {
+    "discovery_running": False,
+    "discovery_done":    0,
+    "discovery_total":   0,
+    "discovery_added":   0,
+    "last_discovery_at": 0.0,
+    "maintenance_running": False,
+    "maintenance_done":    0,
+    "maintenance_total":   0,
+    "maintenance_kicked":  0,
+    "last_maintenance_at": 0.0,
+}
+
 def _admin_cache_get(key: str) -> "bytes | None":
     entry = _admin_cache.get(key)
     if entry and time.time() - entry[0] < _ADMIN_CACHE_TTL.get(key, 10.0):
@@ -777,6 +797,7 @@ async def _ensure_db_tables():
         # 该邮箱（行）是否已为 LOW 用户的 key 贡献过 +16 额度
         # —— 同一邮箱凑够 4 个信任凭证只会触发一次 +16，不会重复计入
         await conn.execute("ALTER TABLE jb_accounts ADD COLUMN IF NOT EXISTS pending_nc_quota_granted BOOLEAN DEFAULT FALSE")
+        await conn.execute("ALTER TABLE jb_accounts ADD COLUMN IF NOT EXISTS in_pool BOOLEAN DEFAULT FALSE")
         # 一次性回填：将 jb_accounts.pending_nc_key 引用的 key 标记为 is_nc_key=TRUE
         # （必须在 jb_accounts 的 pending_nc_key 列被 ALTER 添加之后执行）
         await conn.execute(
@@ -1282,6 +1303,7 @@ async def _batch_save_accounts_to_db(accounts: List[dict]):
             bool(acc.get("has_quota", True)),
             acc.get("daily_used"),
             acc.get("daily_total"),
+            bool(acc.get("in_pool", False)),
         )
         for acc in accounts
     ]
@@ -1291,8 +1313,8 @@ async def _batch_save_accounts_to_db(accounts: List[dict]):
                 """
                 INSERT INTO jb_accounts
                     (id, license_id, auth_token, jwt, last_updated, last_quota_check, has_quota,
-                     daily_used, daily_total)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+                     daily_used, daily_total, in_pool)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
                 ON CONFLICT (id) DO UPDATE SET
                     license_id                  = EXCLUDED.license_id,
                     auth_token                  = EXCLUDED.auth_token,
@@ -1301,7 +1323,8 @@ async def _batch_save_accounts_to_db(accounts: List[dict]):
                     last_quota_check            = EXCLUDED.last_quota_check,
                     has_quota                   = EXCLUDED.has_quota,
                     daily_used                  = EXCLUDED.daily_used,
-                    daily_total                 = EXCLUDED.daily_total
+                    daily_total                 = EXCLUDED.daily_total,
+                    in_pool                     = EXCLUDED.in_pool
                 """,
                 rows,
             )
@@ -1417,8 +1440,8 @@ async def _save_account_to_db(account: dict, pool=None):
                 """
                 INSERT INTO jb_accounts
                     (id, license_id, auth_token, jwt, last_updated, last_quota_check, has_quota,
-                     daily_used, daily_total)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                     daily_used, daily_total, in_pool)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                 ON CONFLICT (id) DO UPDATE SET
                     license_id                  = EXCLUDED.license_id,
                     auth_token                  = EXCLUDED.auth_token,
@@ -1427,7 +1450,8 @@ async def _save_account_to_db(account: dict, pool=None):
                     last_quota_check            = EXCLUDED.last_quota_check,
                     has_quota                   = EXCLUDED.has_quota,
                     daily_used                  = EXCLUDED.daily_used,
-                    daily_total                 = EXCLUDED.daily_total
+                    daily_total                 = EXCLUDED.daily_total,
+                    in_pool                     = EXCLUDED.in_pool
                 """,
                 acc_id,
                 account.get("licenseId"),
@@ -1438,6 +1462,7 @@ async def _save_account_to_db(account: dict, pool=None):
                 bool(account.get("has_quota", True)),
                 account.get("daily_used"),
                 account.get("daily_total"),
+                bool(account.get("in_pool", False)),
             )
     except Exception as e:
         print(f"保存单个账户到数据库时出错: {e}")
@@ -1598,7 +1623,7 @@ async def load_cf_proxies_from_db():
 
 async def load_accounts_from_db():
     """从数据库加载账户列表，若 DB 为空则从 JSON 迁移"""
-    global JETBRAINS_ACCOUNTS
+    global JETBRAINS_ACCOUNTS, POLLING_POOL
     pool = await _get_db_pool()
     if not pool:
         load_jetbrains_accounts()
@@ -1606,7 +1631,7 @@ async def load_accounts_from_db():
     try:
         rows = await pool.fetch(
             "SELECT id, jwt, auth_token, license_id, last_updated, has_quota, last_quota_check,"
-            " daily_used, daily_total"
+            " daily_used, daily_total, in_pool"
             " FROM jb_accounts WHERE jwt IS NOT NULL ORDER BY created_at"
         )
         if rows:
@@ -1618,6 +1643,7 @@ async def load_accounts_from_db():
                     "last_quota_check": row["last_quota_check"] or 0,
                     "daily_used": int(row["daily_used"]) if row["daily_used"] is not None else None,
                     "daily_total": int(row["daily_total"]) if row["daily_total"] is not None else None,
+                    "in_pool": bool(row["in_pool"]) if row["in_pool"] is not None else False,
                 }
                 if row["license_id"] is not None:
                     acc["licenseId"] = row["license_id"]
@@ -1625,7 +1651,11 @@ async def load_accounts_from_db():
                     acc["authorization"] = row["auth_token"]
                 return acc
             JETBRAINS_ACCOUNTS = [_row_to_account(row) for row in rows]
-            print(f"从数据库加载 {len(JETBRAINS_ACCOUNTS)} 个账户")
+            # 从加载的账号中重建 POLLING_POOL
+            POLLING_POOL = {
+                row["id"] for row in rows if row["in_pool"]
+            }
+            print(f"从数据库加载 {len(JETBRAINS_ACCOUNTS)} 个账户，其中 {len(POLLING_POOL)} 个在轮询池")
             # 迁移旧格式 ID（jwt:前16字符）→ 新格式（jwt:SHA256哈希）
             old_ids = [
                 row["id"] for row in rows
@@ -2287,214 +2317,106 @@ async def _refresh_jetbrains_jwt(account: dict):
             raise HTTPException(status_code=500, detail=f"刷新 JWT 时发生未知错误: {e}")
 
 
-async def get_next_jetbrains_account(client_key: Optional[str] = None) -> dict:
-    """按优先级轮询 JetBrains 账户（has_quota=False 的账号始终跳过）：
-    1. 当前请求 key 绑定的账号（优先保障专属配额）
-    2. 没有任何 key 绑定的账号（公共池，轮询）
-    3. 有其他 key 绑定的账号（兜底，轮询）
+def _pool_account_ready(acc: dict) -> bool:
+    """快速判断池内账号是否可立即使用（无网络调用）。
+    池账号由后台任务定期维护，正常情况下 JWT 新鲜、has_quota=True，此函数仅做边界守卫。
     """
-    global current_account_index
+    if not acc.get("jwt"):
+        return False
+    last_jwt_fail = float(acc.get("last_jwt_fail") or 0)
+    if last_jwt_fail and time.time() - last_jwt_fail < 300:
+        return False
+    if acc.get("has_quota") is False:
+        return False
+    return True
 
+
+async def get_next_jetbrains_account(client_key: Optional[str] = None) -> dict:
+    """账号选取策略（全面重构为轮询池模型）：
+    1. 当前 key 绑定的专属账号（优先保障专属配额，含 JWT 刷新）
+    2. 从轮询池随机选取（无网络调用，O(1) 选号；池由后台每 10 分钟自动维护）
+    """
     if not JETBRAINS_ACCOUNTS:
         raise HTTPException(status_code=503, detail="服务不可用: 未配置 JetBrains 账户")
 
-    # 取出当前 key 绑定的 account_id（支持逗号分隔多个账号）
-    preferred_account_ids: set = set()
+    # ── 1. Key 绑定账号优先（含 JWT 刷新，行为同之前）──────────────────────────
     if client_key:
         key_meta = VALID_CLIENT_KEYS.get(client_key)
         if key_meta:
             raw_aid = key_meta.get("account_id") or ""
-            preferred_account_ids = {x.strip() for x in raw_aid.split(",") if x.strip()}
+            preferred_ids = {x.strip() for x in raw_aid.split(",") if x.strip()}
+            if preferred_ids:
+                bound_accs = [a for a in JETBRAINS_ACCOUNTS if _account_id(a) in preferred_ids]
+                for acc in bound_accs:
+                    if await _try_account(acc):
+                        return acc
 
-    async def _try_account(account: dict) -> bool:
-        """尝试使 account 就绪（刷新 JWT / 检查配额），返回是否可用。
+    # ── 2. 从轮询池随机选号（无网络调用）──────────────────────────────────────
+    pool_ids_snapshot = set(POLLING_POOL)   # CPython set 副本，读取原子
+    pool_accs = [a for a in JETBRAINS_ACCOUNTS if _account_id(a) in pool_ids_snapshot]
 
-        优化点：
-        - 配额重查窗口缩短至 120 秒（原 300 秒），更快感知账号恢复
-        - JWT 刷新使用每账号独立锁，防止并发请求重复发起刷新（刷新后双重检查）
-        """
-        # ── JWT 冷却期检查：401-jwt-cooldown 后 300s 内直接跳过 ──
-        last_jwt_fail = float(account.get("last_jwt_fail") or 0)
-        if last_jwt_fail and time.time() - last_jwt_fail < 300:
+    if not pool_accs:
+        raise HTTPException(
+            status_code=429,
+            detail="轮询池当前为空，后台正在补充有配额账号，请稍后重试",
+        )
+
+    _random.shuffle(pool_accs)
+    for acc in pool_accs:
+        if _pool_account_ready(acc):
+            return acc
+
+    raise HTTPException(
+        status_code=429,
+        detail="轮询池中所有账号当前均不可用，后台正在维护，请稍后重试",
+    )
+
+
+async def _try_account(account: dict) -> bool:
+    """尝试使绑定账号就绪（刷新 JWT / 检查配额），返回是否可用。仅用于 key 绑定账号。"""
+    last_jwt_fail = float(account.get("last_jwt_fail") or 0)
+    if last_jwt_fail and time.time() - last_jwt_fail < 300:
+        return False
+
+    if not account.get("has_quota"):
+        last_check = account.get("last_quota_check", 0)
+        if time.time() - last_check >= 120:
+            try:
+                await _check_quota(account)
+            except Exception as _qe:
+                print(f"[绑定账号重查] 账号 {_account_id(account)} 配额重查失败: {_qe}")
+        if not account.get("has_quota"):
             return False
 
-        if not account.get("has_quota"):
-            last_check = account.get("last_quota_check", 0)
-            if time.time() - last_check >= 120:   # 缩短至 2 分钟，更快恢复
-                try:
-                    await _check_quota(account)   # finally 块内已调用 _save_account_to_db，无需重复
-                except Exception as _qe:
-                    print(f"[轮询重查] 账号 {_account_id(account)} 配额重查失败: {_qe}")
-            if not account.get("has_quota"):
-                return False
-
-        if account.get("licenseId"):
-            is_jwt_stale = time.time() - account.get("last_updated", 0) > 12 * 3600
-            if not account.get("jwt") or is_jwt_stale:
-                if not account.get("authorization"):
-                    if account.get("jwt"):
-                        account["last_updated"] = time.time()
-                        print(f"账号 {account.get('licenseId')} 缺少 authorization，跳过刷新，使用现有 JWT")
-                    else:
-                        return False
+    if account.get("licenseId"):
+        is_jwt_stale = time.time() - account.get("last_updated", 0) > 12 * 3600
+        if not account.get("jwt") or is_jwt_stale:
+            if not account.get("authorization"):
+                if account.get("jwt"):
+                    account["last_updated"] = time.time()
                 else:
-                    # ── JWT 刷新去重：每账号一把锁，避免 N 个并发请求重复刷新 ──
-                    acc_id = _account_id(account)
-                    jwt_lock = _jwt_refresh_locks.setdefault(acc_id, asyncio.Lock())
-                    async with jwt_lock:
-                        # 双重检查：等待锁期间可能已被其他协程刷新
-                        still_stale = time.time() - account.get("last_updated", 0) > 12 * 3600
-                        if still_stale:
-                            try:
-                                await _refresh_jetbrains_jwt(account)
-                            except Exception as _e:
-                                print(f"账号 {account.get('licenseId')} JWT 刷新失败: {_e}")
-                                # JWT 刷新失败 ≠ 配额耗尽；若有现存 JWT 仍可尝试使用，
-                                # 避免 auth 端点临时故障时误伤整个账号池。
-                                # 更新 last_updated 防止本次请求内再次触发刷新。
-                                if account.get("jwt"):
-                                    account["last_updated"] = time.time()
-                                    print(f"账号 {account.get('licenseId')} 使用现有 JWT 继续（刷新失败但 JWT 存在）")
-                                else:
-                                    return False
-
-                if not account.get("has_quota"):
-                    await _check_quota(account)
-                    if not account.get("has_quota"):
-                        return False
-
-        return bool(account.get("jwt"))
-
-    # ── 第一步：持锁构建候选列表，并立即推进索引（防止并发请求堆在同一账号）──
-    async with account_rotation_lock:
-        n = len(JETBRAINS_ACCOUNTS)
-        if n == 0:
-            raise HTTPException(status_code=503, detail="服务不可用: 未配置 JetBrains 账户")
-
-        # 主组：has_quota=True（或未检测过）的账号，优先处理，无需网络调用即可判断可用性
-        group1: list = []  # 绑定了本次请求 key 的账号（最高优先）
-        group2: list = []  # 没有任何 key 绑定的账号（公共池）
-        group3: list = []  # 有其他 key 绑定的账号（兜底）
-        # 重检组：has_quota=False 但 last_quota_check 已超 120s 的账号（可能已恢复）
-        # 仅在主组全部耗尽时才进入，避免每次请求都触发大量 _check_quota 网络调用
-        retry1: list = []
-        retry2: list = []
-        retry3: list = []
-
-        # 预构建「所有已绑定账号 ID」集合：O(keys) 一次，避免 O(accounts×keys)
-        bound_account_ids: set = set()
-        for _v in VALID_CLIENT_KEYS.values():
-            _raw = _v.get("account_id") or ""
-            bound_account_ids.update(x.strip() for x in _raw.split(",") if x.strip())
-
-        now_ts = time.time()
-        _JWT_COOLDOWN = 300  # 与 _try_account 保持一致
-        for i in range(n):
-            idx = (current_account_index + i) % n
-            acc = JETBRAINS_ACCOUNTS[idx]
-
-            # 跳过 JWT 冷却期内的账号（_try_account 也会跳过，提前过滤节省并发槽）
-            _last_jwt_fail = float(acc.get("last_jwt_fail") or 0)
-            if _last_jwt_fail and now_ts - _last_jwt_fail < _JWT_COOLDOWN:
-                continue
-
-            is_confirmed_no_quota = acc.get("has_quota") is False
-            if is_confirmed_no_quota:
-                # 近期已确认无配额 → 完全跳过
-                if now_ts - acc.get("last_quota_check", 0) < 120:
-                    continue
-                # 超过 120s 的无配额账号 → 进入重检组（仅兜底使用）
-                acc_id = _account_id(acc)
-                if preferred_account_ids and acc_id in preferred_account_ids:
-                    retry1.append((idx, acc))
-                elif acc_id not in bound_account_ids:
-                    retry2.append((idx, acc))
-                else:
-                    retry3.append((idx, acc))
-                continue
-
-            # has_quota=True 或 None（从未检测过）→ 进入主组
-            acc_id = _account_id(acc)
-            if preferred_account_ids and acc_id in preferred_account_ids:
-                group1.append((idx, acc))
-            elif acc_id not in bound_account_ids:
-                group2.append((idx, acc))
+                    return False
             else:
-                group3.append((idx, acc))
+                acc_id = _account_id(account)
+                jwt_lock = _jwt_refresh_locks.setdefault(acc_id, asyncio.Lock())
+                async with jwt_lock:
+                    still_stale = time.time() - account.get("last_updated", 0) > 12 * 3600
+                    if still_stale:
+                        try:
+                            await _refresh_jetbrains_jwt(account)
+                        except Exception as _e:
+                            print(f"账号 {account.get('licenseId')} JWT 刷新失败: {_e}")
+                            if account.get("jwt"):
+                                account["last_updated"] = time.time()
+                            else:
+                                return False
 
-        # 主组候选优先；重检组只在主组全部失败后才处理
-        primary_candidates = group1 + group2 + group3
-        retry_candidates = retry1 + retry2 + retry3
-        candidates = primary_candidates + retry_candidates
+            if not account.get("has_quota"):
+                await _check_quota(account)
+                if not account.get("has_quota"):
+                    return False
 
-        # 关键：立即推进索引到第一候选位，后续并发请求从下一个账号开始，分散负载
-        if primary_candidates:
-            current_account_index = (primary_candidates[0][0] + 1) % n
-        elif retry_candidates:
-            current_account_index = (retry_candidates[0][0] + 1) % n
-
-    if not candidates:
-        raise HTTPException(status_code=429, detail="所有 JetBrains 账户均已超出配额或无效")
-
-    # ── 第二步：组内并行验证，组间保持优先顺序 ──
-    # group1 > group2 > group3，同一组内分批并发就绪检查，取最先通过的账号。
-    async def _first_ready(group: list, batch_size: int = 8) -> Optional[dict]:
-        """分批并发验证同一优先组内的所有账号，返回第一个就绪的，或 None。
-
-        生产事故修复（2026-04-27）：旧版一次性 create_task 全部候选（生产 group2
-        可达 1.9 万账号），其中部分账号 jwt stale 会触发并发 JWT 刷新洪水 →
-        grazie auth 429 + 全局 http_client 连接池（500 connections）被全部占满 →
-        Python 后端整体瘫痪，所有路径 165–180s 后被客户端 abort。
-        新版采用滑动窗口分批并发：每批最多 batch_size 个候选，找到 winner 立即返回。
-        单次请求引发的并发 JWT 刷新上限收敛到 batch_size，可控且语义不变。
-        """
-        if not group:
-            return None
-        if len(group) == 1:
-            _, acc = group[0]
-            return acc if await _try_account(acc) else None
-
-        for batch_start in range(0, len(group), batch_size):
-            batch = group[batch_start: batch_start + batch_size]
-            done_event = asyncio.Event()
-            winner: list = []
-            remaining = len(batch)
-
-            async def _probe(acc: dict):
-                nonlocal remaining
-                try:
-                    if await _try_account(acc):
-                        if not done_event.is_set():
-                            winner.append(acc)
-                            done_event.set()
-                except Exception:
-                    pass
-                finally:
-                    remaining -= 1
-                    if remaining <= 0:
-                        done_event.set()  # 该批全部探测完成，解除阻塞
-
-            tasks = [asyncio.create_task(_probe(acc)) for _, acc in batch]
-            await done_event.wait()
-            if winner:
-                # 找到 winner，立即返回；该批剩余 task（≤ batch_size-1 个）后台继续完成
-                return winner[0]
-            # 该批全部失败（remaining 在 finally 里降到 0 触发 done_event）→ 进入下一批
-        return None
-
-    # 先处理主组（has_quota=True），按 key 绑定优先级；主组全部失败才尝试重检组
-    for grp in (group1, group2, group3):
-        chosen = await _first_ready(grp)
-        if chosen:
-            return chosen
-
-    # 主组无可用账号 → 尝试重检组（has_quota=False 但超过 120s，可能已恢复）
-    for grp in (retry1, retry2, retry3):
-        chosen = await _first_ready(grp)
-        if chosen:
-            return chosen
-
-    raise HTTPException(status_code=429, detail="所有 JetBrains 账户均已超出配额或无效")
+    return bool(account.get("jwt"))
 
 
 _JB_STREAM_URL = "https://api.jetbrains.ai/user/v5/llm/chat/stream/v7"
@@ -2814,28 +2736,8 @@ async def _startup_quota_check():
         # _check_quota.finally 已逐条保存，此处无需冗余 batch save
         await asyncio.sleep(1.5)  # 块间显著休息，给远端速率限制充分恢复时间
 
-    # 删除确认无配额的账号（内存 + 数据库）
-    no_quota_accs_startup = [a for a in JETBRAINS_ACCOUNTS if not a.get("has_quota")]
-    no_quota_ids = [_account_id(a) for a in no_quota_accs_startup]
-    if no_quota_ids:
-        try:
-            # 先打标，防止后续 fire-and-forget 任务重新写回
-            for acc in no_quota_accs_startup:
-                acc["_deleted"] = True
-            await _batch_delete_accounts_from_db(no_quota_ids)
-            delete_set = set(no_quota_ids)
-            async with account_rotation_lock:
-                JETBRAINS_ACCOUNTS[:] = [
-                    a for a in JETBRAINS_ACCOUNTS if _account_id(a) not in delete_set
-                ]
-                if JETBRAINS_ACCOUNTS and current_account_index >= len(JETBRAINS_ACCOUNTS):
-                    current_account_index = 0
-            print(f"[启动检测] 已删除 {len(no_quota_ids)} 个无配额账号")
-        except Exception as e:
-            print(f"[启动检测] 删除无配额账号失败: {e}")
-
     has = sum(1 for a in JETBRAINS_ACCOUNTS if a.get("has_quota"))
-    print(f"[启动检测] 完成：{has}/{total_acc} 个账号有配额，剩余 {len(JETBRAINS_ACCOUNTS)} 个")
+    print(f"[启动检测] 完成：{has}/{total_acc} 个账号有配额（不自动删除无配额账号，由轮询池机制管理）")
 
 
 def _schedule_quota_checks_for_ids(acc_ids: set, *, label: str = "入池检测") -> int:
@@ -3791,6 +3693,148 @@ async def _cf_proxy_health_check_loop():
             print(f"[cf-health] loop error: {e}")
 
 
+async def _run_pool_discovery():
+    """随机取最多 500 个未在池中的账号，刷新 JWT + 检查配额，有配额的加入轮询池。"""
+    _pool_task_state["discovery_running"] = True
+    _pool_task_state["discovery_done"]    = 0
+    _pool_task_state["discovery_added"]   = 0
+    try:
+        snapshot   = list(JETBRAINS_ACCOUNTS)
+        candidates = [a for a in snapshot if _account_id(a) not in POLLING_POOL]
+        _random.shuffle(candidates)
+        targets = candidates[:500]
+        _pool_task_state["discovery_total"] = len(targets)
+        if not targets:
+            print("[pool-discovery] 所有账号已在池中，跳过")
+            return
+
+        print(f"[pool-discovery] 开始：从 {len(candidates)} 个未入池账号中检测 {len(targets)} 个")
+        semaphore   = asyncio.Semaphore(20)   # 20 并发，避免 auth 端点 429
+        added_count = 0
+        done_count  = 0
+        save_batch: list = []
+
+        async def _disc_one(acc: dict):
+            nonlocal added_count, done_count, save_batch
+            async with semaphore:
+                try:
+                    await _check_quota(acc)     # 含 JWT 刷新
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    print(f"[pool-discovery] 账号 {_account_id(acc)} 检测失败: {e}")
+            done_count += 1
+            _pool_task_state["discovery_done"] = done_count
+            if acc.get("has_quota", True):
+                acc_id = _account_id(acc)
+                acc["in_pool"] = True
+                async with _pool_lock:
+                    POLLING_POOL.add(acc_id)
+                added_count += 1
+                _pool_task_state["discovery_added"] = added_count
+            save_batch.append(acc)
+            if len(save_batch) >= 200:
+                batch, save_batch = save_batch[:], []
+                try:
+                    await _batch_save_accounts_to_db(batch)
+                except Exception as e:
+                    print(f"[pool-discovery] 批量写 DB 失败: {e}")
+
+        await asyncio.gather(*[_disc_one(acc) for acc in targets])
+        if save_batch:
+            try:
+                await _batch_save_accounts_to_db(save_batch)
+            except Exception as e:
+                print(f"[pool-discovery] 最终批量写 DB 失败: {e}")
+        _pool_task_state["last_discovery_at"] = time.time()
+        print(f"[pool-discovery] 完成：新增 {added_count} 个账号入池，当前池大小 {len(POLLING_POOL)}")
+    finally:
+        _pool_task_state["discovery_running"] = False
+
+
+async def _pool_discovery_loop():
+    """每 10 分钟运行一次池发现任务（启动后等 30 秒预热）。"""
+    await asyncio.sleep(30)
+    while True:
+        try:
+            await _run_pool_discovery()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"[pool-discovery] 运行异常: {e}")
+        await asyncio.sleep(600)
+
+
+async def _run_pool_maintenance():
+    """重检轮询池内所有账号（快速，无 JWT 刷新），无配额的踢出至待发现状态。"""
+    _pool_task_state["maintenance_running"] = True
+    _pool_task_state["maintenance_done"]    = 0
+    _pool_task_state["maintenance_kicked"]  = 0
+    try:
+        pool_ids_snapshot = set(POLLING_POOL)
+        targets = [a for a in JETBRAINS_ACCOUNTS if _account_id(a) in pool_ids_snapshot]
+        _pool_task_state["maintenance_total"] = len(targets)
+        if not targets:
+            print("[pool-maintenance] 轮询池为空，跳过维护")
+            return
+
+        print(f"[pool-maintenance] 开始：重检池内 {len(targets)} 个账号")
+        semaphore    = asyncio.Semaphore(300)
+        kicked_count = 0
+        done_count   = 0
+        save_batch: list = []
+
+        async def _maint_one(acc: dict):
+            nonlocal kicked_count, done_count, save_batch
+            async with semaphore:
+                try:
+                    await _check_quota_fast(acc)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    print(f"[pool-maintenance] 账号 {_account_id(acc)} 检测失败: {e}")
+            done_count += 1
+            _pool_task_state["maintenance_done"] = done_count
+            if not acc.get("has_quota", True):
+                acc_id = _account_id(acc)
+                acc["in_pool"] = False
+                async with _pool_lock:
+                    POLLING_POOL.discard(acc_id)
+                kicked_count += 1
+                _pool_task_state["maintenance_kicked"] = kicked_count
+            save_batch.append(acc)
+            if len(save_batch) >= 500:
+                batch, save_batch = save_batch[:], []
+                try:
+                    await _batch_save_accounts_to_db(batch)
+                except Exception as e:
+                    print(f"[pool-maintenance] 批量写 DB 失败: {e}")
+
+        await asyncio.gather(*[_maint_one(acc) for acc in targets])
+        if save_batch:
+            try:
+                await _batch_save_accounts_to_db(save_batch)
+            except Exception as e:
+                print(f"[pool-maintenance] 最终批量写 DB 失败: {e}")
+        _pool_task_state["last_maintenance_at"] = time.time()
+        print(f"[pool-maintenance] 完成：踢出 {kicked_count} 个无配额账号，池大小 {len(POLLING_POOL)}")
+    finally:
+        _pool_task_state["maintenance_running"] = False
+
+
+async def _pool_maintenance_loop():
+    """每 10 分钟运行一次池维护任务（与发现任务错开 5 分钟）。"""
+    await asyncio.sleep(330)    # 启动后等 5.5 分钟，与发现任务交错
+    while True:
+        try:
+            await _run_pool_maintenance()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"[pool-maintenance] 运行异常: {e}")
+        await asyncio.sleep(600)
+
+
 @app.on_event("startup")
 async def startup():
     global models_data, http_client
@@ -3812,7 +3856,8 @@ async def startup():
             keepalive_expiry=60,
         ),
     )
-    asyncio.create_task(_startup_quota_check())
+    asyncio.create_task(_pool_discovery_loop())    # 轮询池发现（每 10 分钟 +500 个账号）
+    asyncio.create_task(_pool_maintenance_loop())  # 轮询池维护（每 10 分钟剔除无配额）
     asyncio.create_task(_cleanup_pending_prizes_loop())
     asyncio.create_task(_partner_credentials_poller())
     asyncio.create_task(_startup_resume_bind_tasks())
@@ -5845,8 +5890,10 @@ async def admin_list_accounts():
     cached = _admin_cache_get("accounts")
     if cached is not None:
         return Response(content=cached, media_type="application/json")
+    pool_ids = set(POLLING_POOL)
     result = []
     for i, acc in enumerate(JETBRAINS_ACCOUNTS):
+        acc_id = _account_id(acc)
         result.append({
             "index": i,
             "has_jwt": bool(acc.get("jwt")),
@@ -5857,12 +5904,54 @@ async def admin_list_accounts():
             "daily_used": acc.get("daily_used", None),
             "daily_total": acc.get("daily_total", None),
             "last_quota_check": acc.get("last_quota_check", 0),
-            "account_id": _account_id(acc),
+            "account_id": acc_id,
             "quota_status_reason": acc.get("quota_status_reason", None),
+            "in_pool": acc_id in pool_ids,
         })
     body = json.dumps({"accounts": result}, ensure_ascii=False).encode()
     _admin_cache_set("accounts", body)
     return Response(content=body, media_type="application/json")
+
+
+@app.get("/admin/accounts/pool-status")
+async def admin_pool_status():
+    """轮询池状态：当前池大小 + 发现/维护任务运行状态。"""
+    return {
+        "pool_size": len(POLLING_POOL),
+        "total_accounts": len(JETBRAINS_ACCOUNTS),
+        "discovery": {
+            "running": _pool_task_state["discovery_running"],
+            "done": _pool_task_state["discovery_done"],
+            "total": _pool_task_state["discovery_total"],
+            "added": _pool_task_state["discovery_added"],
+            "last_at": _pool_task_state["last_discovery_at"],
+        },
+        "maintenance": {
+            "running": _pool_task_state["maintenance_running"],
+            "done": _pool_task_state["maintenance_done"],
+            "total": _pool_task_state["maintenance_total"],
+            "kicked": _pool_task_state["maintenance_kicked"],
+            "last_at": _pool_task_state["last_maintenance_at"],
+        },
+    }
+
+
+@app.post("/admin/accounts/pool/trigger-discovery")
+async def admin_pool_trigger_discovery():
+    """手动触发一次池发现任务（后台运行，立即返回）。"""
+    if _pool_task_state["discovery_running"]:
+        return {"success": False, "message": "发现任务正在运行中，请稍后再试"}
+    asyncio.create_task(_run_pool_discovery())
+    return {"success": True, "message": "发现任务已在后台启动"}
+
+
+@app.post("/admin/accounts/pool/trigger-maintenance")
+async def admin_pool_trigger_maintenance():
+    """手动触发一次池维护任务（后台运行，立即返回）。"""
+    if _pool_task_state["maintenance_running"]:
+        return {"success": False, "message": "维护任务正在运行中，请稍后再试"}
+    asyncio.create_task(_run_pool_maintenance())
+    return {"success": True, "message": "维护任务已在后台启动"}
 
 @app.get("/admin/accounts/{index}/jwt")
 async def admin_get_account_jwt(index: int):
@@ -6137,15 +6226,14 @@ async def admin_recheck_cancel():
 
 
 @app.post("/admin/accounts/turbo-recheck")
-async def admin_turbo_recheck(concurrency: int = 120, delete_empty: bool = False):
+async def admin_turbo_recheck(concurrency: int = 120):
     """极速全量配额重检。
 
     与 reset-quota-all 的区别：
     - 跳过 JWT 刷新（用现有 JWT 直查 /quota/get，省去 1-2 个额外 HTTP 往返）
-    - 并发默认 120（原来 8），可通过 ?concurrency=N 调节，最大 300
-    - 每 500 账号批量写一次 DB（原来每账号单独写）
-    - 401 账号标记 has_quota=False 但不从内存池删除（等扫完后统一清理）
-    - delete_empty=true（默认）：扫完后从内存+DB 删除确认无配额的账号
+    - 并发默认 120，可通过 ?concurrency=N 调节，最大 300
+    - 每 500 账号批量写一次 DB
+    - 无配额账号不自动删除，由轮询池机制管理
     预计完成时间：~5-10 分钟（62K 账号）
     """
     global _bulk_recheck_state
@@ -6166,7 +6254,6 @@ async def admin_turbo_recheck(concurrency: int = 120, delete_empty: bool = False
     _t_start = time.time()
 
     async def _bg_turbo():
-        global current_account_index
         semaphore = asyncio.Semaphore(_concurrency)
         _BATCH_SAVE = 500   # 每满 500 个账号批量写 DB 一次
         pending_save: list = []
@@ -6207,27 +6294,7 @@ async def admin_turbo_recheck(concurrency: int = 120, delete_empty: bool = False
             elapsed = time.time() - _t_start
             has_q   = sum(1 for a in JETBRAINS_ACCOUNTS if a.get("has_quota"))
             no_q    = total - has_q
-            print(f"[turbo-recheck] 完成：{has_q} 有配额，{no_q} 无配额，耗时 {elapsed:.0f}s")
-
-            # 可选：删除确认无配额的账号（内存 + DB）
-            if delete_empty and no_q > 0:
-                no_q_accs = [a for a in JETBRAINS_ACCOUNTS if not a.get("has_quota")]
-                no_q_ids  = [_account_id(a) for a in no_q_accs]
-                try:
-                    for a in no_q_accs:
-                        a["_deleted"] = True
-                    await _batch_delete_accounts_from_db(no_q_ids)
-                    delete_set = set(no_q_ids)
-                    async with account_rotation_lock:
-                        JETBRAINS_ACCOUNTS[:] = [
-                            a for a in JETBRAINS_ACCOUNTS if _account_id(a) not in delete_set
-                        ]
-                        if JETBRAINS_ACCOUNTS and current_account_index >= len(JETBRAINS_ACCOUNTS):
-                            current_account_index = 0
-                    print(f"[turbo-recheck] 已从内存+DB 删除 {len(no_q_ids)} 个无配额账号，"
-                          f"剩余 {len(JETBRAINS_ACCOUNTS)} 个")
-                except Exception as e:
-                    print(f"[turbo-recheck] 删除无配额账号失败: {e}")
+            print(f"[turbo-recheck] 完成：{has_q} 有配额，{no_q} 无配额，耗时 {elapsed:.0f}s（无配额账号不自动删除，由轮询池机制管理）")
 
         except asyncio.CancelledError:
             print(f"[turbo-recheck] 已取消（已完成 {_bulk_recheck_state['done']}/{total}）")
@@ -6254,7 +6321,6 @@ async def admin_turbo_recheck(concurrency: int = 120, delete_empty: bool = False
         "total": total,
         "concurrency": _concurrency,
         "eta_minutes": eta_minutes,
-        "delete_empty": delete_empty,
     }
 
 
