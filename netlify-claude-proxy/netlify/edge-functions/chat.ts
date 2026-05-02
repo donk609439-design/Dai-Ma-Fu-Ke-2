@@ -182,10 +182,17 @@ function anthropicToOpenAI(resp: AnthropicResponse, requestedModel: string) {
 }
 
 // ---------- Anthropic SSE → OpenAI SSE ----------
-// Per-read upstream timeout: if no bytes arrive within this window, give up
-// gracefully instead of hanging forever. Anthropic's longest "thinking" phases
-// rarely exceed this; AI Gateway hiccups should resolve faster too.
-const UPSTREAM_READ_TIMEOUT_MS = 90_000;
+// Per-read upstream idle timeout: gap between two consecutive bytes from
+// Anthropic. NOT a total response time limit — total response can be hours
+// as long as bytes keep flowing. Triggers only when upstream truly stops
+// sending, e.g. zombie TCP connection. Default 5 min covers Claude 4.x
+// extended-thinking pauses (which can stall for minutes silently).
+// Override via env var UPSTREAM_READ_TIMEOUT_MS without redeploying code.
+const UPSTREAM_READ_TIMEOUT_MS = (() => {
+  const raw = Deno.env.get("UPSTREAM_READ_TIMEOUT_MS");
+  const n = raw ? Number(raw) : 300_000;
+  return Number.isFinite(n) && n > 0 ? n : 300_000;
+})();
 
 async function* parseAnthropicSSE(body: ReadableStream<Uint8Array>): AsyncGenerator<any> {
   const reader = body.getReader();
