@@ -219,7 +219,7 @@ export default function Accounts() {
   const [showExistingKeys, setShowExistingKeys] = useState(false);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const [boundExpanded, setBoundExpanded] = useState(false);
-  const [poolExpanded, setPoolExpanded] = useState(true);
+  const [poolExpanded, setPoolExpanded] = useState(false);
   const [unboundExpanded, setUnboundExpanded] = useState(false);
   const [searchQ, setSearchQ] = useState("");
 
