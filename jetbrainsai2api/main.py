@@ -2408,6 +2408,7 @@ async def get_next_jetbrains_account(client_key: Optional[str] = None) -> dict:
             detail="轮询池当前为空，后台正在补充有配额账号，请稍后重试",
         )
 
+    _random.shuffle(pool_accs)
     for acc in pool_accs:
         if _pool_account_ready(acc):
             return acc
@@ -2619,7 +2620,8 @@ async def _stream_with_account_fallback(
                 and _pool_account_ready(a)
             ]
             if pool_candidates:
-                # 按 JETBRAINS_ACCOUNTS 加载顺序（created_at 升序）取第一个
+                # 在前500个池账号中随机选，分散负载避免单账号连续被选触发429
+                _random.shuffle(pool_candidates)
                 next_acc = pool_candidates[0]
             else:
                 # 池内候选用尽，走完整路径再选（含 key 绑定逻辑）
