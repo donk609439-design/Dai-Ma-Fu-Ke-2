@@ -4602,6 +4602,475 @@ async def chat_completions(
             raise
 
 
+# ═══════════════ OpenAI Responses API (/v1/responses) ═══════════════
+# Codex CLI 及部分新版 OpenAI 客户端使用此接口格式
+
+def _responses_convert_tools(tools_raw: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Responses API tool 格式 → chat completions tool 格式。
+
+    Responses API: {"type":"function","name":"...","description":"...","parameters":{...}}
+    Chat compl.:   {"type":"function","function":{"name":"...","description":"...","parameters":{...}}}
+    其他内置 tool 类型（computer_use_preview / web_search_preview / code_interpreter）
+    JetBrains 不支持，直接忽略。
+    """
+    result = []
+    for t in (tools_raw or []):
+        if t.get("type") != "function":
+            continue
+        fn: Dict[str, Any] = {
+            "name": t.get("name", ""),
+            "description": t.get("description", ""),
+            "parameters": t.get("parameters", {}),
+        }
+        if "strict" in t:
+            fn["strict"] = t["strict"]
+        result.append({"type": "function", "function": fn})
+    return result
+
+
+def _responses_input_to_chat_messages(
+    input_val: Any,
+) -> tuple:
+    """Responses API input → (List[ChatMessage], tool_id_map: Dict[str,str])
+
+    input 可以是字符串或数组。数组中每个 item 可能是：
+      - 标准消息  {"role":"user"|"assistant"|"system","content": str|list}
+      - 函数调用  {"type":"function_call","call_id":"...","name":"...","arguments":"..."}
+      - 工具结果  {"type":"function_call_output","call_id":"...","output":"..."}
+    content 数组里的 part type 包括:
+      input_text / output_text / text → 普通文本
+      function_call / function_call_output → 嵌在 content 里的工具调用/结果
+    """
+    tool_id_map: Dict[str, str] = {}
+
+    if isinstance(input_val, str):
+        return [ChatMessage(role="user", content=input_val)], tool_id_map
+
+    messages: List[ChatMessage] = []
+    for item in (input_val or []):
+        item_type = item.get("type", "")
+        role = item.get("role", "")
+
+        # ── 顶层工具结果 ──
+        if item_type == "function_call_output":
+            messages.append(ChatMessage(
+                role="tool",
+                tool_call_id=item.get("call_id", ""),
+                content=str(item.get("output", "")),
+            ))
+            continue
+
+        # ── 顶层函数调用（assistant 历史轮次的 function_call 输出） ──
+        if item_type == "function_call":
+            call_id = item.get("call_id") or item.get("id", "")
+            name = item.get("name", "")
+            arguments = item.get("arguments", "{}")
+            if call_id and name:
+                tool_id_map[call_id] = name
+            messages.append(ChatMessage(
+                role="assistant",
+                content=None,
+                tool_calls=[{"id": call_id, "type": "function",
+                             "function": {"name": name, "arguments": arguments}}],
+            ))
+            continue
+
+        # ── 标准消息 ──
+        if item_type == "message" or role in ("user", "assistant", "system"):
+            if not role:
+                role = "user"
+            content = item.get("content", "")
+
+            if isinstance(content, str):
+                messages.append(ChatMessage(role=role, content=content))
+
+            elif isinstance(content, list):
+                text_parts: List[str] = []
+                tool_calls_list: List[Dict] = []
+                tool_results: List[ChatMessage] = []
+
+                for part in content:
+                    ptype = part.get("type", "")
+                    if ptype in ("input_text", "output_text", "text"):
+                        txt = part.get("text", "")
+                        if txt:
+                            text_parts.append(txt)
+                    elif ptype == "function_call_output":
+                        tool_results.append(ChatMessage(
+                            role="tool",
+                            tool_call_id=part.get("call_id", ""),
+                            content=str(part.get("output", "")),
+                        ))
+                    elif ptype == "function_call":
+                        cid = part.get("call_id") or part.get("id", "")
+                        nm = part.get("name", "")
+                        args = part.get("arguments", "{}")
+                        if cid and nm:
+                            tool_id_map[cid] = nm
+                        tool_calls_list.append({
+                            "id": cid, "type": "function",
+                            "function": {"name": nm, "arguments": args},
+                        })
+
+                messages.extend(tool_results)
+                if tool_calls_list:
+                    messages.append(ChatMessage(
+                        role="assistant",
+                        content=" ".join(text_parts) if text_parts else None,
+                        tool_calls=tool_calls_list,
+                    ))
+                elif text_parts:
+                    messages.append(ChatMessage(role=role, content=" ".join(text_parts)))
+
+    return messages, tool_id_map
+
+
+async def _responses_sse_adapter(
+    openai_sse_stream: AsyncGenerator[str, None],
+    model_name: str,
+    resp_id: str,
+    created_at: int,
+    usage_capture: Optional[Dict[str, int]] = None,
+) -> AsyncGenerator[str, None]:
+    """OpenAI chat.completion.chunk SSE 流 → Responses API SSE 事件流。"""
+
+    def _e(obj: dict) -> str:
+        return f"event: {obj['type']}\ndata: {json.dumps(obj, ensure_ascii=False)}\n\n"
+
+    # response.created
+    yield _e({
+        "type": "response.created",
+        "response": {
+            "id": resp_id, "object": "response",
+            "created_at": created_at, "model": model_name,
+            "output": [], "status": "in_progress",
+        },
+    })
+
+    next_oi = 0  # 下一个可用 output_index
+
+    # 文本消息状态
+    msg_id = f"msg_{uuid.uuid4().hex[:24]}"
+    msg_oi: Optional[int] = None   # None = 尚未分配
+    text_started = False
+    full_text = ""
+
+    # 工具调用状态：按 chunk index 分组
+    tc_st: Dict[int, Dict[str, Any]] = {}
+
+    final_items: List[Dict] = []
+    usage_data: Optional[Dict] = None
+
+    try:
+        async for line in openai_sse_stream:
+            if not line.startswith("data: ") or line.strip() == "data: [DONE]":
+                continue
+            try:
+                data = json.loads(line[6:].strip())
+            except Exception:
+                continue
+
+            # usage-only 块
+            if "usage" in data and data.get("choices") == []:
+                usage_data = data["usage"]
+                continue
+            if not data.get("choices"):
+                continue
+
+            choice = data["choices"][0]
+            delta = choice.get("delta", {})
+
+            # ── 文本增量 ──
+            text = delta.get("content") or ""
+            if text:
+                full_text += text
+                if msg_oi is None:
+                    msg_oi = next_oi
+                    next_oi += 1
+                    yield _e({
+                        "type": "response.output_item.added",
+                        "output_index": msg_oi,
+                        "item": {"id": msg_id, "type": "message", "role": "assistant",
+                                 "content": [], "status": "in_progress"},
+                    })
+                if not text_started:
+                    text_started = True
+                    yield _e({
+                        "type": "response.content_part.added",
+                        "item_id": msg_id, "output_index": msg_oi, "content_index": 0,
+                        "part": {"type": "output_text", "text": ""},
+                    })
+                yield _e({
+                    "type": "response.output_text.delta",
+                    "item_id": msg_id, "output_index": msg_oi,
+                    "content_index": 0, "delta": text,
+                })
+
+            # ── 工具调用增量 ──
+            for tc_chunk in (delta.get("tool_calls") or []):
+                idx = tc_chunk.get("index", 0)
+                func = tc_chunk.get("function", {})
+
+                if idx not in tc_st:
+                    fc_id = f"fc_{uuid.uuid4().hex[:24]}"
+                    call_id = tc_chunk.get("id") or f"call_{uuid.uuid4().hex}"
+                    name = func.get("name", "")
+                    args_init = func.get("arguments", "")
+                    oi = next_oi
+                    next_oi += 1
+                    tc_st[idx] = {
+                        "fc_id": fc_id, "call_id": call_id,
+                        "name": name, "arguments": args_init, "output_index": oi,
+                    }
+                    yield _e({
+                        "type": "response.output_item.added",
+                        "output_index": oi,
+                        "item": {"type": "function_call", "id": fc_id,
+                                 "call_id": call_id, "name": name,
+                                 "arguments": "", "status": "in_progress"},
+                    })
+                    if args_init:
+                        yield _e({
+                            "type": "response.function_call_arguments.delta",
+                            "item_id": fc_id, "output_index": oi, "delta": args_init,
+                        })
+                else:
+                    args_d = func.get("arguments", "")
+                    if args_d:
+                        s = tc_st[idx]
+                        s["arguments"] += args_d
+                        yield _e({
+                            "type": "response.function_call_arguments.delta",
+                            "item_id": s["fc_id"], "output_index": s["output_index"],
+                            "delta": args_d,
+                        })
+    except Exception as _ex:
+        print(f"[/v1/responses] SSE 适配器错误: {_ex}")
+
+    # ── 关闭文本消息 ──
+    if msg_oi is not None and text_started:
+        yield _e({
+            "type": "response.output_text.done",
+            "item_id": msg_id, "output_index": msg_oi, "content_index": 0,
+            "text": full_text,
+        })
+        yield _e({
+            "type": "response.content_part.done",
+            "item_id": msg_id, "output_index": msg_oi, "content_index": 0,
+            "part": {"type": "output_text", "text": full_text},
+        })
+        done_msg: Dict[str, Any] = {
+            "id": msg_id, "type": "message", "role": "assistant",
+            "content": [{"type": "output_text", "text": full_text}],
+            "status": "completed",
+        }
+        yield _e({"type": "response.output_item.done",
+                  "output_index": msg_oi, "item": done_msg})
+        final_items.append(done_msg)
+
+    # ── 关闭工具调用 ──
+    for idx, s in sorted(tc_st.items()):
+        fc_id = s["fc_id"]
+        oi = s["output_index"]
+        arguments = s["arguments"]
+        yield _e({
+            "type": "response.function_call_arguments.done",
+            "item_id": fc_id, "output_index": oi, "arguments": arguments,
+        })
+        done_tc: Dict[str, Any] = {
+            "type": "function_call", "id": fc_id,
+            "call_id": s["call_id"], "name": s["name"],
+            "arguments": arguments, "status": "completed",
+        }
+        yield _e({"type": "response.output_item.done",
+                  "output_index": oi, "item": done_tc})
+        final_items.append(done_tc)
+
+    # ── response.completed ──
+    final_resp: Dict[str, Any] = {
+        "id": resp_id, "object": "response",
+        "created_at": created_at, "model": model_name,
+        "output": final_items, "status": "completed",
+    }
+    # 优先用 FinishMetadata 捕获的真实 token；其次用最后一个 usage-only 块
+    cap = usage_capture or {}
+    real_p = cap.get("prompt_tokens") or (usage_data or {}).get("prompt_tokens") or 0
+    real_c = cap.get("completion_tokens") or (usage_data or {}).get("completion_tokens") or 0
+    if real_p or real_c:
+        final_resp["usage"] = {
+            "input_tokens": real_p,
+            "output_tokens": real_c,
+            "total_tokens": real_p + real_c,
+        }
+    yield _e({"type": "response.completed", "response": final_resp})
+
+
+@app.post("/v1/responses")
+async def responses_api(
+    http_request: Request,
+    client_key: str = Depends(authenticate_client),
+):
+    """OpenAI Responses API 兼容端点（Codex CLI / 新版 OpenAI SDK 使用）。
+
+    将 Responses API 请求格式转换为 JetBrains 内部格式，
+    复用与 /v1/chat/completions 完全相同的上游调用链路。
+    """
+    body = await http_request.json()
+
+    model_name: str = body.get("model", "")
+    input_val = body.get("input") or []
+    tools_raw: List[Dict] = body.get("tools") or []
+    do_stream: bool = bool(body.get("stream", False))
+    max_output: Optional[int] = body.get("max_output_tokens")
+
+    # ── 输入转换 ──
+    messages, tool_id_map = _responses_input_to_chat_messages(input_val)
+    if not messages:
+        raise HTTPException(status_code=400, detail="input 不能为空")
+
+    # ── 令牌限额检查（与 chat/completions 相同逻辑） ──
+    max_in, max_out, _ = _key_tier_limits(client_key)
+    estimated = _estimate_input_tokens(messages)
+    if estimated > max_in:
+        raise HTTPException(
+            status_code=400,
+            detail=f"输入内容过长：估算约 {estimated:,} tokens，超过限制 {max_in:,} tokens",
+        )
+    if max_output is not None and max_output > max_out:
+        max_output = max_out
+
+    # ── 工具格式转换 ──
+    tools_chat = _responses_convert_tools(tools_raw)
+
+    # ── 补全 tool_id_map（从历史消息中收集） ──
+    for m in messages:
+        if m.role == "assistant" and m.tool_calls:
+            for tc in m.tool_calls:
+                if tc.get("id") and tc.get("function", {}).get("name"):
+                    tool_id_map[tc["id"]] = tc["function"]["name"]
+
+    # ── JetBrains 消息格式转换 ──
+    jetbrains_messages = _convert_openai_messages_to_jetbrains(messages, tool_id_map)
+
+    # ── 工具参数 ──
+    data_params: List[Dict] = []
+    jb_tools: Optional[List[Dict]] = None
+    if tools_chat and _jetbrains_profile_supports_functions(model_name):
+        jb_tools = [t["function"] for t in tools_chat]
+        data_params.append({"type": "json", "fqdn": "llm.parameters.functions"})
+        data_params.append({"type": "json", "value": json.dumps(jb_tools)})
+    else:
+        if tools_chat:
+            print(f"[/v1/responses] model={model_name} 使用 OpenAI provider，已忽略 {len(tools_chat)} 个 tools")
+
+    payload = {
+        "prompt": "ij.chat.request.new-chat-on-start",
+        "profile": model_name,
+        "chat": {"messages": jetbrains_messages},
+        "parameters": {"data": data_params},
+    }
+
+    account = await get_next_jetbrains_account(client_key=client_key)
+    usage_capture: Dict[str, int] = {}
+    raw_stream = _stream_with_account_fallback(account, payload, {}, client_key)
+    openai_sse = openai_stream_adapter(
+        raw_stream, model_name, jb_tools or [],
+        include_usage=True, _usage_capture=usage_capture,
+    )
+
+    resp_id = f"resp_{uuid.uuid4().hex}"
+    created_at = int(time.time())
+    prompt_tokens = _estimate_messages_tokens(messages)
+    req_start = time.time()
+
+    if do_stream:
+        responses_stream = _responses_sse_adapter(
+            openai_sse, model_name, resp_id, created_at, usage_capture,
+        )
+
+        async def _tracked_responses():
+            has_content = False
+            completion_chars = 0
+            try:
+                async for chunk in responses_stream:
+                    yield chunk
+                    if ('"response.output_text.delta"' in chunk
+                            or '"response.function_call_arguments.delta"' in chunk):
+                        has_content = True
+                        completion_chars += len(chunk)
+            finally:
+                if has_content:
+                    real_p = usage_capture.get("prompt_tokens") or prompt_tokens
+                    real_c = usage_capture.get("completion_tokens") or max(1, completion_chars // 20)
+                    is_exempt = _is_call_exempt(real_p, real_c)
+                    if not is_exempt:
+                        _consume_key_usage(client_key, cost=MODEL_COSTS.get(model_name, 1.0))
+                    _record_stats(account, real_p, real_c, req_start)
+                    _append_log(model_name, client_key, real_p, real_c,
+                                (time.time() - req_start) * 1000, "ok", exempt=is_exempt)
+
+        return StreamingResponse(
+            _tracked_responses(),
+            media_type="text/event-stream",
+            headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
+        )
+
+    # ── 非流式：聚合 OpenAI SSE → Responses API JSON ──
+    try:
+        chat_resp = await aggregate_stream_for_non_stream_response(openai_sse, model_name)
+
+        output_items: List[Dict] = []
+        message = chat_resp.choices[0].message
+        if message.content:
+            output_items.append({
+                "id": f"msg_{uuid.uuid4().hex[:24]}",
+                "type": "message", "role": "assistant",
+                "content": [{"type": "output_text", "text": message.content}],
+                "status": "completed",
+            })
+        for tc in (message.tool_calls or []):
+            output_items.append({
+                "type": "function_call",
+                "id": f"fc_{uuid.uuid4().hex[:24]}",
+                "call_id": tc.get("id", f"call_{uuid.uuid4().hex}"),
+                "name": tc.get("function", {}).get("name", ""),
+                "arguments": tc.get("function", {}).get("arguments", "{}"),
+                "status": "completed",
+            })
+
+        usage = chat_resp.usage or {}
+        real_p = usage.get("prompt_tokens") or 0
+        real_c = usage.get("completion_tokens") or 0
+        actual_p = real_p if real_p else prompt_tokens
+        actual_c = real_c if real_c else _estimate_tokens(message.content or "")
+
+        is_exempt = _is_call_exempt(actual_p, actual_c)
+        if not is_exempt:
+            _consume_key_usage(client_key, cost=MODEL_COSTS.get(model_name, 1.0))
+        _record_stats(account, actual_p, actual_c, req_start)
+        _append_log(model_name, client_key, actual_p, actual_c,
+                    (time.time() - req_start) * 1000, "ok", exempt=is_exempt)
+
+        return JSONResponse({
+            "id": resp_id,
+            "object": "response",
+            "created_at": created_at,
+            "model": model_name,
+            "output": output_items,
+            "status": "completed",
+            "usage": {
+                "input_tokens": actual_p,
+                "output_tokens": actual_c,
+                "total_tokens": actual_p + actual_c,
+            },
+        })
+    except Exception:
+        _record_stats(account, 0, 0, req_start, error=True)
+        _append_log(model_name, client_key, prompt_tokens, 0,
+                    (time.time() - req_start) * 1000, "error")
+        raise
+
+
 def convert_anthropic_to_openai(
     anthropic_req: AnthropicMessageRequest,
 ) -> ChatCompletionRequest:
