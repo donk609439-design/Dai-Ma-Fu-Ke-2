@@ -2062,6 +2062,10 @@ async def _check_quota(account: dict):
         account["has_quota"]   = has_quota
         account["daily_used"]  = int(tariff_total - tariff_available) if tariff_total > 0 else 0
         account["daily_total"] = int(tariff_total)
+        # 成功确认配额 → 清除 JWT 冷却标记，账号立即重新参与轮询
+        if has_quota:
+            account.pop("last_jwt_fail", None)
+            account.pop("quota_status_reason", None)
         print(f"Account {account.get('licenseId') or 'with static JWT'} "
               f"AI Credits: {int(tariff_available):,}/{int(tariff_total):,} "
               f"(used {int(tariff_used):,}) → has_quota={has_quota}")
@@ -2079,14 +2083,16 @@ async def _check_quota(account: dict):
 
 
 async def _check_quota_fast(account: dict) -> bool:
-    """极速配额检查：跳过 JWT 刷新，直接用现有 JWT 查询 /quota/get。
+    """极速配额检查：优先用现有 JWT 查询 /quota/get；JWT 过期时尝试一次刷新。
 
     与 _check_quota 的区别：
-    - 不触发 JWT 刷新（省去 1-2 个额外 HTTP 往返）
     - 不调用 _save_account_to_db（由调用方批量写库）
     - 429 限流时：原地等待 2s 后重试一次，仍 429 则保留现有 has_quota 不变
-    - 401 时：仅标记 has_quota=False，不尝试 JWT 刷新（由下次正常请求懒刷新）
-    适用场景：全量快速扫描，对 JWT 新鲜度要求低。
+    - 401 时：先尝试刷新 JWT（若有 licenseId/authorization），刷新后重试一次；
+              刷新失败且 JWT 存在 → 保留 has_quota（不能确认配额已耗尽）；
+              无 JWT 也无法刷新 → 标记 has_quota=False
+    - 成功时：清除 last_jwt_fail 冷却标记，让账号立即重新参与轮询
+    适用场景：全量快速扫描（极速重检），需要能恢复被误标的账号。
     """
     acc_id = _account_id(account)
     if acc_id in _quota_check_in_progress:
@@ -2099,6 +2105,7 @@ async def _check_quota_fast(account: dict) -> bool:
         return False
 
     _quota_check_in_progress.add(acc_id)
+    _jwt_refreshed = False  # 本次调用是否已尝试过刷新
     try:
         headers = {
             "User-Agent": "ktor-client",
@@ -2107,7 +2114,7 @@ async def _check_quota_fast(account: dict) -> bool:
             "grazie-agent": '{"name":"aia:pycharm","version":"251.26094.80.13:251.26094.141"}',
             "grazie-authenticate-jwt": jwt_val,
         }
-        for _attempt in range(2):
+        for _attempt in range(3):  # 0: 原JWT, 1: 429重试, 2: JWT刷新后重试
             try:
                 response = await http_client.post(
                     "https://api.jetbrains.ai/user/v5/quota/get", headers=headers, timeout=8.0
@@ -2119,18 +2126,40 @@ async def _check_quota_fast(account: dict) -> bool:
 
             sc = response.status_code
             if sc == 429:
-                if _attempt == 0:
+                if _attempt < 2:
                     await asyncio.sleep(2.0)
                     continue
-                # 二次仍 429：保留现有状态，不做任何修改
+                # 多次 429：保留现有状态
                 account["last_quota_check"] = time.time()
                 return account.get("has_quota", True)
+
             if sc == 401:
+                # JWT 已过期；若未尝试过刷新，先尝试一次
+                if not _jwt_refreshed and account.get("licenseId"):
+                    _jwt_refreshed = True
+                    try:
+                        await _refresh_jetbrains_jwt(account)
+                        new_jwt = account.get("jwt")
+                        if new_jwt and new_jwt != jwt_val:
+                            jwt_val = new_jwt
+                            headers["grazie-authenticate-jwt"] = new_jwt
+                            print(f"[fast-recheck] {acc_id} JWT 刷新成功，重试配额检查")
+                            continue  # 用新 JWT 再试一次
+                        else:
+                            print(f"[fast-recheck] {acc_id} JWT 刷新未更新（state=NONE）")
+                    except Exception as _re:
+                        print(f"[fast-recheck] {acc_id} JWT 刷新失败: {_re}")
+                    # 刷新失败或 JWT 未变化：若仍有 JWT，保留 has_quota（不能确认配额耗尽）
+                    if account.get("jwt"):
+                        account["quota_status_reason"] = "fast_recheck_401_jwt_refresh_failed"
+                        account["last_quota_check"] = time.time()
+                        return account.get("has_quota", True)
+                # 无法恢复（无 licenseId / 已刷新仍 401 / 无 JWT）→ 确认无配额
                 account["has_quota"] = False
                 account["last_quota_check"] = time.time()
                 return False
+
             if sc != 200:
-                # 其他非预期状态码：保留现有状态
                 account["last_quota_check"] = time.time()
                 return account.get("has_quota", True)
 
@@ -2144,13 +2173,19 @@ async def _check_quota_fast(account: dict) -> bool:
             tariff = quota_obj.get("tariffQuota", {})
             tariff_total     = float(tariff.get("maximum",   {}).get("amount", 0) or 0)
             tariff_available = float(tariff.get("available", {}).get("amount", 0) or 0)
-            tariff_used      = float(tariff.get("current",   {}).get("amount", 0) or 0)
             has_q = (tariff_total == 0) or (tariff_available > 0)
             account["has_quota"]   = has_q
             account["daily_used"]  = int(tariff_total - tariff_available) if tariff_total > 0 else 0
             account["daily_total"] = int(tariff_total)
             account["last_quota_check"] = time.time()
+            # 成功查到配额 → 清除 JWT 冷却标记，账号立即重新参与轮询
+            if has_q:
+                account.pop("last_jwt_fail", None)
+                account.pop("quota_status_reason", None)
             return has_q
+        # for 循环正常退出（不应到达）
+        account["last_quota_check"] = time.time()
+        return account.get("has_quota", True)
     except asyncio.CancelledError:
         raise
     except Exception as e:
