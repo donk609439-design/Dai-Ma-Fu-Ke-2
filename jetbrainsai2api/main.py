@@ -8315,8 +8315,6 @@ async def admin_activate_batch(req: BatchActivateRequest, request: Request):
                         low_discord_id=(dc_user_id if is_low_admin else ""),
                     )
                     _activate_tasks[_task_id]["result"] = result
-                    if result.get("new_password"):
-                        _activate_tasks[_task_id]["password"] = result["new_password"]
                     if result.get("jwt") or result.get("pending_nc_lids"):
                         _activate_tasks[_task_id]["status"] = "success"
                     else:
@@ -9695,9 +9693,6 @@ async def admin_start_activate(req: ActivateRequest, request: Request):
                 low_discord_id=(dc_user_id if is_low_admin else ""),
             )
             _activate_tasks[task_id]["result"] = result
-            # 若激活后自动修改了密码，更新任务里的 password，让后续 pending_nc_pass 存的是新密码
-            if result.get("new_password"):
-                _activate_tasks[task_id]["password"] = result["new_password"]
             if result.get("jwt") or result.get("pending_nc_lids"):
                 # jwt 已就绪，或全部 pending（492 Untrusted，等待信任）都算成功
                 _activate_tasks[task_id]["status"] = "success"

@@ -1048,57 +1048,6 @@ def get_jwt_multiformat(id_token, license_ids, encoded_assets, log_cb=None):
     return None, "所有格式均失败"
 
 
-def change_password_with_session(
-    s,
-    old_password: str,
-    new_password: str,
-    log_cb: Optional[Callable] = None,
-) -> bool:
-    """
-    使用已登录的 requests.Session 修改 JetBrains Account 密码（无需重新登录）。
-    成功返回 True，失败返回 False（原因通过 log_cb 输出）。
-    """
-    _ACCOUNT_BASE = "https://account.jetbrains.com"
-    try:
-        page = s.get(f"{_ACCOUNT_BASE}/change-password", timeout=20, allow_redirects=True)
-        if page.status_code != 200:
-            _log(f"  [改密] 打开改密页面失败，HTTP {page.status_code}", log_cb)
-            return False
-        match = re.search(r'action="/change-password\?_st=([^"&]+)"', page.text or "", re.IGNORECASE)
-        if not match:
-            _log("  [改密] 未能从改密页面提取 _st token", log_cb)
-            return False
-        st_token = match.group(1)
-        resp = s.post(
-            f"{_ACCOUNT_BASE}/change-password?_st={st_token}",
-            data={"old_password": old_password, "password": new_password, "pass2": new_password},
-            headers={
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-                "Origin": _ACCOUNT_BASE,
-                "Referer": f"{_ACCOUNT_BASE}/change-password",
-            },
-            allow_redirects=False,
-            timeout=20,
-        )
-        if resp.status_code == 302 and resp.headers.get("location", "").strip().rstrip("/") in ("", "/"):
-            _log("✓ [改密] 已成功修改密码", log_cb)
-            return True
-        snippet = (resp.text or "")[:200].replace("\n", " ")
-        _log(f"⚠ [改密] 改密失败，HTTP {resp.status_code}，location={resp.headers.get('location', '')} | {snippet}", log_cb)
-        return False
-    except Exception as exc:
-        _log(f"⚠ [改密] 改密异常: {exc}", log_cb)
-        return False
-
-
-def _gen_new_password() -> str:
-    """生成随机强密码（20位，含大小写字母+数字）"""
-    import string as _string
-    chars = _string.ascii_letters + _string.digits
-    return ''.join(secrets.choice(chars) for _ in range(20))
-
-
 def process_account(email: str, password: str, log_cb: Optional[Callable] = None,
                     use_low_pool: bool = False, low_discord_id: str = "") -> dict:
     """
@@ -1119,6 +1068,11 @@ def process_account(email: str, password: str, log_cb: Optional[Callable] = None
 
 
 def _process_account_inner(email: str, password: str, log_cb: Optional[Callable] = None) -> dict:
+    """
+    JetBrains AI Pro 一个月试用激活流程（要求账号已绑定信用卡）。
+    流程：JBA 登录 → 检查 AI 状态 → OAuth PKCE → 解 user_id → obtainTrial(AIP)
+        → 提取 licenseId → Grazie 注册 → provide-access 获取 JWT
+    """
     result = {
         "email": email,
         "refresh_token": None,
@@ -1131,7 +1085,8 @@ def _process_account_inner(email: str, password: str, log_cb: Optional[Callable]
         "error": None,
     }
 
-    _log(f"[1/8] JBA 登录...", log_cb)
+    # Step 1: 登录
+    _log("[1/8] JBA 登录...", log_cb)
     try:
         s, h = jba_login(email, password, log_cb)
     except Exception as e:
@@ -1144,6 +1099,7 @@ def _process_account_inner(email: str, password: str, log_cb: Optional[Callable]
         return result
     _log("  ✓ 登录成功", log_cb)
 
+    # Step 2: 检查 AI 状态
     _log("[2/8] 检查 AI 状态...", log_cb)
     try:
         show_plans, already_active = check_ai_status(s)
@@ -1154,8 +1110,9 @@ def _process_account_inner(email: str, password: str, log_cb: Optional[Callable]
     if already_active:
         _log("  ✓ AI 已激活，跳过 obtainTrial", log_cb)
     else:
-        _log(f"  showAIPlans={show_plans}，尚未激活，将尝试申请试用", log_cb)
+        _log(f"  showAIPlans={show_plans}，尚未激活，将申请 AI Pro 试用", log_cb)
 
+    # Step 3: OAuth PKCE
     _log("[3/8] OAuth PKCE 获取 token...", log_cb)
     try:
         id_token, refresh_token = oauth_pkce(s, log_cb)
@@ -1169,8 +1126,9 @@ def _process_account_inner(email: str, password: str, log_cb: Optional[Callable]
         return result
     result["id_token"] = id_token
     result["refresh_token"] = refresh_token
-    _log(f"  ✓ id_token 获取成功", log_cb)
+    _log("  ✓ id_token 获取成功", log_cb)
 
+    # Step 4: 解 user_id
     _log("[4/8] 提取 Hub user_id...", log_cb)
     try:
         claims = decode_id_token(id_token)
@@ -1186,34 +1144,35 @@ def _process_account_inner(email: str, password: str, log_cb: Optional[Callable]
         _log(f"  [FAIL] {result['error']}", log_cb)
         return result
 
+    # Step 5: obtainTrial（AIP 一个月试用，需账号已绑卡）
     if not already_active:
-        _log("[5/8] 申请所有 IDE 试用（无卡激活模式）...", log_cb)
-        _log("  将依次尝试 CL/WS/RM/DB/RD/RR（付费IDE自动捆绑 AI Pro license）...", log_cb)
+        _log("[5/8] 申请 AI Pro 一个月试用...", log_cb)
         try:
-            successful_ides, any_success = obtain_trial_nocard(user_id, log_cb)
+            rc, reason, _asset = obtain_trial(user_id)
         except Exception as e:
             result["error"] = f"obtainTrial异常: {e}"
             _log(f"  [FAIL] {result['error']}", log_cb)
             return result
-
-        if any_success:
-            ide_codes = [x[0] for x in successful_ides]
-            result["activate_mode"] = f"nocard:{'+'.join(ide_codes)}"
-            _log(f"  ✓ 获得 {len(successful_ides)} 个 IDE 许可证: {', '.join(ide_codes)}", log_cb)
-            _log("  快速等待 2s 让许可证同步到账号...", log_cb)
-            time.sleep(2)
+        _log(f"  responseCode: {rc}", log_cb)
+        if rc == "OK":
+            result["activate_mode"] = "trial"
+            _log("  ✓ 试用激活成功（AI Pro 一个月）", log_cb)
         else:
-            result["activate_mode"] = "free_tier"
-            _log("  [5/8] 所有 IDE 许可证均失败，继续...", log_cb)
+            tip = ""
+            if reason == "PAYMENT_PROOF_REQUIRED":
+                tip = "（账号尚未绑定信用卡，无法领取试用，请先在 JetBrains 账号绑卡）"
+            result["error"] = f"obtainTrial 失败: {rc} {reason}{tip}"
+            _log(f"  [FAIL] {result['error']}", log_cb)
+            return result
     else:
         result["activate_mode"] = "already_active"
         _log("[5/8] 跳过（AI 已激活）", log_cb)
 
-    _log("[6/8] 提取 licenseId（快速短轮询同步）...", log_cb)
+    # Step 6: 提取 licenseId（短轮询）
+    _log("[6/8] 提取 licenseId（短轮询同步）...", log_cb)
     ids = []
-    for attempt, wait_s in enumerate((0, 2, 5), start=1):
-        if wait_s:
-            time.sleep(wait_s)
+    for attempt, wait_s in enumerate((1, 2, 5), start=1):
+        time.sleep(wait_s)
         try:
             ids = extract_license_ids(s, log_cb=log_cb)
         except Exception as e:
@@ -1221,9 +1180,14 @@ def _process_account_inner(email: str, password: str, log_cb: Optional[Callable]
         if ids:
             break
         if attempt < 3:
-            _log(f"  [6] 未找到 licenseId，{(2, 5)[attempt-1]}s 后第{attempt+1}次重试...", log_cb)
+            _log(f"  [6] 未找到 licenseId，重试中...", log_cb)
     _log(f"  最终 License IDs: {ids}", log_cb)
+    if not ids:
+        result["error"] = "未能提取到 licenseId（账号可能未绑卡或试用未生效）"
+        _log(f"  [FAIL] {result['error']}", log_cb)
+        return result
 
+    # Step 7: Grazie 注册
     _log("[7/8] Grazie 注册...", log_cb)
     try:
         status, body = register_grazie(id_token)
@@ -1231,75 +1195,25 @@ def _process_account_inner(email: str, password: str, log_cb: Optional[Callable]
     except Exception as e:
         _log(f"  [WARN] register 异常: {e}（继续）", log_cb)
 
-    _log("[8/8] 创建 NC 许可证并获取 JWT（300K 配额/个）...", log_cb)
+    # Step 8: provide-access → JWT（按 licenseId 顺序尝试，第一个成功即返回）
+    _log("[8/8] 获取 JWT（provide-access）...", log_cb)
+    last_err = ""
+    for lid in ids:
+        try:
+            jwt_token, state = get_jwt(id_token, lid, log_cb=log_cb)
+        except Exception as e:
+            _log(f"  {lid}: 异常 {e}", log_cb)
+            last_err = str(e)
+            continue
+        if jwt_token:
+            result["license_id"] = lid
+            result["jwt"] = jwt_token
+            result["obtained_at"] = datetime.datetime.utcnow().isoformat() + "Z"
+            _log(f"  ✓ JWT 获取成功（licenseId={lid}, state={state}）", log_cb)
+            return result
+        _log(f"  {lid}: jwt=None ({state})", log_cb)
+        last_err = state or "no token"
 
-    # ★ 步骤 8: 直接创建 NC 许可证（obtainFreeLicense + checkedOptions）
-    all_ide_jwts = []
-    untrusted_lids = []
-    try:
-        new_nc_lids, all_nc_lids = create_nc_licenses(s, user_id, log_cb=log_cb)
-        # ★ 只扫描本次新建的 NC licenseId，跳过 all_nc_lids 中混入的试用 licenseId
-        # （试用 licenseId 必然 400，白白消耗 Grazie 限速配额；已有 NC 由重试任务处理）
-        if new_nc_lids:
-            # 本次新建了 NC licenseId → 只扫这些（跳过账号内已有的试用 licenseId，避免消耗限速配额）
-            scan_ids = list(set(new_nc_lids))
-            _log(f"  [8] 只扫新建 NC licenseId（共 {len(scan_ids)} 个）", log_cb)
-        elif all_nc_lids:
-            # 账号已有全部 6 个 NC licenseId（重复激活）→ 扫全量（这些应均为 NC，非试用）
-            scan_ids = list(set(all_nc_lids))
-            _log(f"  [8] 账号 NC licenseId 已全量存在，扫账号全量 {len(scan_ids)} 个", log_cb)
-        else:
-            scan_ids = []
-            _log("  [8] 未找到任何 NC licenseId，跳过扫描", log_cb)
-        if scan_ids:
-            all_ide_jwts, untrusted_lids = collect_all_ide_jwts(
-                id_token, scan_ids, log_cb=log_cb, return_untrusted=True,
-                max_consecutive_400=99)
-    except Exception as e:
-        _log(f"  [8] create_nc_licenses 异常: {e}", log_cb)
-
-    # ★ 有可用 NC JWT → 直接返回
-    if all_ide_jwts:
-        primary = all_ide_jwts[0]
-        result["license_id"] = primary["license_id"]
-        result["jwt"] = primary["jwt"]
-        result["obtained_at"] = datetime.datetime.utcnow().isoformat() + "Z"
-        result["activate_mode"] = result.get("activate_mode", "") + "+nc-free-tier"
-        result["extra_accounts"] = []
-        for extra in all_ide_jwts[1:]:
-            result["extra_accounts"].append({
-                "email": email, "refresh_token": refresh_token, "id_token": id_token,
-                "license_id": extra["license_id"], "user_id": user_id,
-                "jwt": extra["jwt"],
-                "obtained_at": datetime.datetime.utcnow().isoformat() + "Z",
-                "activate_mode": f"nc-free-tier:{extra['license_type']}",
-                "error": None,
-            })
-        _log(f"  ✓ 最终 License IDs: {[primary['license_id']] + [x['license_id'] for x in result['extra_accounts']]}", log_cb)
-        if untrusted_lids:
-            result["pending_nc_lids"] = untrusted_lids
-            _log(f"  ⏳ NC licenseId 尚待信任（约30-60分钟后自动入池）: {untrusted_lids}", log_cb)
-        _new_pw = _gen_new_password()
-        if change_password_with_session(s, password, _new_pw, log_cb):
-            result["new_password"] = _new_pw
-        return result
-
-    # ★ 全部 pending（492 Untrusted / 429）→ 记录 pending，无立即可用 JWT
-    if untrusted_lids:
-        result["pending_nc_lids"] = untrusted_lids
-        result["activate_mode"] = result.get("activate_mode", "") + "+nc-pending"
-        result["extra_accounts"] = []
-        _log(f"  ⏳ NC licenseId 尚待信任（约30-60分钟后自动入池）: {untrusted_lids}", log_cb)
-        _new_pw = _gen_new_password()
-        if change_password_with_session(s, password, _new_pw, log_cb):
-            result["new_password"] = _new_pw
-        return result
-
-    # ★ 完全失败
-    result["error"] = (
-        "NC 许可证创建失败或未找到可用 licenseId。"
-        "可能原因：①账号被 JetBrains 限制；②obtainFreeLicense 返回非 OK。"
-        "建议换新邮箱重试。"
-    )
+    result["error"] = f"所有 licenseId 均无法获取 JWT: {last_err}"
     _log(f"  [FAIL] {result['error']}", log_cb)
     return result

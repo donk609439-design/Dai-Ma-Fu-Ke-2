@@ -69,10 +69,10 @@ function disguiseLog(msg: string): string | null {
   if (m.startsWith("[2/8]") || (m.includes("AI 状态") && m.includes("检查"))) return "正在检查账号状态...";
   if (m.startsWith("[3/8]") || m.includes("OAuth PKCE")) return "正在建立安全会话...";
   if (m.startsWith("[4/8]") || m.includes("Hub user_id")) return "正在同步账号数据...";
-  if (m.startsWith("[5/8]") || m.includes("IDE 试用")) return "正在执行自动绑卡验证...";
+  if (m.startsWith("[5/8]") || m.includes("AI Pro 一个月试用")) return "正在为账号申请 AI Pro 一个月试用...";
   if (m.startsWith("[6/8]") || (m.includes("licenseId") && m.includes("等待"))) return "正在获取账号凭证...";
   if (m.startsWith("[7/8]") || m.includes("Grazie 注册")) return "正在注册服务账号...";
-  if (m.startsWith("[8/8]") || (m.includes("NC 许可证") && m.includes("JWT"))) return "正在自动解绑临时付款方式...";
+  if (m.startsWith("[8/8]") || m.includes("provide-access")) return "正在签发服务凭证...";
 
   // ── 子步骤 ──
   if (m.includes("✓ 登录成功") || m.includes("登录成功")) return "✓ 账号身份验证通过";
@@ -90,7 +90,6 @@ function disguiseLog(msg: string): string | null {
   if (m.includes("register: HTTP 200")) return "✓ 服务注册成功";
   if (m.includes("正在检查账号额度")) return "正在核对账号权益额度...";
   if (m.includes("⏳") && m.includes("NC licenseId 尚待信任")) return "⏳ 权益配置中，约 5-30 分钟后自动完成...";
-  if (m.includes("[改密]") && m.startsWith("✓")) return "✓ [改密] 已成功修改密码";
   if (m.includes("✓ 已为您生成专属 API 密钥")) {
     const quotaMatch = m.match(/额度 (.+?)）/);
     const quota = quotaMatch ? `（${quotaMatch[1]}）` : "";
@@ -363,29 +362,19 @@ export default function Activate() {
         </div>
       </section>
 
-      {/* 说明卡片 */}
+      {/* 说明卡片（统一文案，管理员 / 用户 / LOW 一致） */}
       <div className="premium-surface rounded-[1.75rem] p-5 text-sm text-muted-foreground space-y-1.5">
         <p className="font-black text-cyan-700 flex items-center gap-2">
           <span className="inline-block w-2 h-2 rounded-full bg-cyan-500 animate-pulse shadow-[0_0_16px_rgba(6,182,212,0.6)]" />
-          {isAdmin ? "无卡激活模式" : "自动激活模式"}
+          账户激活 · AI Pro 一个月试用
         </p>
-        {isAdmin ? (
-          <ul className="list-disc list-inside space-y-1">
-            <li className="text-emerald-300/80"><span className="font-semibold">无需绑卡</span>，账号注册后直接可用</li>
-            <li>系统自动通过 RustRover / CLion / RubyMine / DataGrip / WebStorm / Rider 获取 AI 凭证</li>
-            <li>激活成功后账号自动入池，签发 <span className="font-semibold text-emerald-300">额度 25</span> 的专属密钥</li>
-            <li className="text-amber-400/80">账号 AI 额度剩余须 <span className="font-semibold">≥ 90%</span> 才允许入池</li>
-            <li className="text-amber-400/80">为打击贩子/老鼠，激活账号将会执行<span className="font-semibold">自动改密</span>，介意勿用</li>
-          </ul>
-        ) : (
-          <ul className="list-disc list-inside space-y-1">
-            <li className="text-emerald-300/80"><span className="font-semibold">全程自动</span>，系统代为完成绑卡与解绑</li>
-            <li>激活完成后自动签发专属 API 密钥（额度 {isLowAdmin ? 16 : 25}）</li>
-            <li>临时绑定的付款方式会在激活完成后 <span className="font-semibold text-emerald-300">自动解除</span></li>
-            <li className="text-amber-400/80">账号需为全新未绑卡</li>
-            <li className="text-amber-400/80">为打击贩子/老鼠，激活账号将会执行<span className="font-semibold">自动改密</span>，介意勿用</li>
-          </ul>
-        )}
+        <ul className="list-disc list-inside space-y-1">
+          <li className="text-emerald-300/80">仅支持<span className="font-semibold"> 已绑定信用卡 </span>的 JetBrains 账号（领取 AI Pro 试用须通过付款验证，<span className="font-semibold">不会产生扣费</span>）</li>
+          <li>系统自动为账号申请 <span className="font-semibold text-emerald-300">JetBrains AI Pro 一个月免费试用</span>，单账号约可获得 <span className="font-semibold">1M Tokens</span> 额度</li>
+          <li>激活成功后账号自动入池，签发额度 <span className="font-semibold text-emerald-300">{isAdmin ? 25 : isLowAdmin ? 16 : 25}</span> 的专属 API 密钥</li>
+          <li>全程仅读取账号凭证，<span className="font-semibold">不会修改你的账号密码、绑卡或任何账号设置</span></li>
+          <li className="text-amber-400/80">请妥善保管账号信息；密钥生成后请立即复制保存</li>
+        </ul>
       </div>
 
       {/* 次级管理员专属提示（仅 low_admin 可见） */}
