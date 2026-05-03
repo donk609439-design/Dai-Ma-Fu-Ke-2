@@ -3892,7 +3892,7 @@ async def _cf_proxy_health_check_loop():
 
 
 async def _run_pool_discovery():
-    """检测全部未在池中的账号，刷新 JWT + 检查配额，有配额的加入轮询池（不再限制数量，确保不漏号）。"""
+    """随机取最多 500 个未在池中的账号，刷新 JWT + 检查配额，有配额的加入轮询池。"""
     _pool_task_state["discovery_running"] = True
     _pool_task_state["discovery_done"]    = 0
     _pool_task_state["discovery_added"]   = 0
@@ -3900,13 +3900,13 @@ async def _run_pool_discovery():
         snapshot   = list(JETBRAINS_ACCOUNTS)
         candidates = [a for a in snapshot if _account_id(a) not in POLLING_POOL]
         _random.shuffle(candidates)
-        targets = candidates  # ★ 不再截断 500，覆盖全部池外账号
+        targets = candidates[:500]
         _pool_task_state["discovery_total"] = len(targets)
         if not targets:
             print("[pool-discovery] 所有账号已在池中，跳过")
             return
 
-        print(f"[pool-discovery] 开始：检测全部 {len(targets)} 个池外账号（不截断）")
+        print(f"[pool-discovery] 开始：从 {len(candidates)} 个未入池账号中检测 {len(targets)} 个")
         semaphore   = asyncio.Semaphore(20)   # 20 并发，避免 auth 端点 429
         added_count = 0
         done_count  = 0
