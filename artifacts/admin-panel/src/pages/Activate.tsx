@@ -647,7 +647,13 @@ export default function Activate() {
                 ? error
                 : (error?.includes("RATE_LIMIT") || error?.includes("速率限制") || error?.includes("429"))
                   ? "服务器当前请求过多，请等待 1-2 分钟后重试。"
-                  : "账号验证未通过，请检查邮箱和密码是否正确后重试。"}
+                  : (error?.includes("PAYMENT_PROOF_REQUIRED") || error?.includes("payment_proof") || error?.includes("绑定信用卡") || error?.includes("绑卡"))
+                    ? "该账号尚未绑定信用卡，无法领取 AI Pro 试用。请先到 JetBrains 账号设置中绑定一张可用的信用卡（不会扣费），然后再回来重试。"
+                    : (error?.includes("COUNTRY_IS_RESTRICTED") || error?.includes("country"))
+                      ? "该账号所在地区受限，无法领取 AI Pro 试用，请更换账号或调整账号地区后重试。"
+                      : (error?.includes("登录失败") || error?.includes("登录异常") || error?.toLowerCase().includes("login") || error?.includes("invalid_login"))
+                        ? "账号验证未通过，请检查邮箱和密码是否正确后重试。"
+                        : (error || "激活失败，请稍后重试。")}
             </p>
           </div>
         </div>
