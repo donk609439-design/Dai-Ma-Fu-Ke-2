@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useMemo } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { Plus, RefreshCw, Users, Copy, Check, ChevronDown, ChevronRight, KeyRound, Unlink, Search, X, Zap, Activity, ListChecks, Eraser } from "lucide-react";
+import { Plus, RefreshCw, Users, Copy, Check, ChevronDown, ChevronRight, KeyRound, Unlink, Search, X, Zap, Activity, ListChecks, Eraser, Gauge } from "lucide-react";
 import { adminFetch } from "@/lib/admin-auth";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -221,6 +221,7 @@ export default function Accounts() {
   const [boundExpanded, setBoundExpanded] = useState(false);
   const [poolExpanded, setPoolExpanded] = useState(false);
   const [unboundExpanded, setUnboundExpanded] = useState(false);
+  const [oneMExpanded, setOneMExpanded] = useState(false);
   const [searchQ, setSearchQ] = useState("");
 
   useEffect(() => {
@@ -455,17 +456,19 @@ export default function Accounts() {
     return ids;
   }, [keysData]);
 
-  const { boundAccounts, poolAccounts, unboundAccounts } = useMemo(() => {
+  const { boundAccounts, poolAccounts, unboundAccounts, oneMAccounts } = useMemo(() => {
     const q = searchQ.trim().toLowerCase();
     const match = (a: Account) =>
       !q ||
       a.licenseId.toLowerCase().includes(q) ||
       a.account_id.toLowerCase().includes(q) ||
       a.jwt_preview.toLowerCase().includes(q);
+    const isOneM = (a: Account) => a.daily_total === 1_000_000;
     return {
-      boundAccounts: accounts.filter(a => boundAccountIds.has(a.account_id) && match(a)),
-      poolAccounts: accounts.filter(a => !boundAccountIds.has(a.account_id) && a.in_pool && match(a)),
-      unboundAccounts: accounts.filter(a => !boundAccountIds.has(a.account_id) && !a.in_pool && match(a)),
+      oneMAccounts: accounts.filter(a => isOneM(a) && match(a)),
+      boundAccounts: accounts.filter(a => !isOneM(a) && boundAccountIds.has(a.account_id) && match(a)),
+      poolAccounts: accounts.filter(a => !isOneM(a) && !boundAccountIds.has(a.account_id) && a.in_pool && match(a)),
+      unboundAccounts: accounts.filter(a => !isOneM(a) && !boundAccountIds.has(a.account_id) && !a.in_pool && match(a)),
     };
   }, [accounts, boundAccountIds, searchQ]);
 
@@ -747,6 +750,35 @@ export default function Accounts() {
         </Card>
       ) : (
         <div className="space-y-4">
+          {/* 1M 配额账户（独立分类，不再出现在其他三个分组中） */}
+          <div className="space-y-2">
+            <SectionHeader
+              icon={<Gauge className="w-4 h-4" />}
+              label="1M"
+              count={oneMAccounts.length}
+              expanded={oneMExpanded}
+              onToggle={() => setOneMExpanded(v => !v)}
+              iconClass="text-violet-400"
+              hoverClass="hover:text-violet-400"
+              badge={
+                <span className="text-xs bg-violet-500/15 text-violet-300 border border-violet-500/30 px-1.5 py-0.5 rounded-full">
+                  1,000,000 tokens/天
+                </span>
+              }
+            />
+            {oneMExpanded && (
+              oneMAccounts.length === 0 ? (
+                <p className="text-xs text-muted-foreground pl-6 py-2">暂无配额上限为 1M 的账号</p>
+              ) : (
+                <div className="space-y-3">
+                  {oneMAccounts.map(account => (
+                    <AccountCard key={account.index} account={account} {...cardProps} />
+                  ))}
+                </div>
+              )
+            )}
+          </div>
+
           {/* 已绑定密钥的账户 */}
           <div className="space-y-2">
             <SectionHeader
