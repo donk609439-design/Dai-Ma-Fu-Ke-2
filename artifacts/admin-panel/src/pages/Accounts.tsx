@@ -477,12 +477,12 @@ export default function Accounts() {
       a.account_id.toLowerCase().includes(q) ||
       a.jwt_preview.toLowerCase().includes(q);
     const isOneM = (a: Account) => a.daily_total === 1_000_000;
-    // 1M 账号允许同时出现在【1M】和原有三组中（重复显示），便于直观看到它们在池/绑定状态
+    // 1M 账号仅允许同时出现在【1M】和【轮询池】两组中；【已绑定】【无绑定】仍排除 1M
     return {
       oneMAccounts: accounts.filter(a => isOneM(a) && match(a)),
-      boundAccounts: accounts.filter(a => boundAccountIds.has(a.account_id) && match(a)),
+      boundAccounts: accounts.filter(a => !isOneM(a) && boundAccountIds.has(a.account_id) && match(a)),
       poolAccounts: accounts.filter(a => !boundAccountIds.has(a.account_id) && a.in_pool && match(a)),
-      unboundAccounts: accounts.filter(a => !boundAccountIds.has(a.account_id) && !a.in_pool && match(a)),
+      unboundAccounts: accounts.filter(a => !isOneM(a) && !boundAccountIds.has(a.account_id) && !a.in_pool && match(a)),
     };
   }, [accounts, boundAccountIds, searchQ]);
 
