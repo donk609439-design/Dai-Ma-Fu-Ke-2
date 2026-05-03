@@ -412,4 +412,3 @@ NDJSON 协议（version 3）：
 3. **修改 `Accounts.tsx`** — 删除 `syncFromSourceMutation`（调用旧端点 `/admin/accounts/import-from-source`）及其 state（`syncOpen`、`syncUrl`）和对应 Dialog UI；移除 `ArrowDownToLine` 未使用 import。
 
 架构师审查：旧函数已全部删除，新 5 个端点存在且正确，_EXPORT_TABLES/_TABLE_CONFLICT_COL 包含 jb_settings，Python 语法检查 PASS（`python3 -m py_compile`），前端热更新无编译错误，API 服务正常启动（2166 账号）。
-
