@@ -22,6 +22,9 @@ type Status = {
   usage_count?: number;
   claimed_today: number;
   daily_quota: number;
+  global_cap?: number;
+  global_granted?: number;
+  global_remaining?: number;
   user_tag?: string;
 };
 
@@ -221,8 +224,12 @@ export default function PersonalCenter() {
   const overstocked = status?.has_key
     ? keyRemaining > (status.daily_quota ?? 40)
     : false;
+  const globalCap = status?.global_cap ?? 10000;
+  const globalRemaining = status?.global_remaining ?? globalCap;
+  const poolDepleted =
+    !!status && globalRemaining < (status.daily_quota ?? 40);
   const claimDisabled =
-    !status?.has_key || claiming || claimedToday || overstocked;
+    !status?.has_key || claiming || claimedToday || overstocked || poolDepleted;
 
   return (
     <div className="min-h-[60vh] flex items-start justify-center pt-8 pb-12">
@@ -326,8 +333,32 @@ export default function PersonalCenter() {
                       ? `今日已签到（+${status.daily_quota} 额度已发放）`
                       : overstocked
                         ? `当前剩余额度 ${keyRemaining} > ${status.daily_quota}，请先使用部分额度后再签到`
-                        : `每天可签到一次，一次性发放 ${status.daily_quota} 次调用额度`}
+                        : poolDepleted
+                          ? `今日全站签到额度已发完，请明天再来`
+                          : `每天可签到一次，一次性发放 ${status.daily_quota} 次调用额度`}
                   </p>
+                </div>
+              </div>
+
+              <div className="bg-muted/30 rounded-xl px-3 py-2.5 space-y-1.5">
+                <div className="flex items-center justify-between text-[11px]">
+                  <span className="text-muted-foreground">今日全站剩余</span>
+                  <span className="font-mono font-semibold">
+                    {globalRemaining} / {globalCap}
+                  </span>
+                </div>
+                <div className="w-full h-1.5 bg-muted/40 rounded-full overflow-hidden">
+                  <div
+                    className={`h-full rounded-full transition-all ${
+                      poolDepleted ? "bg-red-500/70" : "bg-primary"
+                    }`}
+                    style={{
+                      width: `${Math.max(
+                        0,
+                        Math.min(100, (globalRemaining / Math.max(1, globalCap)) * 100),
+                      )}%`,
+                    }}
+                  />
                 </div>
               </div>
 
@@ -345,13 +376,16 @@ export default function PersonalCenter() {
                   ? "今日已签到"
                   : overstocked
                     ? `剩余额度过多，暂不可签到`
-                    : claiming
-                      ? "签到中…"
-                      : `签到领取 +${status.daily_quota} 额度`}
+                    : poolDepleted
+                      ? "今日全站额度已发完"
+                      : claiming
+                        ? "签到中…"
+                        : `签到领取 +${status.daily_quota} 额度`}
               </button>
 
               <p className="text-[11px] text-muted-foreground text-center leading-relaxed">
-                每天签到一次，一次性发放 {status.daily_quota} 次调用额度。
+                每天签到一次，一次性发放 {status.daily_quota} 次调用额度，全站每天上限{" "}
+                {globalCap}（约前 {Math.floor(globalCap / status.daily_quota)} 名，先到先得）。
                 <br />
                 为防止囤积，剩余额度大于 {status.daily_quota} 时无法签到。次日 0 点（UTC）自动重置。
               </p>

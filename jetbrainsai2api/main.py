@@ -887,6 +887,13 @@ async def _ensure_db_tables():
                 PRIMARY KEY (dc_user_id, date)
             )
         """)
+        # 个人中心：全局每日发放总额度（先到先得，超出则当日不再发放）
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS dc_global_claim_quota (
+                date           DATE PRIMARY KEY,
+                total_granted  INTEGER NOT NULL DEFAULT 0
+            )
+        """)
         # 通用设置 K-V 表（目前用于 LOW_ADMIN 批量激活并发数）
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS jb_settings (
@@ -11171,6 +11178,7 @@ async def discord_verify(token: str = ""):
 # ==================== 个人中心：Discord 用户独占 Key + 每日 40 次额度 ====================
 
 _DC_PERSONAL_DAILY_QUOTA = 40  # 每用户每天签到一次性发放的调用额度
+_DC_GLOBAL_DAILY_CAP = 10000   # 全局每天发放总额度上限（先到先得，约前 250 名）
 
 
 def _validate_personal_dc(token: str) -> dict:
@@ -11218,24 +11226,30 @@ async def personal_center_status(discord_token: str = ""):
             "SELECT count FROM dc_claim_limits WHERE dc_user_id=$1 AND date=CURRENT_DATE",
             dc_uid,
         )
+        global_row = await conn.fetchrow(
+            "SELECT total_granted FROM dc_global_claim_quota WHERE date=CURRENT_DATE"
+        )
     claimed_today = int(claim_row["count"]) if claim_row else 0
+    global_granted = int(global_row["total_granted"]) if global_row else 0
+    global_remaining = max(0, _DC_GLOBAL_DAILY_CAP - global_granted)
+    base = {
+        "claimed_today": claimed_today,
+        "daily_quota": _DC_PERSONAL_DAILY_QUOTA,
+        "global_cap": _DC_GLOBAL_DAILY_CAP,
+        "global_granted": global_granted,
+        "global_remaining": global_remaining,
+        "user_tag": info.get("user_tag", ""),
+    }
     if api_key:
         meta = VALID_CLIENT_KEYS.get(api_key, {})
         return {
+            **base,
             "has_key": True,
             "api_key": api_key,
             "usage_limit": int(meta.get("usage_limit") or 0),
             "usage_count": int(meta.get("usage_count") or 0),
-            "claimed_today": claimed_today,
-            "daily_quota": _DC_PERSONAL_DAILY_QUOTA,
-            "user_tag": info.get("user_tag", ""),
         }
-    return {
-        "has_key": False,
-        "claimed_today": claimed_today,
-        "daily_quota": _DC_PERSONAL_DAILY_QUOTA,
-        "user_tag": info.get("user_tag", ""),
-    }
+    return {**base, "has_key": False}
 
 
 @app.post("/key/personal-center/create")
@@ -11401,6 +11415,24 @@ async def personal_center_claim(request: Request):
                     detail=f"今日已签到，请明天再来（每天发放 {_DC_PERSONAL_DAILY_QUOTA} 调用额度）",
                 )
             new_count = 1
+            # 全局每日发放上限（先到先得）：原子 UPSERT + 条件 WHERE，超额则不更新
+            global_row = await conn.fetchrow(
+                """
+                INSERT INTO dc_global_claim_quota (date, total_granted)
+                VALUES (CURRENT_DATE, $1)
+                ON CONFLICT (date) DO UPDATE
+                SET total_granted = dc_global_claim_quota.total_granted + EXCLUDED.total_granted
+                WHERE dc_global_claim_quota.total_granted + EXCLUDED.total_granted <= $2
+                RETURNING total_granted
+                """,
+                _DC_PERSONAL_DAILY_QUOTA, _DC_GLOBAL_DAILY_CAP,
+            )
+            if not global_row:
+                # 命中全局上限：让事务回滚以撤销 dc_claim_limits 的插入
+                raise HTTPException(
+                    status_code=429,
+                    detail=f"今日全站签到额度已发完（每天 {_DC_GLOBAL_DAILY_CAP} 总额度，约前 {_DC_GLOBAL_DAILY_CAP // _DC_PERSONAL_DAILY_QUOTA} 名），请明天再来",
+                )
             # 原子加发放额度
             up_row = await conn.fetchrow(
                 """
