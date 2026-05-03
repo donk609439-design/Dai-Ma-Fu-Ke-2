@@ -199,48 +199,68 @@ async function* parseAnthropicSSE(body: ReadableStream<Uint8Array>): AsyncGenera
   const decoder = new TextDecoder();
   let buffer = "";
 
-  while (true) {
-    let chunk: ReadableStreamReadResult<Uint8Array>;
-    try {
-      chunk = await Promise.race([
-        reader.read(),
-        new Promise<never>((_, reject) =>
-          setTimeout(
-            () => reject(new Error(`upstream read timeout after ${UPSTREAM_READ_TIMEOUT_MS}ms`)),
-            UPSTREAM_READ_TIMEOUT_MS,
-          ),
-        ),
-      ]);
-    } catch (err) {
-      // Surface as a synthetic error event so the consumer ends the stream cleanly.
-      yield { type: "error", error: { message: (err as Error).message, type: "upstream_timeout" } };
+  // Outer try/finally guarantees reader cleanup even if the consumer breaks
+  // early or throws (e.g. `for await ... { break }` after a yielded error).
+  try {
+    while (true) {
+      // Per-read idle timeout: we MUST clearTimeout when read() wins the race,
+      // otherwise every successful read leaks a pending timer + rejected
+      // promise. Over a 1000-chunk stream that's 1000 leaked timers.
+      let timeoutId: ReturnType<typeof setTimeout> | undefined;
+      let chunk: ReadableStreamReadResult<Uint8Array>;
       try {
-        await reader.cancel();
-      } catch {
-        /* ignore */
+        chunk = await Promise.race([
+          reader.read(),
+          new Promise<never>((_, reject) => {
+            timeoutId = setTimeout(
+              () =>
+                reject(
+                  new Error(`upstream read timeout after ${UPSTREAM_READ_TIMEOUT_MS}ms`),
+                ),
+              UPSTREAM_READ_TIMEOUT_MS,
+            );
+          }),
+        ]);
+      } catch (err) {
+        yield {
+          type: "error",
+          error: { message: (err as Error).message, type: "upstream_timeout" },
+        };
+        return;
+      } finally {
+        if (timeoutId !== undefined) clearTimeout(timeoutId);
       }
-      return;
+
+      const { value, done } = chunk;
+      if (done) break;
+      // Normalize CRLF → LF so the \n\n splitter works on either style.
+      buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
+
+      let nlIdx;
+      while ((nlIdx = buffer.indexOf("\n\n")) !== -1) {
+        const block = buffer.slice(0, nlIdx);
+        buffer = buffer.slice(nlIdx + 2);
+
+        let dataLine = "";
+        for (const line of block.split("\n")) {
+          if (line.startsWith("data:")) dataLine += line.slice(5).trim();
+        }
+        if (!dataLine) continue;
+        try {
+          yield JSON.parse(dataLine);
+        } catch {
+          // Ignore malformed JSON
+        }
+      }
     }
-    const { value, done } = chunk;
-    if (done) break;
-    // Normalize CRLF → LF so the \n\n splitter works on either style.
-    buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
-
-    let nlIdx;
-    while ((nlIdx = buffer.indexOf("\n\n")) !== -1) {
-      const block = buffer.slice(0, nlIdx);
-      buffer = buffer.slice(nlIdx + 2);
-
-      let dataLine = "";
-      for (const line of block.split("\n")) {
-        if (line.startsWith("data:")) dataLine += line.slice(5).trim();
-      }
-      if (!dataLine) continue;
-      try {
-        yield JSON.parse(dataLine);
-      } catch {
-        // Ignore malformed JSON
-      }
+  } finally {
+    // Always release the upstream socket. cancel() rejects pending read() and
+    // tells the runtime we don't want any more bytes; releaseLock is implicit
+    // after cancel but harmless if cancel already ran.
+    try {
+      await reader.cancel();
+    } catch {
+      /* upstream may already be closed */
     }
   }
 }
@@ -331,16 +351,44 @@ async function streamAnthropicToOpenAI(
             // emitted below as [DONE]
           } else if (evt.type === "error") {
             sawError = true;
+            const errMsg = (evt.error?.message as string | undefined) ?? "upstream error";
+            const errType = (evt.error?.type as string | undefined) ?? "error";
+            // If the role chunk hasn't been sent yet, send it first so the
+            // upcoming content delta has a valid OpenAI chunk shape preceding it.
+            if (!openedRole) {
+              controller.enqueue(
+                encoder.encode(
+                  `data: ${JSON.stringify(
+                    makeOpenAIChunk(id, requestedModel, { role: "assistant", content: "" }),
+                  )}\n\n`,
+                ),
+              );
+              openedRole = true;
+            }
+            // Inline the error as a visible content delta so the user sees
+            // exactly what went wrong instead of staring at a half-sentence.
             controller.enqueue(
               encoder.encode(
-                `data: ${JSON.stringify({ error: evt.error ?? evt })}\n\n`,
+                `data: ${JSON.stringify(
+                  makeOpenAIChunk(id, requestedModel, {
+                    content: `\n\n[Stream interrupted — ${errType}: ${errMsg}]`,
+                  }),
+                )}\n\n`,
               ),
             );
-            // Do NOT emit [DONE] — surface failure clearly to the client.
+            // Emit finish_reason=stop so the client treats the response as
+            // gracefully terminated (just truncated).
+            controller.enqueue(
+              encoder.encode(
+                `data: ${JSON.stringify(
+                  makeOpenAIChunk(id, requestedModel, {}, "stop"),
+                )}\n\n`,
+              ),
+            );
             break;
           }
         }
-        if (!sawError && !openedRole) {
+        if (!openedRole) {
           controller.enqueue(
             encoder.encode(
               `data: ${JSON.stringify(
@@ -349,9 +397,10 @@ async function streamAnthropicToOpenAI(
             ),
           );
         }
-        if (!sawError) {
-          controller.enqueue(encoder.encode(`data: [DONE]\n\n`));
-        }
+        // ALWAYS emit [DONE] — including after an error — so OpenAI-compatible
+        // clients (SillyTavern, etc.) cleanly end the streaming UI state.
+        // Without this terminator, clients spin forever waiting for more data.
+        controller.enqueue(encoder.encode(`data: [DONE]\n\n`));
         controller.close();
       } catch (err) {
         controller.error(err);
