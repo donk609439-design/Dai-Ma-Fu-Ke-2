@@ -9945,18 +9945,16 @@ async def admin_activate_stream(task_id: str):
                         return
                     daily_used = new_account.get("daily_used", 0) or 0
                     daily_total = new_account.get("daily_total", 0) or 0
-                    # daily_total=0 表示无限制套餐，允许入池；否则剩余须 ≥ 90% 才允许
-                    MIN_REMAINING_PCT = 0.90
+                    # daily_total=0 表示无限制套餐，允许入池；否则必须满配额（未使用过）才允许
                     if daily_total > 0:
-                        remaining_pct = (daily_total - daily_used) / daily_total
                         used_pct = round(daily_used / daily_total * 100, 1)
-                        if remaining_pct < MIN_REMAINING_PCT:
+                        if daily_used > 0:
                             await _discard_preissued()
-                            yield f"data: {json.dumps({'type': 'log', 'msg': f'✗ 账号额度剩余不足 90%（已用 {used_pct}%，{daily_used:,}/{daily_total:,} tokens），拒绝入池'})}\n\n"
+                            yield f"data: {json.dumps({'type': 'log', 'msg': f'✗ 账号未满配额（已用 {used_pct}%，{daily_used:,}/{daily_total:,} tokens），仅允许全新满配额账号入池'})}\n\n"
                             task["status"] = "quota_rejected"
                             yield f"data: {json.dumps({'type': 'done', 'status': 'quota_rejected', 'result': result, 'generated_key': None, 'is_existing_key': False})}\n\n"
                             return
-                        yield f"data: {json.dumps({'type': 'log', 'msg': f'✓ 额度充足（剩余 {100-used_pct}%），允许入池'})}\n\n"
+                        yield f"data: {json.dumps({'type': 'log', 'msg': '✓ 满配额账号，允许入池'})}\n\n"
                     else:
                         yield f"data: {json.dumps({'type': 'log', 'msg': '✓ 无限制套餐，允许入池'})}\n\n"
 
@@ -10129,16 +10127,14 @@ async def admin_activate_stream(task_id: str):
                                 await _check_quota(existing_acc)
                                 ex_daily_used = existing_acc.get("daily_used", 0) or 0
                                 ex_daily_total = existing_acc.get("daily_total", 0) or 0
-                                MIN_REMAINING_PCT = 0.90
                                 if ex_daily_total > 0:
-                                    ex_remaining_pct = (ex_daily_total - ex_daily_used) / ex_daily_total
                                     ex_used_pct = round(ex_daily_used / ex_daily_total * 100, 1)
-                                    if ex_remaining_pct < MIN_REMAINING_PCT:
-                                        yield f"data: {json.dumps({'type': 'log', 'msg': f'✗ 账号额度剩余不足 90%（已用 {ex_used_pct}%，{ex_daily_used:,}/{ex_daily_total:,} tokens），拒绝入池'})}\n\n"
+                                    if ex_daily_used > 0:
+                                        yield f"data: {json.dumps({'type': 'log', 'msg': f'✗ 账号未满配额（已用 {ex_used_pct}%，{ex_daily_used:,}/{ex_daily_total:,} tokens），仅允许全新满配额账号入池'})}\n\n"
                                         task["status"] = "quota_rejected"
                                         yield f"data: {json.dumps({'type': 'done', 'status': 'quota_rejected', 'result': result, 'generated_key': None, 'is_existing_key': False})}\n\n"
                                         return
-                                    yield f"data: {json.dumps({'type': 'log', 'msg': f'✓ 额度充足（剩余 {100-ex_used_pct}%），允许入池'})}\n\n"
+                                    yield f"data: {json.dumps({'type': 'log', 'msg': '✓ 满配额账号，允许入池'})}\n\n"
                                 else:
                                     yield f"data: {json.dumps({'type': 'log', 'msg': '✓ 无限制套餐，允许入池'})}\n\n"
                                 generated_key = task.get("preissued_key", "")

@@ -618,8 +618,8 @@ export default function Activate() {
           <div>
             <p className="font-medium">账号额度不足，无法激活</p>
             <p className="text-sm mt-1.5 text-amber-400/80 leading-relaxed">
-              该账号 tokens 剩余不足 90%，不符合激活要求。<br />
-              请使用一个额度充足的全新账号重试。
+              该账号已使用过额度，不是满配额状态，不符合激活要求。<br />
+              仅允许从未使用过的、满配额的全新账号入池，请更换账号后重试。
             </p>
           </div>
         </div>
