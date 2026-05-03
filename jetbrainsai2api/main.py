@@ -12484,6 +12484,10 @@ async def admin_manually_activate_contribution(cid: str, request: Request):
 _EXPORT_TABLES = [
     "jb_accounts",
     "jb_client_keys",
+    # ★ 个人中心三表：紧跟 jb_client_keys，保证用户↔个人 key↔每日额度记录的对应关系
+    "dc_personal_keys",         # Discord 用户 → 专属 api_key（关联 jb_client_keys.key）
+    "dc_claim_limits",          # Discord 用户每日签到/领取计数
+    "dc_global_claim_quota",    # 全局每日发放总额度（防止超发）
     "jb_settings",                   # ★ LOW 用户审计行 + 全局配置（关键安全表）
     "partner_client_config",
     "partner_keys",
@@ -12513,6 +12517,9 @@ _TABLE_CONFLICT_COL: dict[str, str] = {
     "partner_precheck_rejections": "id",
     "self_register_jobs":          "email",
     "account_contributions":       "id",
+    # 个人中心
+    "dc_personal_keys":            "dc_user_id",    # Discord 用户主键
+    "dc_global_claim_quota":       "date",          # 每日全局发放计数器
     # 以下表支持源覆盖（冲突时用源数据覆盖）
     "user_passwords":              "password",
     "saint_points":                "password",
@@ -12526,6 +12533,7 @@ _TABLE_CONFLICT_COL: dict[str, str] = {
 _TABLE_CONFLICT_MULTI: dict[str, list] = {
     "cf_proxy_pool":      ["url", "owner", "owner_discord_id"],
     "pokeball_members":   ["pokeball_id", "member_key"],
+    "dc_claim_limits":    ["dc_user_id", "date"],   # ★ 个人中心：Discord 用户每日领取计数
 }
 
 
