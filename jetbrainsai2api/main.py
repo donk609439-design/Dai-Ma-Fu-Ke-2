@@ -6841,6 +6841,76 @@ async def admin_delete_key(key: str):
     _admin_cache_invalidate("keys", "status")
     return {"success": True, "keys_count": len(VALID_CLIENT_KEYS)}
 
+
+# ==================== 自建 Key（用户在个人中心创建的 Key）管理接口 ====================
+
+@app.get("/admin/personal-keys")
+async def admin_list_personal_keys():
+    """列出所有用户在【个人中心】自建的 Key 及其用量、签到状态。"""
+    pool = await _get_db_pool()
+    if not pool:
+        raise HTTPException(status_code=503, detail="数据库不可用")
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT
+                p.dc_user_id,
+                p.api_key,
+                p.created_at,
+                k.usage_limit,
+                k.usage_count,
+                k.banned,
+                k.banned_at,
+                cl.count AS claimed_today
+            FROM dc_personal_keys p
+            LEFT JOIN jb_client_keys k         ON k.key = p.api_key
+            LEFT JOIN dc_claim_limits cl
+                   ON cl.dc_user_id = p.dc_user_id AND cl.date = CURRENT_DATE
+            ORDER BY p.created_at DESC NULLS LAST
+            """
+        )
+    items = []
+    for r in rows:
+        api_key = r["api_key"] or ""
+        masked = (api_key[:8] + "*" * (len(api_key) - 8)) if len(api_key) > 8 else "***"
+        items.append({
+            "dc_user_id": r["dc_user_id"],
+            "api_key": api_key,
+            "masked": masked,
+            "usage_limit": int(r["usage_limit"] or 0),
+            "usage_count": int(r["usage_count"] or 0),
+            "banned": bool(r["banned"]) if r["banned"] is not None else False,
+            "banned_at": r["banned_at"],
+            "claimed_today": int(r["claimed_today"] or 0),
+            "created_at": float(r["created_at"]) if r["created_at"] is not None else None,
+            "key_exists": r["usage_limit"] is not None or r["usage_count"] is not None,
+        })
+    return {"items": items, "count": len(items)}
+
+
+@app.delete("/admin/personal-keys/{dc_user_id}")
+async def admin_delete_personal_key(dc_user_id: str):
+    """解除某 Discord 用户的【个人中心】Key 绑定，并删除底层 jb_client_keys。
+    用户下次访问个人中心可重新创建。"""
+    global VALID_CLIENT_KEYS
+    pool = await _get_db_pool()
+    if not pool:
+        raise HTTPException(status_code=503, detail="数据库不可用")
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                "SELECT api_key FROM dc_personal_keys WHERE dc_user_id=$1", dc_user_id
+            )
+            if not row:
+                raise HTTPException(status_code=404, detail="该 Discord 用户没有自建 Key")
+            api_key = row["api_key"]
+            await conn.execute("DELETE FROM dc_personal_keys WHERE dc_user_id=$1", dc_user_id)
+            await conn.execute("DELETE FROM jb_client_keys WHERE key=$1", api_key)
+    if api_key in VALID_CLIENT_KEYS:
+        del VALID_CLIENT_KEYS[api_key]
+    _admin_cache_invalidate("keys", "status")
+    return {"success": True, "deleted_key": api_key}
+
 @app.get("/admin/prizes")
 async def admin_list_prizes():
     """获取所有奖品"""

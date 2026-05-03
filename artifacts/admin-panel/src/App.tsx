@@ -5,6 +5,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import Dashboard from "@/pages/Dashboard";
 import Accounts from "@/pages/Accounts";
 import ApiKeys from "@/pages/ApiKeys";
+import SelfBuiltKeys from "@/pages/SelfBuiltKeys";
 import Models from "@/pages/Models";
 import Docs from "@/pages/Docs";
 import Stats from "@/pages/Stats";
@@ -54,6 +55,7 @@ import {
   Shield,
   Megaphone,
   UserCircle,
+  KeyRound,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { type ReactNode, useState, useEffect } from "react";
@@ -86,6 +88,7 @@ const adminNavItems = [
   { path: "/pending-queue", label: "排队记录", icon: Hourglass },
   { path: "/self-register", label: "自助绑卡", icon: CreditCard },
   { path: "/keys", label: "API 密钥", icon: Key },
+  { path: "/self-built-keys", label: "自建 Key", icon: KeyRound },
   { path: "/models", label: "模型配置", icon: Cpu },
   { path: "/stats", label: "用量统计", icon: BarChart3 },
   { path: "/logs", label: "调用日志", icon: ScrollText },
@@ -454,6 +457,7 @@ function AdminRoutes() {
       <Route path="/" component={Dashboard} />
       <Route path="/accounts" component={Accounts} />
       <Route path="/keys" component={ApiKeys} />
+      <Route path="/self-built-keys" component={SelfBuiltKeys} />
       <Route path="/models" component={Models} />
       <Route path="/stats" component={Stats} />
       <Route path="/logs" component={Logs} />
@@ -589,6 +593,7 @@ function Router() {
           <Route path="/" component={Dashboard} />
           <Route path="/accounts" component={Accounts} />
           <Route path="/keys" component={ApiKeys} />
+          <Route path="/self-built-keys" component={SelfBuiltKeys} />
           <Route path="/models" component={Models} />
           <Route path="/stats" component={Stats} />
           <Route path="/logs" component={Logs} />
