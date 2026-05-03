@@ -154,6 +154,19 @@ def _is_call_exempt(prompt_tokens: int, completion_tokens: int) -> bool:
         and int(completion_tokens or 0) < _USAGE_EXEMPT_OUTPUT_TOKENS
     )
 
+
+# ==================== 上游错误豁免 ====================
+# 当所有 JetBrains 账号配额耗尽 / 上游 API 失败时，openai_stream_adapter 会把错误
+# 包装成 assistant 文本：`[上游错误] ...`。这种合成响应不应消耗客户 key 额度。
+_UPSTREAM_ERROR_PREFIX = "[上游错误]"
+
+
+def _is_upstream_error_text(text: Optional[str]) -> bool:
+    """识别合成的『上游错误』响应：以 [上游错误] 开头的文本不计入 key 用量。"""
+    if not text:
+        return False
+    return text.lstrip().startswith(_UPSTREAM_ERROR_PREFIX)
+
 def _append_log(model: str, client_key: str, prompt_tokens: int,
                 completion_tokens: int, elapsed_ms: float, status: str,
                 exempt: bool = False) -> None:
@@ -257,6 +270,8 @@ async def _tracked_stream(
     completion_chars = 0
     inline_usage_p = 0
     inline_usage_c = 0
+    upstream_error_seen = False
+    accumulated_head = ""
     try:
         async for chunk in stream:
             if chunk.startswith("data: ") and chunk.strip() != "data: [DONE]":
@@ -267,6 +282,10 @@ async def _tracked_stream(
                     for choice in data.get("choices", []):
                         content = choice.get("delta", {}).get("content") or ""
                         completion_chars += len(content)
+                        if content and not upstream_error_seen and len(accumulated_head) < 32:
+                            accumulated_head += content
+                            if _is_upstream_error_text(accumulated_head):
+                                upstream_error_seen = True
                     # 与 _stream_with_key_consume 一致：兼容内联 usage 块
                     u = data.get("usage") or {}
                     if u:
@@ -283,11 +302,14 @@ async def _tracked_stream(
         real_c = cap.get("completion_tokens") or inline_usage_c or 0
         actual_prompt = real_p if real_p else prompt_tokens
         actual_completion = real_c if real_c else max(1, completion_chars // 4)
-        _record_stats(account, actual_prompt, actual_completion, start_time, first_token_time)
+        # 合成『[上游错误]』响应（如所有账号配额耗尽）不计入账号统计
+        if not upstream_error_seen:
+            _record_stats(account, actual_prompt, actual_completion, start_time, first_token_time)
         # 是否豁免：流式分支由 _stream_with_key_consume 实际决定计费；此处按相同条件标记日志
-        is_exempt = _is_call_exempt(actual_prompt, actual_completion)
+        is_exempt = _is_call_exempt(actual_prompt, actual_completion) or upstream_error_seen
         _append_log(model, client_key, actual_prompt, actual_completion,
-                    (time.time() - start_time) * 1000, "ok", exempt=is_exempt)
+                    (time.time() - start_time) * 1000,
+                    "upstream_error" if upstream_error_seen else "ok", exempt=is_exempt)
     except Exception as e:
         _record_stats(account, 0, 0, start_time, error=True)
         _append_log(model, client_key, prompt_tokens, 0,
@@ -1931,6 +1953,8 @@ async def _stream_with_key_consume(
     completion_chars = 0
     inline_usage_p = 0
     inline_usage_c = 0
+    upstream_error_seen = False  # 收到 `[上游错误] ...` 合成内容时置位，最终不扣费
+    accumulated_head = ""        # 累积前若干字符用于识别上游错误前缀（防分片）
     try:
         async for chunk in stream:
             if chunk.startswith("data: ") and chunk.strip() != "data: [DONE]":
@@ -1943,6 +1967,10 @@ async def _stream_with_key_consume(
                         content = delta.get("content") or ""
                         if content:
                             completion_chars += len(content)
+                            if not upstream_error_seen and len(accumulated_head) < 32:
+                                accumulated_head += content
+                                if _is_upstream_error_text(accumulated_head):
+                                    upstream_error_seen = True
                     # 兼容：若 SSE 中带了 usage 块（include_usage=True 时），也尝试采集
                     u = obj.get("usage") or {}
                     if u:
@@ -1955,7 +1983,8 @@ async def _stream_with_key_consume(
             yield chunk
     finally:
         # 无论是正常结束还是被取消（客户端断开），都按已累积内容做计费决策
-        if has_content:
+        # 但若整段响应是合成的『[上游错误] ...』（如所有账号配额耗尽），不扣费
+        if has_content and not upstream_error_seen:
             cap = usage_capture or {}
             final_p = cap.get("prompt_tokens") or inline_usage_p or est_prompt_tokens or 0
             final_c = cap.get("completion_tokens") or inline_usage_c or max(1, completion_chars // 4)
@@ -5043,12 +5072,16 @@ async def chat_completions(
             # 豁免判断：输入/输出均 < 阈值则不计费
             # 注意：成功返回（未抛异常）即视为一次有效调用；不再用 completion_text 作为门槛，
             # 否则纯 tool_calls / 空文本的合法响应会被错误地豁免计费。
-            is_exempt = _is_call_exempt(actual_prompt, actual_completion)
+            # 合成『[上游错误]』响应（如所有账号配额耗尽）不扣 key 额度
+            is_upstream_err = _is_upstream_error_text(completion_text)
+            is_exempt = _is_call_exempt(actual_prompt, actual_completion) or is_upstream_err
             if not is_exempt:
                 _consume_key_usage(client_key, cost=MODEL_COSTS.get(request.model, 1.0))
-            _record_stats(account, actual_prompt, actual_completion, req_start)
+            if not is_upstream_err:
+                _record_stats(account, actual_prompt, actual_completion, req_start)
             _append_log(request.model, client_key, actual_prompt, actual_completion,
-                        (time.time() - req_start) * 1000, "ok", exempt=is_exempt)
+                        (time.time() - req_start) * 1000,
+                        "upstream_error" if is_upstream_err else "ok", exempt=is_exempt)
             # ── LOW 缓存写入 ────────────────────────────────────────────────
             if _ai_cacheable and _ai_cache_key:
                 try:
@@ -5492,6 +5525,8 @@ async def responses_api(
         async def _tracked_responses():
             has_content = False
             completion_chars = 0
+            upstream_error_seen = False
+            error_buffer = ""  # 跨 chunk 累积，识别可能被分片的 [上游错误] 前缀
             try:
                 async for chunk in responses_stream:
                     yield chunk
@@ -5499,16 +5534,25 @@ async def responses_api(
                             or '"response.function_call_arguments.delta"' in chunk):
                         has_content = True
                         completion_chars += len(chunk)
+                        if not upstream_error_seen:
+                            # 仅保留尾部少量字符以拼接下一段，足以识别前缀
+                            error_buffer = (error_buffer + chunk)[-128:]
+                            if _UPSTREAM_ERROR_PREFIX in error_buffer:
+                                upstream_error_seen = True
             finally:
+                # 合成『[上游错误]』响应（如所有账号配额耗尽）不扣费、不计统计
                 if has_content:
                     real_p = usage_capture.get("prompt_tokens") or prompt_tokens
                     real_c = usage_capture.get("completion_tokens") or max(1, completion_chars // 20)
-                    is_exempt = _is_call_exempt(real_p, real_c)
+                    is_exempt = _is_call_exempt(real_p, real_c) or upstream_error_seen
                     if not is_exempt:
                         _consume_key_usage(client_key, cost=MODEL_COSTS.get(model_name, 1.0))
-                    _record_stats(account, real_p, real_c, req_start)
+                    if not upstream_error_seen:
+                        _record_stats(account, real_p, real_c, req_start)
                     _append_log(model_name, client_key, real_p, real_c,
-                                (time.time() - req_start) * 1000, "ok", exempt=is_exempt)
+                                (time.time() - req_start) * 1000,
+                                "upstream_error" if upstream_error_seen else "ok",
+                                exempt=is_exempt)
 
         return StreamingResponse(
             _tracked_responses(),
@@ -5545,12 +5589,16 @@ async def responses_api(
         actual_p = real_p if real_p else prompt_tokens
         actual_c = real_c if real_c else _estimate_tokens(message.content or "")
 
-        is_exempt = _is_call_exempt(actual_p, actual_c)
+        # 合成『[上游错误]』响应（如所有账号配额耗尽）不扣 key 额度
+        is_upstream_err = _is_upstream_error_text(message.content or "")
+        is_exempt = _is_call_exempt(actual_p, actual_c) or is_upstream_err
         if not is_exempt:
             _consume_key_usage(client_key, cost=MODEL_COSTS.get(model_name, 1.0))
-        _record_stats(account, actual_p, actual_c, req_start)
+        if not is_upstream_err:
+            _record_stats(account, actual_p, actual_c, req_start)
         _append_log(model_name, client_key, actual_p, actual_c,
-                    (time.time() - req_start) * 1000, "ok", exempt=is_exempt)
+                    (time.time() - req_start) * 1000,
+                    "upstream_error" if is_upstream_err else "ok", exempt=is_exempt)
 
         return JSONResponse({
             "id": resp_id,
@@ -6007,13 +6055,17 @@ async def messages_completions(
             real_completion = (openai_response.usage or {}).get("completion_tokens", 0)
             actual_prompt = real_prompt if real_prompt else prompt_tokens
             actual_completion = real_completion if real_completion else _estimate_tokens(completion_text)
-            is_exempt = _is_call_exempt(actual_prompt, actual_completion)
+            # 合成『[上游错误]』响应（如所有账号配额耗尽）不扣 key 额度、不计入账号统计
+            is_upstream_err = _is_upstream_error_text(completion_text)
+            is_exempt = _is_call_exempt(actual_prompt, actual_completion) or is_upstream_err
             # 同 chat 路径：不再以 completion_text 为门槛，避免 tool_calls 类响应漏计费
             if not is_exempt:
                 _consume_key_usage(client_key, cost=MODEL_COSTS.get(openai_request.model, 1.0))
-            _record_stats(account, actual_prompt, actual_completion, req_start)
+            if not is_upstream_err:
+                _record_stats(account, actual_prompt, actual_completion, req_start)
             _append_log(openai_request.model, client_key, actual_prompt, actual_completion,
-                        (time.time() - req_start) * 1000, "ok", exempt=is_exempt)
+                        (time.time() - req_start) * 1000,
+                        "upstream_error" if is_upstream_err else "ok", exempt=is_exempt)
             anthropic_response = convert_openai_to_anthropic_response(openai_response)
             # ── LOW 缓存写入（/v1/messages） ─────────────────────────────────
             if _msg_cacheable and _msg_cache_key:

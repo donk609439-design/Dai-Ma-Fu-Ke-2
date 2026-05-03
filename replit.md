@@ -412,3 +412,14 @@ NDJSON 协议（version 3）：
 3. **修改 `Accounts.tsx`** — 删除 `syncFromSourceMutation`（调用旧端点 `/admin/accounts/import-from-source`）及其 state（`syncOpen`、`syncUrl`）和对应 Dialog UI；移除 `ArrowDownToLine` 未使用 import。
 
 架构师审查：旧函数已全部删除，新 5 个端点存在且正确，_EXPORT_TABLES/_TABLE_CONFLICT_COL 包含 jb_settings，Python 语法检查 PASS（`python3 -m py_compile`），前端热更新无编译错误，API 服务正常启动（2166 账号）。
+
+### 上游错误不扣费（2026-05-03）
+
+当所有 JetBrains 账号配额耗尽（或上游 API 失败）时，`openai_stream_adapter` 会把错误包装成 `[上游错误] ...` 文本响应。新增 `_is_upstream_error_text(text)` 助手 + `_UPSTREAM_ERROR_PREFIX="[上游错误]"`，并在所有计费点拦截：
+
+1. `_stream_with_key_consume`（chat/completions 流式）：累积前 32 字符内容头识别上游错误前缀，置位 `upstream_error_seen`，finally 阶段 `has_content and not upstream_error_seen` 才扣费。
+2. chat/completions 非流式（~5070）：`is_exempt = _is_call_exempt(...) or _is_upstream_error_text(completion_text)`。
+3. responses API 流式 `_tracked_responses`（~5520）：扫描每个 chunk 是否含 `[上游错误]`，命中则跳过扣费。
+4. responses API 非流式（~5577）：同样对 `message.content` 做前缀检查。
+
+效果：客户调用得到错误响应时不再消耗 key 额度。
