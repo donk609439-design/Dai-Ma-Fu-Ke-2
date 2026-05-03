@@ -22,6 +22,7 @@ import SelfRegister from "@/pages/SelfRegister";
 import Donate from "@/pages/Donate";
 import DonatedAccounts from "@/pages/DonatedAccounts";
 import PendingQueue from "@/pages/PendingQueue";
+import Announcement from "@/pages/Announcement";
 import AdminGate from "@/components/AdminGate";
 import { getAdminKey, useAdminRole } from "@/lib/admin-auth";
 import {
@@ -50,6 +51,7 @@ import {
   Command,
   ChevronRight,
   Shield,
+  Megaphone,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { type ReactNode, useState, useEffect } from "react";
@@ -85,6 +87,7 @@ const adminNavItems = [
   { path: "/models", label: "模型配置", icon: Cpu },
   { path: "/stats", label: "用量统计", icon: BarChart3 },
   { path: "/logs", label: "调用日志", icon: ScrollText },
+  { path: "/announcement", label: "公告劫持", icon: Megaphone },
   { path: "/docs", label: "接口文档", icon: BookOpen },
   { path: "/prizes", label: "奖品管理", icon: Gift },
   { path: "/partners", label: "合作伙伴", icon: Handshake },
@@ -451,6 +454,7 @@ function AdminRoutes() {
       <Route path="/models" component={Models} />
       <Route path="/stats" component={Stats} />
       <Route path="/logs" component={Logs} />
+      <Route path="/announcement" component={Announcement} />
       <Route path="/docs" component={Docs} />
       <Route path="/prizes" component={Prizes} />
       <Route path="/partners" component={Partners} />
@@ -582,6 +586,7 @@ function Router() {
           <Route path="/models" component={Models} />
           <Route path="/stats" component={Stats} />
           <Route path="/logs" component={Logs} />
+          <Route path="/announcement" component={Announcement} />
           <Route path="/docs" component={Docs} />
           <Route path="/prizes" component={Prizes} />
           <Route path="/partners" component={Partners} />

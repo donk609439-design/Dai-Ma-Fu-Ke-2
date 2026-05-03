@@ -2921,6 +2921,130 @@ async def _load_low_admin_settings():
         print(f"[LOW] 加载并发配置失败（使用默认 {_low_admin_concurrency}）: {_e}")
 
 
+# ─── 公告（Announcement）功能 ─────────────────────────────────────────
+# 启用后，对 /v1/chat/completions、/v1/responses、/v1/messages 的调用
+# 立即返回公告内容（覆盖 AI 回答），不消耗任何账号配额或 key 用量。
+_ANNOUNCEMENT: Dict[str, Any] = {"enabled": False, "content": "", "updated_at": 0}
+
+
+async def _load_announcement():
+    """从 jb_settings 加载公告配置（启动时执行一次）"""
+    global _ANNOUNCEMENT
+    pool = await _get_db_pool()
+    if not pool:
+        return
+    try:
+        async with pool.acquire() as conn:
+            row = await conn.fetchval("SELECT v FROM jb_settings WHERE k='announcement'")
+        if row:
+            data = json.loads(row)
+            _ANNOUNCEMENT = {
+                "enabled": bool(data.get("enabled", False)),
+                "content": str(data.get("content", "") or ""),
+                "updated_at": int(data.get("updated_at", 0) or 0),
+            }
+    except Exception as e:
+        print(f"[announcement] 加载失败: {e}")
+
+
+def _announcement_active() -> Optional[str]:
+    """若公告启用且内容非空，返回内容；否则返回 None"""
+    if _ANNOUNCEMENT.get("enabled") and _ANNOUNCEMENT.get("content"):
+        return str(_ANNOUNCEMENT["content"])
+    return None
+
+
+def _build_openai_announcement_chat_resp(model: str, content: str) -> Dict[str, Any]:
+    """构造 OpenAI Chat Completions 非流式响应（公告内容作为 assistant 文本）"""
+    return {
+        "id": f"chatcmpl-ann-{uuid.uuid4().hex[:16]}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model or "",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": content},
+            "finish_reason": "stop",
+        }],
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        "announcement": True,
+    }
+
+
+async def _openai_announcement_sse(model: str, content: str):
+    """构造 OpenAI Chat Completions 流式 SSE（公告内容）"""
+    sid = f"chatcmpl-ann-{uuid.uuid4().hex[:16]}"
+    created = int(time.time())
+    base = {"id": sid, "object": "chat.completion.chunk", "created": created, "model": model or ""}
+    yield f"data: {json.dumps({**base, 'choices': [{'index': 0, 'delta': {'role': 'assistant'}, 'finish_reason': None}]}, ensure_ascii=False)}\n\n"
+    yield f"data: {json.dumps({**base, 'choices': [{'index': 0, 'delta': {'content': content}, 'finish_reason': None}]}, ensure_ascii=False)}\n\n"
+    yield f"data: {json.dumps({**base, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]}, ensure_ascii=False)}\n\n"
+    yield "data: [DONE]\n\n"
+
+
+def _build_responses_announcement_resp(model: str, content: str) -> Dict[str, Any]:
+    """构造 OpenAI Responses API 非流式响应（公告内容）"""
+    return {
+        "id": f"resp_ann_{uuid.uuid4().hex[:16]}",
+        "object": "response",
+        "created_at": int(time.time()),
+        "model": model or "",
+        "output": [{
+            "id": f"msg_{uuid.uuid4().hex[:24]}",
+            "type": "message", "role": "assistant",
+            "content": [{"type": "output_text", "text": content}],
+            "status": "completed",
+        }],
+        "status": "completed",
+        "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+        "announcement": True,
+    }
+
+
+async def _responses_announcement_sse(model: str, content: str):
+    """构造 Responses API 流式 SSE（公告内容）"""
+    rid = f"resp_ann_{uuid.uuid4().hex[:16]}"
+    msg_id = f"msg_{uuid.uuid4().hex[:24]}"
+    created = int(time.time())
+    yield f"event: response.created\ndata: {json.dumps({'type': 'response.created', 'response': {'id': rid, 'object': 'response', 'created_at': created, 'model': model or '', 'status': 'in_progress', 'output': []}}, ensure_ascii=False)}\n\n"
+    yield f"event: response.output_item.added\ndata: {json.dumps({'type': 'response.output_item.added', 'output_index': 0, 'item': {'id': msg_id, 'type': 'message', 'role': 'assistant', 'status': 'in_progress', 'content': []}}, ensure_ascii=False)}\n\n"
+    yield f"event: response.content_part.added\ndata: {json.dumps({'type': 'response.content_part.added', 'item_id': msg_id, 'output_index': 0, 'content_index': 0, 'part': {'type': 'output_text', 'text': ''}}, ensure_ascii=False)}\n\n"
+    yield f"event: response.output_text.delta\ndata: {json.dumps({'type': 'response.output_text.delta', 'item_id': msg_id, 'output_index': 0, 'content_index': 0, 'delta': content}, ensure_ascii=False)}\n\n"
+    yield f"event: response.output_text.done\ndata: {json.dumps({'type': 'response.output_text.done', 'item_id': msg_id, 'output_index': 0, 'content_index': 0, 'text': content}, ensure_ascii=False)}\n\n"
+    yield f"event: response.completed\ndata: {json.dumps({'type': 'response.completed', 'response': {'id': rid, 'object': 'response', 'created_at': created, 'model': model or '', 'status': 'completed', 'output': [{'id': msg_id, 'type': 'message', 'role': 'assistant', 'content': [{'type': 'output_text', 'text': content}], 'status': 'completed'}], 'usage': {'input_tokens': 0, 'output_tokens': 0, 'total_tokens': 0}}}, ensure_ascii=False)}\n\n"
+
+
+def _build_anthropic_announcement_resp(model: str, content: str) -> Dict[str, Any]:
+    """构造 Anthropic /v1/messages 非流式响应"""
+    return {
+        "id": f"msg_ann_{uuid.uuid4().hex[:16]}",
+        "type": "message",
+        "role": "assistant",
+        "model": model or "",
+        "content": [{"type": "text", "text": content}],
+        "stop_reason": "end_turn",
+        "stop_sequence": None,
+        "usage": {"input_tokens": 0, "output_tokens": 0},
+        "announcement": True,
+    }
+
+
+async def _anthropic_announcement_sse(model: str, content: str):
+    """构造 Anthropic /v1/messages 流式 SSE"""
+    mid = f"msg_ann_{uuid.uuid4().hex[:16]}"
+    yield f"event: message_start\ndata: {json.dumps({'type': 'message_start', 'message': {'id': mid, 'type': 'message', 'role': 'assistant', 'model': model or '', 'content': [], 'stop_reason': None, 'stop_sequence': None, 'usage': {'input_tokens': 0, 'output_tokens': 0}}}, ensure_ascii=False)}\n\n"
+    yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}}, ensure_ascii=False)}\n\n"
+    yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': content}}, ensure_ascii=False)}\n\n"
+    yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0}, ensure_ascii=False)}\n\n"
+    yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': 'end_turn', 'stop_sequence': None}, 'usage': {'output_tokens': 0}}, ensure_ascii=False)}\n\n"
+    yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'}, ensure_ascii=False)}\n\n"
+
+
+class AnnouncementUpdate(BaseModel):
+    enabled: bool = False
+    content: str = ""
+
+
 async def _retry_pending_nc_lids():
     """
     后台任务：每 5 分钟扫描所有带 pending_nc_lids 的账号，
@@ -3911,6 +4035,7 @@ async def startup():
     await load_pokeball_keys_from_db()
     await _load_discord_sessions_from_db()
     await _load_low_admin_settings()
+    await _load_announcement()
     http_client = httpx.AsyncClient(
         # 连接阶段最多等 15 秒；流式读取兜底 900 秒（避免僵尸 SSE 永久占用连接池连接）；
         # 池等待 30 秒（应对突发流量排队，比直接 PoolTimeout 友好）
@@ -4626,6 +4751,18 @@ async def chat_completions(
     client_key: str = Depends(authenticate_client),
 ):
     """创建聊天完成"""
+    # 公告优先：启用时立即返回公告，覆盖 AI 回答，不消耗账号/key
+    _ann = _announcement_active()
+    if _ann is not None:
+        _append_log(request.model, client_key, 0, 0, 0, "ok", exempt=True)
+        if request.stream:
+            return StreamingResponse(
+                _openai_announcement_sse(request.model, _ann),
+                media_type="text/event-stream",
+                headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
+            )
+        return JSONResponse(_build_openai_announcement_chat_resp(request.model, _ann))
+
     max_in, max_out, _ = _key_tier_limits(client_key)
     estimated = _estimate_input_tokens(request.messages)
     if estimated > max_in:
@@ -5141,6 +5278,18 @@ async def responses_api(
     do_stream: bool = bool(body.get("stream", False))
     max_output: Optional[int] = body.get("max_output_tokens")
 
+    # 公告优先：启用时立即返回公告
+    _ann = _announcement_active()
+    if _ann is not None:
+        _append_log(model_name, client_key, 0, 0, 0, "ok", exempt=True)
+        if do_stream:
+            return StreamingResponse(
+                _responses_announcement_sse(model_name, _ann),
+                media_type="text/event-stream",
+                headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
+            )
+        return JSONResponse(_build_responses_announcement_resp(model_name, _ann))
+
     # ── 输入转换 ──
     messages, tool_id_map = _responses_input_to_chat_messages(input_val)
     if not messages:
@@ -5559,6 +5708,19 @@ async def messages_completions(
     client_key: str = Depends(authenticate_anthropic_client),
 ):
     """创建符合 Anthropic 规范的聊天完成"""
+    # 公告优先：启用时立即返回公告
+    _ann = _announcement_active()
+    if _ann is not None:
+        _model_for_log = request.model or ""
+        _append_log(_model_for_log, client_key, 0, 0, 0, "ok", exempt=True)
+        if request.stream:
+            return StreamingResponse(
+                _anthropic_announcement_sse(_model_for_log, _ann),
+                media_type="text/event-stream",
+                headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
+            )
+        return JSONResponse(_build_anthropic_announcement_resp(_model_for_log, _ann))
+
     # 估算 token 数：消息 + system prompt
     system_text = ""
     if isinstance(request.system, str):
@@ -5895,6 +6057,42 @@ def _build_stats_response():
         },
         "accounts": accounts_out,
     }
+
+@app.get("/admin/announcement")
+async def admin_get_announcement():
+    """获取当前公告配置（启用状态 + 内容 + 更新时间）"""
+    return {
+        "enabled": bool(_ANNOUNCEMENT.get("enabled", False)),
+        "content": str(_ANNOUNCEMENT.get("content", "") or ""),
+        "updated_at": int(_ANNOUNCEMENT.get("updated_at", 0) or 0),
+    }
+
+
+@app.put("/admin/announcement")
+async def admin_put_announcement(req: AnnouncementUpdate, request: Request):
+    """更新公告（仅完整管理员）。持久化到 jb_settings.announcement"""
+    if request.headers.get("X-Admin-Key", "") != ADMIN_KEY:
+        raise HTTPException(status_code=403, detail="仅完整管理员可修改公告")
+    global _ANNOUNCEMENT
+    new_state = {
+        "enabled": bool(req.enabled),
+        "content": str(req.content or ""),
+        "updated_at": int(time.time()),
+    }
+    pool = await _get_db_pool()
+    if pool:
+        try:
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    "INSERT INTO jb_settings (k, v) VALUES ('announcement', $1) "
+                    "ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v",
+                    json.dumps(new_state, ensure_ascii=False),
+                )
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"持久化失败: {e}")
+    _ANNOUNCEMENT = new_state
+    return {"ok": True, **new_state}
+
 
 @app.get("/admin/stats")
 async def admin_stats():
