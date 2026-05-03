@@ -23,6 +23,7 @@ interface Account {
   account_id: string;
   quota_status_reason: string | null;
   in_pool: boolean;
+  external_mark_count?: number;
 }
 
 interface PoolStatus {
@@ -119,8 +120,12 @@ function AccountCard({
   resetQuotaMutation: { mutate: (index: number) => void; isPending: boolean };
   deleteMutation: { mutate: (index: number) => void; isPending: boolean };
 }) {
+  const externalMarks = account.external_mark_count ?? 0;
+  const cardClass = externalMarks > 0
+    ? "border-amber-400/70 ring-1 ring-amber-400/50 shadow-[0_0_0_1px_rgba(251,191,36,0.35)] transition-all"
+    : `border-card-border transition-all ${account.has_quota ? "glow-green" : "glow-red"}`;
   return (
-    <Card className={`border-card-border transition-all ${account.has_quota ? "glow-green" : "glow-red"}`}>
+    <Card className={cardClass}>
       <CardContent className="flex items-center gap-4 py-4">
         <div className="flex items-center gap-2 shrink-0">
           {account.has_quota
@@ -128,13 +133,21 @@ function AccountCard({
             : <span className="w-2 h-2 rounded-full bg-destructive shrink-0" />}
         </div>
         <div className="flex-1 min-w-0 grid grid-cols-[1fr_auto] gap-x-4 gap-y-1">
-          <div className="flex items-center gap-2 min-w-0">
+          <div className="flex items-center gap-2 min-w-0 flex-wrap">
             <code className="text-xs font-mono text-muted-foreground truncate">
               {account.licenseId || account.jwt_preview || account.account_id}
             </code>
             {account.quota_status_reason && !account.has_quota && (
               <span className="text-xs bg-destructive/20 text-destructive border border-destructive/30 px-1.5 py-0.5 rounded-full shrink-0">
                 {QUOTA_REASON_LABELS[account.quota_status_reason] ?? account.quota_status_reason}
+              </span>
+            )}
+            {externalMarks > 0 && (
+              <span
+                className="text-xs bg-amber-500/15 text-amber-300 border border-amber-400/50 px-1.5 py-0.5 rounded-full shrink-0"
+                title={`检测到 ${externalMarks} 次外部消耗${externalMarks >= 2 ? "（已自动封禁绑定 key）" : ""}`}
+              >
+                外部消耗 ×{externalMarks}
               </span>
             )}
           </div>

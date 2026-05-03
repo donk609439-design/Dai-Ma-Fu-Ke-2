@@ -798,6 +798,8 @@ async def _ensure_db_tables():
         # —— 同一邮箱凑够 4 个信任凭证只会触发一次 +16，不会重复计入
         await conn.execute("ALTER TABLE jb_accounts ADD COLUMN IF NOT EXISTS pending_nc_quota_granted BOOLEAN DEFAULT FALSE")
         await conn.execute("ALTER TABLE jb_accounts ADD COLUMN IF NOT EXISTS in_pool BOOLEAN DEFAULT FALSE")
+        # 1M 账号外部消耗检测：累计被标记次数（达到 2 次自动封禁绑定 key）
+        await conn.execute("ALTER TABLE jb_accounts ADD COLUMN IF NOT EXISTS external_mark_count INTEGER DEFAULT 0")
         # 一次性回填：将 jb_accounts.pending_nc_key 引用的 key 标记为 is_nc_key=TRUE
         # （必须在 jb_accounts 的 pending_nc_key 列被 ALTER 添加之后执行）
         await conn.execute(
@@ -1328,6 +1330,7 @@ async def _batch_save_accounts_to_db(accounts: List[dict]):
             acc.get("daily_used"),
             acc.get("daily_total"),
             bool(acc.get("in_pool", False)),
+            int(acc.get("external_mark_count") or 0),
         )
         for acc in accounts
     ]
@@ -1337,8 +1340,8 @@ async def _batch_save_accounts_to_db(accounts: List[dict]):
                 """
                 INSERT INTO jb_accounts
                     (id, license_id, auth_token, jwt, last_updated, last_quota_check, has_quota,
-                     daily_used, daily_total, in_pool)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+                     daily_used, daily_total, in_pool, external_mark_count)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
                 ON CONFLICT (id) DO UPDATE SET
                     license_id                  = EXCLUDED.license_id,
                     auth_token                  = EXCLUDED.auth_token,
@@ -1348,7 +1351,8 @@ async def _batch_save_accounts_to_db(accounts: List[dict]):
                     has_quota                   = EXCLUDED.has_quota,
                     daily_used                  = EXCLUDED.daily_used,
                     daily_total                 = EXCLUDED.daily_total,
-                    in_pool                     = EXCLUDED.in_pool
+                    in_pool                     = EXCLUDED.in_pool,
+                    external_mark_count         = EXCLUDED.external_mark_count
                 """,
                 rows,
             )
@@ -1464,8 +1468,8 @@ async def _save_account_to_db(account: dict, pool=None):
                 """
                 INSERT INTO jb_accounts
                     (id, license_id, auth_token, jwt, last_updated, last_quota_check, has_quota,
-                     daily_used, daily_total, in_pool)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                     daily_used, daily_total, in_pool, external_mark_count)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                 ON CONFLICT (id) DO UPDATE SET
                     license_id                  = EXCLUDED.license_id,
                     auth_token                  = EXCLUDED.auth_token,
@@ -1475,7 +1479,8 @@ async def _save_account_to_db(account: dict, pool=None):
                     has_quota                   = EXCLUDED.has_quota,
                     daily_used                  = EXCLUDED.daily_used,
                     daily_total                 = EXCLUDED.daily_total,
-                    in_pool                     = EXCLUDED.in_pool
+                    in_pool                     = EXCLUDED.in_pool,
+                    external_mark_count         = EXCLUDED.external_mark_count
                 """,
                 acc_id,
                 account.get("licenseId"),
@@ -1487,6 +1492,7 @@ async def _save_account_to_db(account: dict, pool=None):
                 account.get("daily_used"),
                 account.get("daily_total"),
                 bool(account.get("in_pool", False)),
+                int(account.get("external_mark_count") or 0),
             )
     except Exception as e:
         print(f"保存单个账户到数据库时出错: {e}")
@@ -1655,7 +1661,7 @@ async def load_accounts_from_db():
     try:
         rows = await pool.fetch(
             "SELECT id, jwt, auth_token, license_id, last_updated, has_quota, last_quota_check,"
-            " daily_used, daily_total, in_pool"
+            " daily_used, daily_total, in_pool, external_mark_count"
             " FROM jb_accounts WHERE jwt IS NOT NULL ORDER BY created_at"
         )
         if rows:
@@ -1668,6 +1674,7 @@ async def load_accounts_from_db():
                     "daily_used": int(row["daily_used"]) if row["daily_used"] is not None else None,
                     "daily_total": int(row["daily_total"]) if row["daily_total"] is not None else None,
                     "in_pool": bool(row["in_pool"]) if row["in_pool"] is not None else False,
+                    "external_mark_count": int(row["external_mark_count"] or 0),
                 }
                 if row["license_id"] is not None:
                     acc["licenseId"] = row["license_id"]
@@ -4048,6 +4055,108 @@ async def _pool_maintenance_loop():
         await asyncio.sleep(600)
 
 
+# ==================== 1M 账号外部消耗检测 ====================
+# 每 5 分钟对所有 daily_total==1,000,000 的账号做一次快照差值检测：
+# 若两次快照间内部 0 调用、但 daily_used 增加超过阈值，即视为账号被外部调用，
+# 累计标记 +1；同一账号累计 ≥2 次自动封禁绑定的所有客户端 key。
+_one_m_external_baseline: Dict[str, Dict[str, Any]] = {}
+_ONE_M_EXTERNAL_THRESHOLD = 100  # 快照间 daily_used 增量超过此值且内部 0 调用 → 视为外部消耗
+_ONE_M_EXTERNAL_BAN_AT   = 2     # 累计标记到该值即封禁绑定 key
+
+
+async def _run_one_m_external_check():
+    """对所有 1M 账号做快照差值检测，识别外部消耗并自动封禁。"""
+    targets = [a for a in JETBRAINS_ACCOUNTS if (a.get("daily_total") == 1_000_000)]
+    if not targets:
+        return
+    semaphore = asyncio.Semaphore(20)
+    save_batch: list = []
+    keys_to_ban: set = set()
+
+    async def _check_one(acc: dict):
+        acc_id = _account_id(acc)
+        async with semaphore:
+            try:
+                await _check_quota_fast(acc)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                print(f"[1M-external] 账号 {acc_id} 配额查询失败: {e}")
+                return
+        cur_used = acc.get("daily_used")
+        if cur_used is None:
+            return
+        cur_calls = int((account_stats.get(acc_id) or {}).get("calls") or 0)
+        prev = _one_m_external_baseline.get(acc_id)
+        # 始终更新基线
+        _one_m_external_baseline[acc_id] = {
+            "used":  int(cur_used),
+            "calls": cur_calls,
+            "ts":    time.time(),
+        }
+        if prev is None:
+            return
+        used_delta  = int(cur_used) - int(prev.get("used") or 0)
+        calls_delta = cur_calls - int(prev.get("calls") or 0)
+        # 仅当本周期内部 0 调用 且 daily_used 显著增加，才算外部消耗
+        if used_delta >= _ONE_M_EXTERNAL_THRESHOLD and calls_delta == 0:
+            new_count = int(acc.get("external_mark_count") or 0) + 1
+            acc["external_mark_count"] = new_count
+            print(f"[1M-external] 检测到外部消耗 acc={acc_id} used_delta={used_delta} 累计标记={new_count}")
+            save_batch.append(acc)
+            if new_count >= _ONE_M_EXTERNAL_BAN_AT:
+                # 找到绑定到该账号的所有 key，待统一封禁
+                # 用 list(...) 快照防并发修改 VALID_CLIENT_KEYS 时迭代异常
+                for k, v in list(VALID_CLIENT_KEYS.items()):
+                    raw = v.get("account_id") or ""
+                    bound = {x.strip() for x in raw.split(",") if x.strip()}
+                    if acc_id in bound and not v.get("banned"):
+                        keys_to_ban.add(k)
+
+    await asyncio.gather(*[_check_one(acc) for acc in targets])
+
+    if save_batch:
+        try:
+            await _batch_save_accounts_to_db(save_batch)
+        except Exception as e:
+            print(f"[1M-external] 标记持久化失败: {e}")
+        _admin_cache_invalidate("accounts")
+
+    if keys_to_ban:
+        ban_ts = time.time()
+        for k in keys_to_ban:
+            meta = VALID_CLIENT_KEYS.get(k)
+            if not meta or meta.get("banned"):
+                continue
+            meta["banned"] = True
+            meta["banned_at"] = ban_ts
+            try:
+                await _upsert_key_to_db(k, meta)
+            except Exception as e:
+                print(f"[1M-external] DB 持久化封禁失败 key={k[:20]}…: {e}")
+            _did = str(meta.get("low_admin_discord_id") or "")
+            if _did:
+                try:
+                    await _persist_low_user_ban(_did, ban_ts)
+                except Exception as e:
+                    print(f"[1M-external] LOW audit 持久化失败 discord_id={_did}: {e}")
+            print(f"[1M-external] 累计 ≥{_ONE_M_EXTERNAL_BAN_AT} 次外部消耗，自动封禁 key {k[:20]}…")
+        _admin_cache_invalidate("keys", "status")
+
+
+async def _one_m_external_check_loop():
+    """每 5 分钟检测一次 1M 账号外部消耗（启动后等 90 秒预热）。"""
+    await asyncio.sleep(90)
+    while True:
+        try:
+            await _run_one_m_external_check()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"[1M-external] 运行异常: {e}")
+        await asyncio.sleep(300)
+
+
 @app.on_event("startup")
 async def startup():
     global models_data, http_client
@@ -4072,6 +4181,7 @@ async def startup():
     )
     asyncio.create_task(_pool_discovery_loop())    # 轮询池发现（每 10 分钟 +500 个账号）
     asyncio.create_task(_pool_maintenance_loop())  # 轮询池维护（每 10 分钟剔除无配额）
+    asyncio.create_task(_one_m_external_check_loop())  # 1M 账号外部消耗检测（每 5 分钟）
     asyncio.create_task(_cleanup_pending_prizes_loop())
     asyncio.create_task(_partner_credentials_poller())
     asyncio.create_task(_startup_resume_bind_tasks())
@@ -6194,6 +6304,7 @@ async def admin_list_accounts():
             "account_id": acc_id,
             "quota_status_reason": acc.get("quota_status_reason", None),
             "in_pool": acc_id in pool_ids,
+            "external_mark_count": int(acc.get("external_mark_count") or 0),
         })
     body = json.dumps({"accounts": result}, ensure_ascii=False).encode()
     _admin_cache_set("accounts", body)
