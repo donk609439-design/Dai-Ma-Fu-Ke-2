@@ -202,6 +202,13 @@ export default function PersonalCenter() {
               <p>· 创建 1 个专属个人 API Key（每账号唯一）</p>
               <p>· 每天签到一次，一次性领取 40 次调用额度</p>
               <p className="text-amber-400/80">· 仅限拥有指定身份组的服务器成员使用</p>
+              <p>
+                · 也可以去
+                <a href="/admin-panel/activate" className="text-primary hover:underline mx-0.5">
+                  【账号激活】
+                </a>
+                页面上传已经绑卡的 JetBrains 账号
+              </p>
             </div>
 
             <button
