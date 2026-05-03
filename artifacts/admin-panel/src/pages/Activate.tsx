@@ -176,17 +176,9 @@ export default function Activate() {
         throw new Error(data.detail || data.error?.message || `HTTP ${res.status}`);
       }
       const postData = await res.json();
-      const { task_id, preissued_key } = postData;
+      const { task_id } = postData;
 
-      // ★ 预签 key 立即可见（0 额度，凭证到位后自动升级为 25）
-      if (preissued_key) {
-        setSuccessInfo({
-          licenseId: undefined,
-          generatedKey: preissued_key,
-          isExisting: false,
-          isPending: true,
-        });
-      }
+      // ★ 新流程：不再预签 key，等待激活流程结束后由 done 事件返回 generated_key
 
       const es = new EventSource(`/admin/activate/${task_id}/stream`);
       esRef.current = es;
@@ -200,11 +192,12 @@ export default function Activate() {
             es.close();
             if (data.status === "success") {
               setStatus("success");
+              const isPending = !data.result?.jwt && !!data.result?.pending_nc_lids?.length;
               setSuccessInfo({
                 licenseId: data.result?.license_id,
-                generatedKey: data.generated_key ?? preissued_key ?? undefined,
+                generatedKey: data.generated_key ?? undefined,
                 isExisting: data.is_existing_key ?? false,
-                isPending: !!preissued_key,  // 有预签 key 说明 NC 许可证尚未 trusted，额度还未升至 25
+                isPending,
               });
               queryClient.invalidateQueries({ queryKey: ["/admin/accounts"] });
               queryClient.invalidateQueries({ queryKey: ["/admin/status"] });

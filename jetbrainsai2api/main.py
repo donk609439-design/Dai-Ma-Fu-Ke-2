@@ -870,6 +870,23 @@ async def _ensure_db_tables():
                 PRIMARY KEY (dc_user_id, date)
             )
         """)
+        # 个人中心：每个 Discord 用户唯一的免费 key
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS dc_personal_keys (
+                dc_user_id  TEXT PRIMARY KEY,
+                api_key     TEXT NOT NULL UNIQUE,
+                created_at  DOUBLE PRECISION DEFAULT EXTRACT(EPOCH FROM NOW())
+            )
+        """)
+        # 个人中心：每个 Discord 用户每日额度领取次数（上限 40 次/天）
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS dc_claim_limits (
+                dc_user_id  TEXT NOT NULL,
+                date        DATE NOT NULL DEFAULT CURRENT_DATE,
+                count       INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (dc_user_id, date)
+            )
+        """)
         # 通用设置 K-V 表（目前用于 LOW_ADMIN 批量激活并发数）
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS jb_settings (
@@ -9645,27 +9662,10 @@ async def admin_start_activate(req: ActivateRequest, request: Request):
     task_id = str(uuid.uuid4())
     log_queue: queue.Queue = queue.Queue()
 
-    # LOW 用户优先使用已创建的个人专属密钥；管理员或无个人 key 时沿用 preissued 机制
+    # LOW 用户优先使用已创建的个人专属密钥；其余情况不再预签 key，
+    # 改为激活流程成功后由 stream handler 当场铸造，避免在失败/拒绝时积累零额度孤儿 key。
     personal_key = _get_low_personal_key(dc_user_id) if (is_low_admin and dc_user_id) else ""
-
-    if personal_key:
-        # 有个人 key → 激活成功后累加配额，无需预签新 key
-        preissued_key = ""
-    else:
-        # ★ 预签发 0 额度 key（凭证全部到位后自动升级：普通 25，LOW 用户 16）
-        # is_nc_key=True 保护其不被清理任务误删；is_low_admin_key 决定升级后配额和请求时输入/输出限制
-        preissued_key = f"sk-jb-{secrets.token_hex(24)}"
-        preissued_meta: Dict[str, Any] = {
-            "usage_limit": 0, "usage_count": 0, "account_id": "",
-            "is_nc_key": True, "is_low_admin_key": is_low_admin,
-            # 把创建者 Discord ID 写入 LOW 预签 key，确保 /admin/keys 按 Discord 分组归属正确
-            "low_admin_discord_id": str(dc_user_id or "") if is_low_admin else "",
-        }
-        VALID_CLIENT_KEYS[preissued_key] = preissued_meta
-        _admin_cache_invalidate("keys", "status")
-        _pre_db = await _get_db_pool()
-        if _pre_db:
-            await _upsert_key_to_db(preissued_key, preissued_meta)
+    preissued_key = ""
 
     _activate_tasks[task_id] = {
         "status": "running",
@@ -9888,8 +9888,25 @@ async def admin_activate_stream(task_id: str):
                     await _save_account_to_db(new_account, pool=await _get_pool_for_task())
                     yield f"data: {json.dumps({'type': 'log', 'msg': '✓ 账号已自动添加到系统'})}\n\n"
 
-                    # ★ 个人 key 模式复用已有 key；否则使用预签 key
+                    # ★ 个人 key 模式复用已有 key；否则当场铸造（不再使用预签 key）
                     generated_key = _personal_key or task.get("preissued_key", "")
+                    if not generated_key:
+                        generated_key = f"sk-jb-{secrets.token_hex(24)}"
+                        _new_meta = {
+                            "usage_limit": 0, "usage_count": 0, "account_id": "",
+                            "is_nc_key": True,
+                            "is_low_admin_key": bool(task.get("is_low_admin")),
+                            "low_admin_discord_id": (
+                                str(task.get("discord_user_id", "") or "")
+                                if task.get("is_low_admin") else ""
+                            ),
+                        }
+                        VALID_CLIENT_KEYS[generated_key] = _new_meta
+                        _mint_db = await _get_pool_for_task()
+                        if _mint_db:
+                            await _upsert_key_to_db(generated_key, _new_meta)
+                        _admin_cache_invalidate("keys", "status")
+                        task["preissued_key"] = generated_key  # 兼容后续 _discard_preissued/幂等逻辑
                     new_acc_id = _account_id(new_account)
                     all_bound_ids: list = [new_acc_id]  # 收集全部绑定账号 ID
 
@@ -10048,6 +10065,23 @@ async def admin_activate_stream(task_id: str):
                                 else:
                                     yield f"data: {json.dumps({'type': 'log', 'msg': '✓ 无限制套餐，允许入池'})}\n\n"
                                 generated_key = task.get("preissued_key", "")
+                                if not generated_key:
+                                    generated_key = f"sk-jb-{secrets.token_hex(24)}"
+                                    _dup_meta = {
+                                        "usage_limit": 0, "usage_count": 0, "account_id": "",
+                                        "is_nc_key": True,
+                                        "is_low_admin_key": bool(task.get("is_low_admin")),
+                                        "low_admin_discord_id": (
+                                            str(task.get("discord_user_id", "") or "")
+                                            if task.get("is_low_admin") else ""
+                                        ),
+                                    }
+                                    VALID_CLIENT_KEYS[generated_key] = _dup_meta
+                                    _dup_mint_db = await _get_pool_for_task()
+                                    if _dup_mint_db:
+                                        await _upsert_key_to_db(generated_key, _dup_meta)
+                                    _admin_cache_invalidate("keys", "status")
+                                    task["preissued_key"] = generated_key
                                 _dup_db2 = await _get_pool_for_task()
                                 if _dup_db2 and generated_key:
                                     await _activate_key_quota(generated_key, [acc_id], _dup_db2)
@@ -10061,8 +10095,25 @@ async def admin_activate_stream(task_id: str):
         # ★ 全部 pending（NC 已创建但尚未被 Grazie 信任，无立即可用 JWT）
         elif (result.get("pending_nc_lids") and not result.get("jwt")
               and task["status"] == "success"):
-            # 有个人 key → 使用个人 key；否则使用预签 key
+            # 有个人 key → 使用个人 key；否则当场铸造（不再使用预签 key）
             generated_key = _personal_key or task.get("preissued_key", "")
+            if not generated_key:
+                generated_key = f"sk-jb-{secrets.token_hex(24)}"
+                _pend_meta = {
+                    "usage_limit": 0, "usage_count": 0, "account_id": "",
+                    "is_nc_key": True,
+                    "is_low_admin_key": bool(task.get("is_low_admin")),
+                    "low_admin_discord_id": (
+                        str(task.get("discord_user_id", "") or "")
+                        if task.get("is_low_admin") else ""
+                    ),
+                }
+                VALID_CLIENT_KEYS[generated_key] = _pend_meta
+                _pend_mint_db = await _get_pool_for_task()
+                if _pend_mint_db:
+                    await _upsert_key_to_db(generated_key, _pend_meta)
+                _admin_cache_invalidate("keys", "status")
+                task["preissued_key"] = generated_key
             try:
                 pending_nc = result["pending_nc_lids"]
                 _db_p = await _get_pool_for_task()
@@ -11114,6 +11165,257 @@ async def discord_verify(token: str = ""):
         _DISCORD_VERIFIED.pop(token, None)
         raise HTTPException(status_code=401, detail="Discord 验证已过期，请重新授权")
     return {"valid": True, "user_tag": data["user_tag"], "user_id": data["user_id"]}
+
+
+# ==================== 个人中心：Discord 用户独占 Key + 每日 40 次额度 ====================
+
+_DC_PERSONAL_DAILY_QUOTA = 40  # 每用户每天最多领取额度次数（每次 +1 调用额度）
+
+
+def _validate_personal_dc(token: str) -> dict:
+    """校验 Discord token 并返回 user_info（含 user_id/user_tag）。失败抛 HTTPException。"""
+    if not token or token not in _DISCORD_VERIFIED:
+        raise HTTPException(status_code=401, detail="Discord 验证无效，请重新登录")
+    info = _DISCORD_VERIFIED[token]
+    if time.time() - info.get("ts", 0) > _DC_SESSION_TTL:
+        _DISCORD_VERIFIED.pop(token, None)
+        raise HTTPException(status_code=401, detail="Discord 验证已过期，请重新登录")
+    return info
+
+
+@app.get("/key/personal-center")
+async def personal_center_status(discord_token: str = ""):
+    """查询个人中心状态：当前 key、用量、今日已领取次数。"""
+    info = _validate_personal_dc(discord_token)
+    dc_uid = str(info["user_id"])
+    pool = await _get_db_pool()
+    if not pool:
+        raise HTTPException(status_code=503, detail="数据库不可用")
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT api_key FROM dc_personal_keys WHERE dc_user_id=$1", dc_uid
+        )
+        api_key = row["api_key"] if row else ""
+        # 以 DB 为真源校验；仅在 jb_client_keys 中也确认不存在时才清理脏映射
+        if api_key:
+            k_row = await conn.fetchrow(
+                "SELECT key, usage_limit, usage_count FROM jb_client_keys WHERE key=$1", api_key
+            )
+            if not k_row:
+                await conn.execute("DELETE FROM dc_personal_keys WHERE dc_user_id=$1", dc_uid)
+                api_key = ""
+            elif api_key not in VALID_CLIENT_KEYS:
+                # DB 中仍在但内存暂未同步：按 DB 真值回填
+                VALID_CLIENT_KEYS[api_key] = {
+                    "usage_limit": int(k_row["usage_limit"] or 0),
+                    "usage_count": int(k_row["usage_count"] or 0),
+                    "account_id": "",
+                    "is_nc_key": True, "is_low_admin_key": False,
+                    "low_admin_discord_id": "",
+                }
+        claim_row = await conn.fetchrow(
+            "SELECT count FROM dc_claim_limits WHERE dc_user_id=$1 AND date=CURRENT_DATE",
+            dc_uid,
+        )
+    claimed_today = int(claim_row["count"]) if claim_row else 0
+    if api_key:
+        meta = VALID_CLIENT_KEYS.get(api_key, {})
+        return {
+            "has_key": True,
+            "api_key": api_key,
+            "usage_limit": int(meta.get("usage_limit") or 0),
+            "usage_count": int(meta.get("usage_count") or 0),
+            "claimed_today": claimed_today,
+            "daily_quota": _DC_PERSONAL_DAILY_QUOTA,
+            "user_tag": info.get("user_tag", ""),
+        }
+    return {
+        "has_key": False,
+        "claimed_today": claimed_today,
+        "daily_quota": _DC_PERSONAL_DAILY_QUOTA,
+        "user_tag": info.get("user_tag", ""),
+    }
+
+
+@app.post("/key/personal-center/create")
+async def personal_center_create(request: Request):
+    """每个 Discord 用户仅可创建 1 个个人 Key。已存在则返回原 key。"""
+    body = await request.json()
+    info = _validate_personal_dc((body.get("discord_token") or "").strip())
+    dc_uid = str(info["user_id"])
+    pool = await _get_db_pool()
+    if not pool:
+        raise HTTPException(status_code=503, detail="数据库不可用")
+    async with pool.acquire() as conn:
+        # 先校验已有映射；以 DB 为真源，仅当 jb_client_keys 也确认不存在时才清理脏映射
+        existing = await conn.fetchrow(
+            "SELECT api_key FROM dc_personal_keys WHERE dc_user_id=$1", dc_uid
+        )
+        if existing:
+            ek = existing["api_key"]
+            k_row = await conn.fetchrow(
+                "SELECT key, usage_limit, usage_count FROM jb_client_keys WHERE key=$1", ek
+            )
+            if k_row:
+                # DB 中 key 仍在；按 DB 真值回填内存（兼容多实例/重启场景）
+                if ek not in VALID_CLIENT_KEYS:
+                    VALID_CLIENT_KEYS[ek] = {
+                        "usage_limit": int(k_row["usage_limit"] or 0),
+                        "usage_count": int(k_row["usage_count"] or 0),
+                        "account_id": "",
+                        "is_nc_key": True, "is_low_admin_key": False,
+                        "low_admin_discord_id": "",
+                    }
+                return {
+                    "api_key": ek, "created": False,
+                    "usage_limit": int(k_row["usage_limit"] or 0),
+                    "usage_count": int(k_row["usage_count"] or 0),
+                }
+            # DB 也确认不存在：清理脏映射后重建
+            await conn.execute("DELETE FROM dc_personal_keys WHERE dc_user_id=$1", dc_uid)
+
+        # 原子幂等创建：先抢占映射行（防并发双击产生孤儿 key），赢得 INSERT 才铸造 key
+        # 极小概率 key 冲突时重试新 key（最多 5 次）
+        last_err: Exception | None = None
+        for _attempt in range(5):
+            new_key = f"sk-jb-{secrets.token_hex(24)}"
+            try:
+                async with conn.transaction():
+                    won = await conn.fetchrow(
+                        """
+                        INSERT INTO dc_personal_keys (dc_user_id, api_key)
+                        VALUES ($1, $2)
+                        ON CONFLICT (dc_user_id) DO NOTHING
+                        RETURNING api_key
+                        """,
+                        dc_uid, new_key,
+                    )
+                    if not won:
+                        # 并发败方：回查现有映射（DB 真源）并复用
+                        row = await conn.fetchrow(
+                            "SELECT api_key FROM dc_personal_keys WHERE dc_user_id=$1", dc_uid
+                        )
+                        if not row:
+                            raise HTTPException(status_code=500, detail="创建冲突，请重试")
+                        ek = row["api_key"]
+                        k_row = await conn.fetchrow(
+                            "SELECT key, usage_limit, usage_count FROM jb_client_keys WHERE key=$1", ek
+                        )
+                        if not k_row:
+                            raise HTTPException(status_code=500, detail="创建冲突，请重试")
+                        if ek not in VALID_CLIENT_KEYS:
+                            VALID_CLIENT_KEYS[ek] = {
+                                "usage_limit": int(k_row["usage_limit"] or 0),
+                                "usage_count": int(k_row["usage_count"] or 0),
+                                "account_id": "",
+                                "is_nc_key": True, "is_low_admin_key": False,
+                                "low_admin_discord_id": "",
+                            }
+                        return {
+                            "api_key": ek, "created": False,
+                            "usage_limit": int(k_row["usage_limit"] or 0),
+                            "usage_count": int(k_row["usage_count"] or 0),
+                        }
+
+                    # 赢得映射；同事务内 INSERT key，校验 RETURNING 必须命中（避免孤儿/碰撞他人 key）
+                    inserted = await conn.fetchrow(
+                        """
+                        INSERT INTO jb_client_keys (key, usage_limit, usage_count, account_id, is_nc_key, is_low_admin_key, low_admin_discord_id)
+                        VALUES ($1, 0, 0, '', TRUE, FALSE, '')
+                        RETURNING key
+                        """,
+                        new_key,
+                    )
+                    if not inserted:
+                        # 极少见：抛错触发整事务回滚（dc_personal_keys 同时回滚），重试新 key
+                        raise RuntimeError("jb_client_keys insert returned no row")
+            except HTTPException:
+                # 业务错误（如并发冲突回查失败）：不要重试，直接抛出
+                raise
+            except Exception as e:
+                # UniqueViolation/RuntimeError 等：整事务已回滚，换新 key 再试
+                last_err = e
+                continue
+            # 事务提交成功后再写内存
+            VALID_CLIENT_KEYS[new_key] = {
+                "usage_limit": 0, "usage_count": 0, "account_id": "",
+                "is_nc_key": True, "is_low_admin_key": False,
+                "low_admin_discord_id": "",
+            }
+            _admin_cache_invalidate("keys", "status")
+            return {"api_key": new_key, "created": True, "usage_limit": 0, "usage_count": 0}
+        raise HTTPException(status_code=500, detail=f"创建失败，请重试：{last_err}")
+
+
+@app.post("/key/personal-center/claim")
+async def personal_center_claim(request: Request):
+    """领取 1 次额度（key.usage_limit += 1），每天最多 40 次。"""
+    body = await request.json()
+    info = _validate_personal_dc((body.get("discord_token") or "").strip())
+    dc_uid = str(info["user_id"])
+    pool = await _get_db_pool()
+    if not pool:
+        raise HTTPException(status_code=503, detail="数据库不可用")
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT api_key FROM dc_personal_keys WHERE dc_user_id=$1", dc_uid
+        )
+        if not row:
+            raise HTTPException(status_code=404, detail="请先创建个人 Key 后再领取额度")
+        api_key = row["api_key"]
+        # 以 DB 为真源校验 key 是否存在（避免内存暂未同步导致误删映射）
+        exists_db = await conn.fetchval(
+            "SELECT 1 FROM jb_client_keys WHERE key=$1", api_key
+        )
+        if not exists_db:
+            await conn.execute("DELETE FROM dc_personal_keys WHERE dc_user_id=$1", dc_uid)
+            raise HTTPException(status_code=410, detail="个人 Key 已被清理，请重新创建")
+        async with conn.transaction():
+            cnt_row = await conn.fetchrow(
+                """
+                INSERT INTO dc_claim_limits (dc_user_id, date, count)
+                VALUES ($1, CURRENT_DATE, 1)
+                ON CONFLICT (dc_user_id, date) DO UPDATE
+                SET count = dc_claim_limits.count + 1
+                RETURNING count
+                """,
+                dc_uid,
+            )
+            new_count = int(cnt_row["count"])
+            if new_count > _DC_PERSONAL_DAILY_QUOTA:
+                # 超限回滚
+                raise HTTPException(
+                    status_code=429,
+                    detail=f"今日额度已领满（{_DC_PERSONAL_DAILY_QUOTA} 次/天），请明天再来",
+                )
+            # 原子自增（避免多实例/竞态下的丢增量）
+            up_row = await conn.fetchrow(
+                """
+                UPDATE jb_client_keys
+                SET usage_limit = COALESCE(usage_limit, 0) + 1
+                WHERE key=$1
+                RETURNING usage_limit, usage_count
+                """,
+                api_key,
+            )
+            if not up_row:
+                # key 在事务内被删：让事务回滚以防超额计入计数
+                raise HTTPException(status_code=410, detail="个人 Key 已被清理，请重新创建")
+            new_limit = int(up_row["usage_limit"])
+            new_used = int(up_row["usage_count"] or 0)
+    # 事务提交成功后再更新内存（提交失败上面已抛异常，跳过此处）
+    meta = VALID_CLIENT_KEYS.get(api_key)
+    if meta is not None:
+        meta["usage_limit"] = new_limit
+        meta["usage_count"] = new_used
+    _admin_cache_invalidate("keys", "status")
+    return {
+        "api_key": api_key,
+        "usage_limit": new_limit,
+        "usage_count": new_used,
+        "claimed_today": new_count,
+        "daily_quota": _DC_PERSONAL_DAILY_QUOTA,
+    }
 
 
 # ==================== Discord 账号 背包/抽奖 专用接口 ====================

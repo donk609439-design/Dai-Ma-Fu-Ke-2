@@ -53,7 +53,7 @@ function saveSession(token: string, userTag: string) {
 }
 
 export function useDiscordAuth(
-  redirectPage: "lottery" | "backpack" | "donate" | "activate" | "my-cf-pool",
+  redirectPage: "lottery" | "backpack" | "donate" | "activate" | "my-cf-pool" | "personal-center",
 ) {
   const [session, setSession] = useState<DcSession | null>(() => loadSession());
 

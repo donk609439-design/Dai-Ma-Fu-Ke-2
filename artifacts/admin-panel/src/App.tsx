@@ -23,6 +23,7 @@ import Donate from "@/pages/Donate";
 import DonatedAccounts from "@/pages/DonatedAccounts";
 import PendingQueue from "@/pages/PendingQueue";
 import Announcement from "@/pages/Announcement";
+import PersonalCenter from "@/pages/PersonalCenter";
 import AdminGate from "@/components/AdminGate";
 import { getAdminKey, useAdminRole } from "@/lib/admin-auth";
 import {
@@ -52,6 +53,7 @@ import {
   ChevronRight,
   Shield,
   Megaphone,
+  UserCircle,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { type ReactNode, useState, useEffect } from "react";
@@ -75,7 +77,7 @@ const queryClient = new QueryClient({
   },
 });
 
-const GUEST_PATHS = ["/activate", "/self-register", "/my-key", "/lottery", "/backpack", "/donate"];
+const GUEST_PATHS = ["/activate", "/self-register", "/my-key", "/personal-center", "/lottery", "/backpack", "/donate"];
 
 const adminNavItems = [
   { path: "/", label: "控制台", icon: LayoutDashboard },
@@ -103,6 +105,7 @@ const adminNavItems = [
 const guestNavItems = [
   { path: "/activate", label: "账号激活", icon: UserPlus },
   { path: "/self-register", label: "自助绑卡", icon: CreditCard },
+  { path: "/personal-center", label: "个人中心", icon: UserCircle },
   { path: "/my-key", label: "用量查询", icon: Search },
   { path: "/lottery", label: "抽奖机", icon: Ticket },
   { path: "/backpack", label: "我的背包", icon: Package },
@@ -465,6 +468,7 @@ function AdminRoutes() {
       <Route path="/pending-queue" component={PendingQueue} />
       <Route path="/self-register" component={SelfRegister} />
       <Route path="/my-key" component={KeyUsage} />
+      <Route path="/personal-center" component={PersonalCenter} />
       <Route path="/backpack" component={Backpack} />
       <Route path="/donate" component={Donate} />
     </Switch>
@@ -487,6 +491,7 @@ function LowAdminRoutes() {
       <Route path="/activate" component={Activate} />
       <Route path="/self-register" component={SelfRegister} />
       <Route path="/my-key" component={KeyUsage} />
+      <Route path="/personal-center" component={PersonalCenter} />
       <Route path="/backpack" component={Backpack} />
       <Route path="/donate" component={Donate} />
       <Route path="/my-cf-pool" component={LowCfPool} />
@@ -568,6 +573,7 @@ function Router() {
           <Route path="/activate" component={Activate} />
           <Route path="/self-register" component={SelfRegister} />
           <Route path="/my-key" component={KeyUsage} />
+          <Route path="/personal-center" component={PersonalCenter} />
           <Route path="/backpack" component={Backpack} />
           <Route path="/donate" component={Donate} />
         </Switch>
