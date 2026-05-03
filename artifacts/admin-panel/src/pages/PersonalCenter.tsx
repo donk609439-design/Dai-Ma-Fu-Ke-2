@@ -215,7 +215,14 @@ export default function PersonalCenter() {
 
   // ─── 已登录 ───
   const claimedToday = (status?.claimed_today ?? 0) > 0;
-  const claimDisabled = !status?.has_key || claiming || claimedToday;
+  const keyRemaining = status?.has_key
+    ? Math.max(0, (status.usage_limit ?? 0) - (status.usage_count ?? 0))
+    : 0;
+  const overstocked = status?.has_key
+    ? keyRemaining > (status.daily_quota ?? 40)
+    : false;
+  const claimDisabled =
+    !status?.has_key || claiming || claimedToday || overstocked;
 
   return (
     <div className="min-h-[60vh] flex items-start justify-center pt-8 pb-12">
@@ -317,7 +324,9 @@ export default function PersonalCenter() {
                   <p className="text-xs text-muted-foreground mt-0.5">
                     {claimedToday
                       ? `今日已签到（+${status.daily_quota} 额度已发放）`
-                      : `每天可签到一次，一次性发放 ${status.daily_quota} 次调用额度`}
+                      : overstocked
+                        ? `当前剩余额度 ${keyRemaining} > ${status.daily_quota}，请先使用部分额度后再签到`
+                        : `每天可签到一次，一次性发放 ${status.daily_quota} 次调用额度`}
                   </p>
                 </div>
               </div>
@@ -334,15 +343,17 @@ export default function PersonalCenter() {
                 )}
                 {claimedToday
                   ? "今日已签到"
-                  : claiming
-                    ? "签到中…"
-                    : `签到领取 +${status.daily_quota} 额度`}
+                  : overstocked
+                    ? `剩余额度过多，暂不可签到`
+                    : claiming
+                      ? "签到中…"
+                      : `签到领取 +${status.daily_quota} 额度`}
               </button>
 
               <p className="text-[11px] text-muted-foreground text-center leading-relaxed">
                 每天签到一次，一次性发放 {status.daily_quota} 次调用额度。
                 <br />
-                次日 0 点（UTC）自动重置。
+                为防止囤积，剩余额度大于 {status.daily_quota} 时无法签到。次日 0 点（UTC）自动重置。
               </p>
             </div>
           </>

@@ -11372,6 +11372,19 @@ async def personal_center_claim(request: Request):
             await conn.execute("DELETE FROM dc_personal_keys WHERE dc_user_id=$1", dc_uid)
             raise HTTPException(status_code=410, detail="个人 Key 已被清理，请重新创建")
         async with conn.transaction():
+            # 防囤额度：当前剩余额度 > 40 时不允许签到
+            cur = await conn.fetchrow(
+                "SELECT COALESCE(usage_limit,0) AS lim, COALESCE(usage_count,0) AS used FROM jb_client_keys WHERE key=$1 FOR UPDATE",
+                api_key,
+            )
+            if not cur:
+                raise HTTPException(status_code=410, detail="个人 Key 已被清理，请重新创建")
+            cur_remaining = int(cur["lim"]) - int(cur["used"])
+            if cur_remaining > _DC_PERSONAL_DAILY_QUOTA:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"剩余额度（{cur_remaining}）大于 {_DC_PERSONAL_DAILY_QUOTA}，请先使用部分额度后再签到",
+                )
             # 一次性签到：每天首次 INSERT 才发放，已存在则视为今日已签到（429）
             inserted = await conn.fetchrow(
                 """
