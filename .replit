@@ -41,4 +41,3 @@ packages = ["cargo", "libiconv", "libxcrypt", "openssl", "pkg-config", "postgres
 [userenv]
 
 [userenv.shared]
-JWT_FULL_REFRESH_ENABLED = "1"

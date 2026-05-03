@@ -46,16 +46,6 @@ _quota_check_in_progress: set = set()
 # JWT 刷新间隔：仅在 JWT 缺失或距上次成功刷新超过此秒数时才重新刷新
 _JWT_REFRESH_INTERVAL_SECS: int = 1800  # 30 分钟
 
-# 低速全量 JWT 轮刷配置（可选保险机制，覆盖池外冷账号）
-# - ENABLED: 默认关闭，需显式开启（避免误触发对 grazie auth 端点的全量压力）
-# - PERIOD_HOURS: 一轮覆盖目标时长，默认 24h（60K 账号 × 0.5s ≈ 8.3h，留充足余量）
-# - MIN_THROTTLE_MS: 单账号最小间隔毫秒数（防止突发 429）
-# - SKIP_FRESH_HOURS: 若 last_updated 在此小时内则跳过（避免与 30 分钟懒刷新和 10 分钟池维护重复）
-JWT_FULL_REFRESH_ENABLED: bool = os.getenv("JWT_FULL_REFRESH_ENABLED", "0") in ("1", "true", "True")
-JWT_FULL_REFRESH_PERIOD_HOURS: float = float(os.getenv("JWT_FULL_REFRESH_PERIOD_HOURS", "24"))
-JWT_FULL_REFRESH_MIN_THROTTLE_MS: int = int(os.getenv("JWT_FULL_REFRESH_MIN_THROTTLE_MS", "300"))
-JWT_FULL_REFRESH_SKIP_FRESH_HOURS: float = float(os.getenv("JWT_FULL_REFRESH_SKIP_FRESH_HOURS", "6"))
-
 # 全量重检进度跟踪（线程安全：asyncio 单线程）
 _bulk_recheck_state: Dict[str, Any] = {
     "running": False,
@@ -3910,115 +3900,6 @@ async def _pool_maintenance_loop():
         await asyncio.sleep(600)
 
 
-async def _jwt_full_refresh_loop():
-    """低速全量 JWT 轮刷：覆盖池外冷账号，避免 auth_token 长期不试探。
-
-    特性：
-    - 默认关闭（JWT_FULL_REFRESH_ENABLED=0），需显式开启
-    - 一轮目标 PERIOD_HOURS 小时（默认 24h），按账号数动态计算 throttle
-    - 跳过策略：last_updated < SKIP_FRESH_HOURS（默认 6h）/ 无 auth_token / 5 分钟冷却中
-    - 复用现有 _jwt_refresh_locks，与懒刷新和池维护互斥
-    - 异常隔离：单账号失败不中断整轮
-    - 批量写库：每 100 个成功保存一次
-    - 启动后延迟 15 分钟，避开启动期 quota 检查/池预热风暴
-    """
-    if not JWT_FULL_REFRESH_ENABLED:
-        print("[jwt-full-refresh] 已禁用（JWT_FULL_REFRESH_ENABLED=0），跳过启动")
-        return
-
-    print(f"[jwt-full-refresh] 已启用，period={JWT_FULL_REFRESH_PERIOD_HOURS}h "
-          f"min_throttle={JWT_FULL_REFRESH_MIN_THROTTLE_MS}ms "
-          f"skip_fresh={JWT_FULL_REFRESH_SKIP_FRESH_HOURS}h")
-
-    await asyncio.sleep(900)    # 启动后等 15 分钟，避开启动期峰值
-
-    while True:
-        try:
-            accounts_snapshot = list(JETBRAINS_ACCOUNTS)
-            n = len(accounts_snapshot)
-            if n == 0:
-                await asyncio.sleep(600)
-                continue
-
-            period_secs = JWT_FULL_REFRESH_PERIOD_HOURS * 3600.0
-            calc_throttle_ms = (period_secs * 1000.0) / n
-            throttle_ms = max(JWT_FULL_REFRESH_MIN_THROTTLE_MS, int(calc_throttle_ms))
-            throttle_secs = throttle_ms / 1000.0
-
-            print(f"[jwt-full-refresh] 开始一轮：accounts={n} throttle={throttle_ms}ms "
-                  f"预计耗时={n * throttle_secs / 3600.0:.1f}h")
-
-            t_start = time.time()
-            ok = skipped = failed = 0
-            save_batch: list = []
-            skip_fresh_secs = JWT_FULL_REFRESH_SKIP_FRESH_HOURS * 3600.0
-
-            for acc in accounts_snapshot:
-                try:
-                    # 跳过：无 auth_token（无法刷新）
-                    if not acc.get("authorization"):
-                        skipped += 1
-                    # 跳过：5 分钟冷却中
-                    elif (time.time() - float(acc.get("last_jwt_fail") or 0)) < 300:
-                        skipped += 1
-                    # 跳过：JWT 仍新鲜
-                    elif (time.time() - float(acc.get("last_updated") or 0)) < skip_fresh_secs:
-                        skipped += 1
-                    else:
-                        acc_id = _account_id(acc)
-                        jwt_lock = _jwt_refresh_locks.setdefault(acc_id, asyncio.Lock())
-                        async with jwt_lock:
-                            # 双重检查（持锁后再判断一次）
-                            if (time.time() - float(acc.get("last_updated") or 0)) < skip_fresh_secs:
-                                skipped += 1
-                            else:
-                                try:
-                                    await _refresh_jetbrains_jwt(acc)
-                                    ok += 1
-                                    save_batch.append(acc)
-                                except Exception as _re:
-                                    failed += 1
-                                    # 写入冷却标记，避免下一轮立刻又试
-                                    acc["last_jwt_fail"] = time.time()
-                except asyncio.CancelledError:
-                    raise
-                except Exception as _oe:
-                    failed += 1
-                    print(f"[jwt-full-refresh] 账号处理异常: {_oe}")
-
-                # 批量写库
-                if len(save_batch) >= 100:
-                    batch, save_batch = save_batch[:], []
-                    try:
-                        await _batch_save_accounts_to_db(batch)
-                    except Exception as _be:
-                        print(f"[jwt-full-refresh] 批量写库失败: {_be}")
-
-                await asyncio.sleep(throttle_secs)
-
-            # 收尾批次
-            if save_batch:
-                try:
-                    await _batch_save_accounts_to_db(save_batch)
-                except Exception as _be:
-                    print(f"[jwt-full-refresh] 收尾批量写库失败: {_be}")
-
-            elapsed_h = (time.time() - t_start) / 3600.0
-            print(f"[jwt-full-refresh] 一轮完成：ok={ok} skipped={skipped} failed={failed} "
-                  f"耗时={elapsed_h:.2f}h")
-
-            # 若一轮跑得比 period 快，补齐到下一轮起点
-            remaining = period_secs - (time.time() - t_start)
-            if remaining > 0:
-                await asyncio.sleep(remaining)
-
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            print(f"[jwt-full-refresh] 主循环异常: {e}")
-            await asyncio.sleep(600)
-
-
 @app.on_event("startup")
 async def startup():
     global models_data, http_client
@@ -4042,7 +3923,6 @@ async def startup():
     )
     asyncio.create_task(_pool_discovery_loop())    # 轮询池发现（每 10 分钟 +500 个账号）
     asyncio.create_task(_pool_maintenance_loop())  # 轮询池维护（每 10 分钟剔除无配额）
-    asyncio.create_task(_jwt_full_refresh_loop())  # 低速全量 JWT 轮刷（默认关闭，可选保险）
     asyncio.create_task(_cleanup_pending_prizes_loop())
     asyncio.create_task(_partner_credentials_poller())
     asyncio.create_task(_startup_resume_bind_tasks())
