@@ -54,6 +54,7 @@ function saveSession(token: string, userTag: string) {
 
 export function useDiscordAuth(
   redirectPage: "lottery" | "backpack" | "donate" | "activate" | "my-cf-pool" | "personal-center",
+  mode: "pack" | "register" = "pack",
 ) {
   const [session, setSession] = useState<DcSession | null>(() => loadSession());
 
@@ -76,8 +77,8 @@ export function useDiscordAuth(
   }, []);
 
   const login = useCallback(() => {
-    window.location.href = `/key/discord-auth?mode=pack&redirect_to=${redirectPage}`;
-  }, [redirectPage]);
+    window.location.href = `/key/discord-auth?mode=${mode}&redirect_to=${redirectPage}`;
+  }, [redirectPage, mode]);
 
   const logout = useCallback(() => {
     safeRemoveStorageItem(SESSION_KEY);

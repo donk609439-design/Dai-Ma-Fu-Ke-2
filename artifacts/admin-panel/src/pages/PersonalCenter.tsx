@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from "react";
 import {
   Loader2,
   CheckCircle2,
+  XCircle,
   Copy,
   KeyRound,
   UserCircle,
@@ -77,9 +78,30 @@ function CopyBtn({ text }: { text: string }) {
   );
 }
 
+const DC_ERR_MSGS: Record<string, string> = {
+  not_member: "您的 Discord 账号不是本服务器成员，请先加入服务器后重试",
+  no_required_role: "您的 Discord 账号没有所需身份组，请先获取身份组后重试",
+  access_denied: "您取消了 Discord 授权",
+  token_failed: "Discord Token 交换失败，请重试",
+  user_failed: "获取 Discord 用户信息失败，请重试",
+  member_check_failed: "无法验证服务器成员资格，请重试",
+  invalid_state: "授权已过期，请重新发起",
+  no_token: "Discord 未返回 Token，请重试",
+};
+
 export default function PersonalCenter() {
   const { toast } = useToast();
-  const { dcToken, userTag, isLoggedIn, login, logout } = useDiscordAuth("personal-center");
+  // 在 hook 清理 URL 参数前先抢读 discord_error
+  const [discordError] = useState<string>(() => {
+    if (typeof window === "undefined") return "";
+    const sp = new URLSearchParams(window.location.search);
+    const err = sp.get("discord_error") || "";
+    const tag = sp.get("tag") || "";
+    if (!err) return "";
+    const base = DC_ERR_MSGS[err] || `Discord 错误: ${err}`;
+    return tag ? `${base}（${decodeURIComponent(tag)}）` : base;
+  });
+  const { dcToken, userTag, isLoggedIn, login, logout } = useDiscordAuth("personal-center", "register");
 
   const [status, setStatus] = useState<Status | null>(null);
   const [loading, setLoading] = useState(false);
@@ -165,10 +187,18 @@ export default function PersonalCenter() {
               </div>
             </div>
 
+            {discordError && (
+              <div className="flex items-start gap-2 bg-red-500/10 border border-red-500/20 rounded-xl px-4 py-3">
+                <XCircle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
+                <p className="text-sm text-red-400">{discordError}</p>
+              </div>
+            )}
+
             <div className="bg-muted/20 rounded-xl px-4 py-3 text-xs text-muted-foreground space-y-1">
               <p>登录后您可以：</p>
               <p>· 创建 1 个专属个人 API Key（每账号唯一）</p>
               <p>· 每天领取最多 40 次额度，自动累加到该 Key</p>
+              <p className="text-amber-400/80">· 仅限拥有指定身份组的服务器成员使用</p>
             </div>
 
             <button

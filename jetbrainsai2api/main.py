@@ -11033,7 +11033,8 @@ async def discord_callback(request: Request, code: str = "", state: str = "", er
     state_data = _DISCORD_STATES.pop(state, None) if state else None
     dc_mode = state_data.get("mode", "register") if state_data else "register"
     redirect_to = state_data.get("redirect_to", "") if state_data else ""
-    frontend_base = f"/admin-panel/{redirect_to}" if (dc_mode == "pack" and redirect_to) else "/admin-panel/self-register"
+    # 兼容老逻辑：register 模式默认回 self-register；任何模式下若指定 redirect_to 则优先使用
+    frontend_base = f"/admin-panel/{redirect_to}" if redirect_to else "/admin-panel/self-register"
     if error:
         return RedirectResponse(f"{frontend_base}?discord_error={error}")
     if not code or not state_data:
