@@ -388,6 +388,15 @@ export default function PersonalCenter() {
                 {globalCap}（约前 {Math.floor(globalCap / status.daily_quota)} 名，先到先得）。
                 <br />
                 为防止囤积，剩余额度大于 {status.daily_quota} 时无法签到。次日 0 点（UTC）自动重置。
+                <br />
+                也可以去
+                <a
+                  href="/admin-panel/activate"
+                  className="text-primary hover:underline mx-0.5"
+                >
+                  【账号激活】
+                </a>
+                页面上传已经绑卡的 JetBrains 账号
               </p>
             </div>
           </>
