@@ -150,10 +150,10 @@ export default function PersonalCenter() {
     setClaiming(true);
     try {
       const d = await postClaim(dcToken);
-      toast({ title: `已领取 +1 额度（今日 ${d.claimed_today}/${d.daily_quota}）` });
+      toast({ title: `签到成功，+${d.daily_quota} 额度已到账` });
       await refresh(true);
     } catch (e: any) {
-      toast({ title: "领取失败", description: e.message, variant: "destructive" });
+      toast({ title: "签到失败", description: e.message, variant: "destructive" });
     } finally {
       setClaiming(false);
     }
@@ -197,7 +197,7 @@ export default function PersonalCenter() {
             <div className="bg-muted/20 rounded-xl px-4 py-3 text-xs text-muted-foreground space-y-1">
               <p>登录后您可以：</p>
               <p>· 创建 1 个专属个人 API Key（每账号唯一）</p>
-              <p>· 每天领取最多 40 次额度，自动累加到该 Key</p>
+              <p>· 每天签到一次，一次性领取 40 次调用额度</p>
               <p className="text-amber-400/80">· 仅限拥有指定身份组的服务器成员使用</p>
             </div>
 
@@ -214,8 +214,8 @@ export default function PersonalCenter() {
   }
 
   // ─── 已登录 ───
-  const remaining = status ? Math.max(0, status.daily_quota - status.claimed_today) : 0;
-  const claimDisabled = !status?.has_key || claiming || remaining <= 0;
+  const claimedToday = (status?.claimed_today ?? 0) > 0;
+  const claimDisabled = !status?.has_key || claiming || claimedToday;
 
   return (
     <div className="min-h-[60vh] flex items-start justify-center pt-8 pb-12">
@@ -313,23 +313,13 @@ export default function PersonalCenter() {
                   <Gift className="w-5 h-5 text-primary" />
                 </div>
                 <div className="flex-1">
-                  <p className="font-semibold text-sm">每日免费额度</p>
+                  <p className="font-semibold text-sm">每日签到</p>
                   <p className="text-xs text-muted-foreground mt-0.5">
-                    今日已领 {status.claimed_today} / {status.daily_quota} 次
+                    {claimedToday
+                      ? `今日已签到（+${status.daily_quota} 额度已发放）`
+                      : `每天可签到一次，一次性发放 ${status.daily_quota} 次调用额度`}
                   </p>
                 </div>
-              </div>
-
-              <div className="w-full h-2 bg-muted/40 rounded-full overflow-hidden">
-                <div
-                  className="h-full bg-primary rounded-full transition-all"
-                  style={{
-                    width: `${Math.min(
-                      100,
-                      (status.claimed_today / Math.max(1, status.daily_quota)) * 100
-                    )}%`,
-                  }}
-                />
               </div>
 
               <button
@@ -342,15 +332,15 @@ export default function PersonalCenter() {
                 ) : (
                   <Sparkles className="w-4 h-4" />
                 )}
-                {remaining <= 0
-                  ? "今日额度已领满"
+                {claimedToday
+                  ? "今日已签到"
                   : claiming
-                    ? "领取中…"
-                    : `领取 +1 额度（剩余 ${remaining} 次/今日）`}
+                    ? "签到中…"
+                    : `签到领取 +${status.daily_quota} 额度`}
               </button>
 
               <p className="text-[11px] text-muted-foreground text-center leading-relaxed">
-                每天最多领取 {status.daily_quota} 次，每次为您的 Key 累加 1 次调用额度。
+                每天签到一次，一次性发放 {status.daily_quota} 次调用额度。
                 <br />
                 次日 0 点（UTC）自动重置。
               </p>

@@ -11170,7 +11170,7 @@ async def discord_verify(token: str = ""):
 
 # ==================== 个人中心：Discord 用户独占 Key + 每日 40 次额度 ====================
 
-_DC_PERSONAL_DAILY_QUOTA = 40  # 每用户每天最多领取额度次数（每次 +1 调用额度）
+_DC_PERSONAL_DAILY_QUOTA = 40  # 每用户每天签到一次性发放的调用额度
 
 
 def _validate_personal_dc(token: str) -> dict:
@@ -11372,35 +11372,34 @@ async def personal_center_claim(request: Request):
             await conn.execute("DELETE FROM dc_personal_keys WHERE dc_user_id=$1", dc_uid)
             raise HTTPException(status_code=410, detail="个人 Key 已被清理，请重新创建")
         async with conn.transaction():
-            cnt_row = await conn.fetchrow(
+            # 一次性签到：每天首次 INSERT 才发放，已存在则视为今日已签到（429）
+            inserted = await conn.fetchrow(
                 """
                 INSERT INTO dc_claim_limits (dc_user_id, date, count)
                 VALUES ($1, CURRENT_DATE, 1)
-                ON CONFLICT (dc_user_id, date) DO UPDATE
-                SET count = dc_claim_limits.count + 1
+                ON CONFLICT (dc_user_id, date) DO NOTHING
                 RETURNING count
                 """,
                 dc_uid,
             )
-            new_count = int(cnt_row["count"])
-            if new_count > _DC_PERSONAL_DAILY_QUOTA:
-                # 超限回滚
+            if not inserted:
                 raise HTTPException(
                     status_code=429,
-                    detail=f"今日额度已领满（{_DC_PERSONAL_DAILY_QUOTA} 次/天），请明天再来",
+                    detail=f"今日已签到，请明天再来（每天发放 {_DC_PERSONAL_DAILY_QUOTA} 调用额度）",
                 )
-            # 原子自增（避免多实例/竞态下的丢增量）
+            new_count = 1
+            # 原子加发放额度
             up_row = await conn.fetchrow(
                 """
                 UPDATE jb_client_keys
-                SET usage_limit = COALESCE(usage_limit, 0) + 1
+                SET usage_limit = COALESCE(usage_limit, 0) + $2
                 WHERE key=$1
                 RETURNING usage_limit, usage_count
                 """,
-                api_key,
+                api_key, _DC_PERSONAL_DAILY_QUOTA,
             )
             if not up_row:
-                # key 在事务内被删：让事务回滚以防超额计入计数
+                # key 在事务内被删：让事务回滚以撤销今日签到记录
                 raise HTTPException(status_code=410, detail="个人 Key 已被清理，请重新创建")
             new_limit = int(up_row["usage_limit"])
             new_used = int(up_row["usage_count"] or 0)
